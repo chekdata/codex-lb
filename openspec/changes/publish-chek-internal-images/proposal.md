@@ -12,8 +12,8 @@ repository-owned image publisher.
 - Add a focused GitHub Actions workflow that publishes the fork to
   `ghcr.io/chekdata/codex-lb` after a push to `main` or an explicit manual run.
 - Publish both supported Linux architectures in one manifest.
-- Publish an immutable full-SHA tag for GitOps and a mutable `main` convenience
-  tag while granting the workflow only read-content and write-package access.
+- Publish an immutable full-SHA tag for GitOps while granting the workflow only
+  read-content and write-package access; do not publish a mutable `main` tag.
 - Fail closed before building when the full-SHA tag already exists or the
   registry cannot prove that it is absent.
 - Serialize all runs for the same commit across branch and tag aliases so the

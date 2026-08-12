@@ -6,8 +6,8 @@ The `chekdata/codex-lb` repository SHALL build and publish a container image to
 `ghcr.io/chekdata/codex-lb` after changes land on `main` and when an operator
 explicitly dispatches the workflow. The published manifest MUST support
 `linux/amd64` and `linux/arm64`, MUST include an immutable `sha-<full-commit>`
-tag, and MAY update the `main` tag for operator convenience. Production GitOps
-consumers MUST be able to select the immutable tag.
+tag, and MUST NOT publish a mutable `main` tag. Production GitOps consumers
+MUST be able to select the immutable tag.
 
 Before publishing, the workflow MUST prove that the full-SHA tag does not
 already exist. It MUST fail without building when the tag exists and MUST fail
@@ -25,7 +25,7 @@ NOT publish images.
 - **WHEN** a reviewed commit lands on `main`
 - **THEN** the workflow publishes `ghcr.io/chekdata/codex-lb:sha-<full-commit>`
 - **AND** the image manifest supports `linux/amd64` and `linux/arm64`
-- **AND** the same run updates `ghcr.io/chekdata/codex-lb:main`
+- **AND** the run does not publish a mutable `main` tag
 
 #### Scenario: Pull request validation cannot publish a package
 
