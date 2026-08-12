@@ -43,7 +43,8 @@ def _enum_value_exists(bind: sa.engine.Connection, enum_type_name: str, enum_val
         sa.text(
             "SELECT 1 FROM pg_enum e "
             "JOIN pg_type t ON e.enumtypid = t.oid "
-            "WHERE t.typname = :type_name AND e.enumlabel = :value"
+            "WHERE pg_type_is_visible(t.oid) "
+            "AND t.typname = :type_name AND e.enumlabel = :value"
         ),
         {"type_name": enum_type_name, "value": enum_value},
     )

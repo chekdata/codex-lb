@@ -216,6 +216,7 @@ This chart intentionally keeps migration behavior explicit by install mode.
 - Application pods use a schema gate initContainer when `migration.enabled=true`, `config.databaseMigrateOnStartup=false`, and `migration.schemaGate.enabled=true`.
 - That initContainer runs `python -m app.db.migrate wait-for-head` and blocks the app container until the database is at Alembic head.
 - In bundled mode, `values-bundled.yaml` enables startup migration instead of the schema gate so fresh self-contained installs do not deadlock on `helm install --wait`.
+- Shared PostgreSQL installs can isolate codex-lb in an application schema; see the [Kubernetes deployment guide](https://soju06.github.io/codex-lb/deployment/kubernetes/#shared-postgresql-databases).
 
 This means:
 

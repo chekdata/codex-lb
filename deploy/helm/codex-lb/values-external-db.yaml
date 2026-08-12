@@ -12,3 +12,6 @@ migration:
 # - externalDatabase.host/user/database (+ optional port)
 # - externalDatabase.existingSecret
 # - auth.existingSecret
+#
+# Optional for shared PostgreSQL databases:
+# config.databasePostgresSchema: codex_lb_prod

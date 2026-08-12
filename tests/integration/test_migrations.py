@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import importlib
 from collections.abc import Callable
+from uuid import uuid4
 
 import pytest
 from anyio import to_thread
-from sqlalchemy import text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.auth import DEFAULT_PLAN
@@ -34,6 +36,7 @@ from app.db.migrate import (
     run_startup_migrations,
     run_upgrade,
 )
+from app.db.migration_url import to_sync_database_url
 from app.db.models import Account, AccountStatus
 from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
@@ -53,6 +56,82 @@ _STAMPED_AFTER_LEGACY_PREFIX_1 = OLD_TO_NEW_REVISION_MAP["001_normalize_account_
 
 def _is_postgresql_database_url(url: str) -> bool:
     return url.startswith("postgresql+")
+
+
+@pytest.mark.skipif(not _is_postgresql_database_url(_DATABASE_URL), reason="PostgreSQL-only schema isolation")
+def test_configured_schema_does_not_reuse_public_alembic_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    schema = f"codex_lb_test_{uuid4().hex}"
+    sync_url = to_sync_database_url(_DATABASE_URL)
+
+    monkeypatch.delenv("CODEX_LB_DATABASE_POSTGRES_SCHEMA", raising=False)
+    get_settings.cache_clear()
+    public_result = run_upgrade(_DATABASE_URL, "head", bootstrap_legacy=False)
+
+    monkeypatch.setenv("CODEX_LB_DATABASE_POSTGRES_SCHEMA", schema)
+    get_settings.cache_clear()
+    try:
+        state_before = inspect_migration_state(_DATABASE_URL)
+        assert state_before.current_revision is None
+        assert state_before.has_alembic_version_table is False
+        assert state_before.needs_upgrade is True
+
+        schema_result = run_upgrade(_DATABASE_URL, "head", bootstrap_legacy=False)
+        assert schema_result.current_revision == public_result.current_revision
+
+        engine = create_engine(sync_url, future=True)
+        try:
+            with engine.connect() as connection:
+                inspector = inspect(connection)
+                assert inspector.has_table("alembic_version", schema=schema)
+                assert inspector.has_table("accounts", schema=schema)
+                enum_values = connection.execute(
+                    text(
+                        "SELECT e.enumlabel FROM pg_enum e "
+                        "JOIN pg_type t ON e.enumtypid = t.oid "
+                        "JOIN pg_namespace n ON t.typnamespace = n.oid "
+                        "WHERE n.nspname = :schema AND t.typname = 'account_status'"
+                    ),
+                    {"schema": schema},
+                ).scalars()
+                assert "reauth_required" in set(enum_values)
+        finally:
+            engine.dispose()
+    finally:
+        engine = create_engine(sync_url, future=True)
+        try:
+            with engine.begin() as connection:
+                connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        finally:
+            engine.dispose()
+        monkeypatch.delenv("CODEX_LB_DATABASE_POSTGRES_SCHEMA", raising=False)
+        get_settings.cache_clear()
+
+
+@pytest.mark.skipif(not _is_postgresql_database_url(_DATABASE_URL), reason="PostgreSQL-only enum visibility")
+def test_enum_probe_follows_visible_public_type_without_schema_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    schema = f"codex_lb_path_{uuid4().hex}"
+    sync_url = to_sync_database_url(_DATABASE_URL)
+    monkeypatch.delenv("CODEX_LB_DATABASE_POSTGRES_SCHEMA", raising=False)
+    get_settings.cache_clear()
+    run_upgrade(_DATABASE_URL, "head", bootstrap_legacy=False)
+
+    engine = create_engine(sync_url, future=True)
+    try:
+        with engine.begin() as connection:
+            connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+            connection.execute(
+                text("SELECT set_config('search_path', :search_path, false)"),
+                {"search_path": f'"{schema}",public'},
+            )
+            migration = importlib.import_module(
+                "app.db.alembic.versions.20260310_000000_fix_postgresql_enum_value_casing"
+            )
+
+            assert migration._enum_value_exists(connection, "account_status", "active") is True
+    finally:
+        with engine.begin() as connection:
+            connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        engine.dispose()
 
 
 def _make_account(account_id: str, email: str, plan_type: str) -> Account:

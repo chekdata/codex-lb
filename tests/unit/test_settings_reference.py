@@ -54,7 +54,11 @@ ENV_EXAMPLE_PATH = REPO_ROOT / ".env.example"
 # 117 -> 118: http_responses_session_bridge_anchor_poison_failure_threshold
 # (bridge restart anchor poisoning). Not hardcoded because operators need a
 # bounded deployment-specific poison threshold while recovery telemetry matures.
-MAX_SETTINGS_FIELDS = 118
+# 118 -> 119: database_postgres_schema. Shared-database deployments need one
+# explicit schema knob so runtime engines, migration jobs, and schema gates use
+# the same non-public search_path; there is no safe fixed default when a single
+# PostgreSQL database is reused by multiple applications.
+MAX_SETTINGS_FIELDS = 119
 
 
 def test_generated_settings_reference_matches_code() -> None:

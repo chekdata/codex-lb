@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.pool import NullPool
 
 from app.core.config.settings import get_settings
+from app.db.migration_url import postgres_search_path
 from app.db.sqlite_utils import (
     SqliteIntegrityCheckMode,
     check_sqlite_integrity,
@@ -76,7 +77,11 @@ def _postgres_async_connect_args(url: str) -> dict[str, object] | None:
     # bridge-session cleanup stop running, and account/stream lease expiry is
     # mis-evaluated. Forcing UTC keeps stored timestamps correct regardless of
     # the container time zone.
-    connect_args: dict[str, object] = {"server_settings": {"timezone": "UTC"}}
+    server_settings: dict[str, str] = {"timezone": "UTC"}
+    search_path = postgres_search_path(_settings.database_postgres_schema)
+    if search_path is not None:
+        server_settings["search_path"] = search_path
+    connect_args: dict[str, object] = {"server_settings": server_settings}
     if os.environ.get("CODEX_LB_TEST_DATABASE_URL"):
         connect_args["prepared_statement_cache_size"] = 0
     return connect_args

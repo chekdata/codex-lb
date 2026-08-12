@@ -12,6 +12,39 @@ kubectl port-forward svc/codex-lb 2455:2455
 
 Open [localhost:2455](http://localhost:2455) → Add account → Done.
 
+## Shared PostgreSQL databases
+
+For an external PostgreSQL database shared by multiple applications, assign
+codex-lb its own schema with `config.databasePostgresSchema`:
+
+```yaml
+postgresql:
+  enabled: false
+externalDatabase:
+  existingSecret: codex-lb-app-secret
+config:
+  databasePostgresSchema: codex_lb_prod
+```
+
+The runtime searches `codex_lb_prod` first and retains `public` as a read
+fallback. Migration jobs and schema-gate init containers operate only in
+`codex_lb_prod`, so another application's `public.alembic_version` cannot make
+an uninitialized codex-lb schema appear current.
+
+On the first migration run, codex-lb executes `CREATE SCHEMA IF NOT EXISTS`
+before inspecting or advancing Alembic state. If the deployment user cannot
+create schemas, create `codex_lb_prod` once as a database administrator. Keep
+the same `config.databasePostgresSchema` value for the workload, migration job,
+and schema gate; the chart wires it to all three paths.
+
+The setting is optional. Omitting it preserves PostgreSQL's existing default
+search-path behavior. See the owning
+[database-backends](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/database-backends),
+[database-migrations](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/database-migrations),
+and
+[deployment-installation](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/deployment-installation)
+contracts.
+
 ## Multi-replica behavior
 
 The Helm chart auto-configures HTTP `/responses` owner handoff for multi-replica installs using a headless-service DNS name per pod. The default cluster domain is `cluster.local`; set Helm `clusterDomain` if your cluster uses a different suffix. Override `config.sessionBridgeAdvertiseBaseUrl` only if pods must be reached through a different internal address.

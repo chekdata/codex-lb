@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -13,6 +15,24 @@ pytestmark = pytest.mark.unit
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CHART_DIR = _REPO_ROOT / "deploy" / "helm" / "codex-lb"
 _DEPENDENCY_BUILD_COMPLETE = False
+_HELM_HOME = Path(tempfile.mkdtemp(prefix="codex-lb-helm-"))
+_HELM_ENV = {
+    "HELM_CONFIG_HOME": str(_HELM_HOME / "config"),
+    "HELM_CACHE_HOME": str(_HELM_HOME / "cache"),
+    "HELM_DATA_HOME": str(_HELM_HOME / "data"),
+    "HELM_REGISTRY_CONFIG": str(_HELM_HOME / "config" / "registry.json"),
+    "HELM_REPOSITORY_CONFIG": str(_HELM_HOME / "config" / "repositories.yaml"),
+    "HELM_REPOSITORY_CACHE": str(_HELM_HOME / "repository"),
+}
+
+for path in (
+    _HELM_HOME / "config",
+    _HELM_HOME / "cache",
+    _HELM_HOME / "data",
+    _HELM_HOME / "repository",
+):
+    path.mkdir(parents=True, exist_ok=True)
+(_HELM_HOME / "config" / "repositories.yaml").touch()
 
 
 def _ensure_chart_dependencies() -> None:
@@ -29,6 +49,7 @@ def _ensure_chart_dependencies() -> None:
         check=True,
         capture_output=True,
         text=True,
+        env={**os.environ, **_HELM_ENV},
     )
     _DEPENDENCY_BUILD_COMPLETE = True
 
@@ -43,6 +64,7 @@ def _helm_template(*args: str) -> str:
         check=True,
         capture_output=True,
         text=True,
+        env={**os.environ, **_HELM_ENV},
     )
     return completed.stdout
 
@@ -58,6 +80,7 @@ def _helm_template_failure(*args: str) -> subprocess.CalledProcessError:
             check=True,
             capture_output=True,
             text=True,
+            env={**os.environ, **_HELM_ENV},
         )
     return exc_info.value
 
@@ -925,6 +948,20 @@ def test_external_database_url_is_rendered_into_chart_managed_secret_when_postgr
     )
 
     assert 'database-url: "postgresql+asyncpg://user:pass@db.example.com:5432/codexlb"' in rendered
+
+
+def test_database_postgres_schema_is_rendered_for_runtime_and_migration_paths() -> None:
+    rendered = _helm_template(
+        "--set",
+        "postgresql.enabled=false",
+        "--set",
+        "externalDatabase.url=postgresql+asyncpg://user:pass@db.example.com:5432/codexlb",
+        "--set",
+        "config.databasePostgresSchema=codex_lb_prod",
+    )
+
+    assert 'CODEX_LB_DATABASE_POSTGRES_SCHEMA: "codex_lb_prod"' in rendered
+    assert rendered.count("name: CODEX_LB_DATABASE_POSTGRES_SCHEMA") == 2
 
 
 def test_network_policy_does_not_allow_http_ingress_from_all_namespaces_by_default() -> None:

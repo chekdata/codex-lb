@@ -95,6 +95,10 @@ spec:
             - name: CODEX_LB_DATABASE_URL
               value: {{ include "codex-lb.databaseUrl" . | quote }}
             {{- end }}
+            {{- if .Values.config.databasePostgresSchema }}
+            - name: CODEX_LB_DATABASE_POSTGRES_SCHEMA
+              value: {{ .Values.config.databasePostgresSchema | quote }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

@@ -29,6 +29,7 @@ class _FakeSettings:
     database_sqlite_pre_migrate_backup_enabled: bool = False
     database_sqlite_pre_migrate_backup_max_files: int = 5
     database_sqlite_startup_check_mode: str = "quick"
+    database_postgres_schema: str | None = None
     database_migrations_fail_fast: bool = False
 
 
@@ -326,6 +327,27 @@ def test_postgres_connect_args_pin_session_timezone_to_utc(monkeypatch) -> None:
     connect_args = session_module._postgres_async_connect_args("postgresql+asyncpg://u:p@h/db")
 
     assert connect_args == {"server_settings": {"timezone": "UTC"}}
+
+
+def test_postgres_connect_args_include_search_path_when_schema_is_configured(monkeypatch) -> None:
+    monkeypatch.delenv("CODEX_LB_TEST_DATABASE_URL", raising=False)
+    monkeypatch.setattr(
+        session_module,
+        "_settings",
+        _FakeSettings(
+            database_url="postgresql+asyncpg://u:p@h/db",
+            database_postgres_schema="codex_lb_prod",
+        ),
+    )
+
+    connect_args = session_module._postgres_async_connect_args("postgresql+asyncpg://u:p@h/db")
+
+    assert connect_args == {
+        "server_settings": {
+            "timezone": "UTC",
+            "search_path": '"codex_lb_prod",public',
+        }
+    }
 
 
 def test_postgres_connect_args_pin_utc_and_keep_test_db_url_tuning(monkeypatch) -> None:

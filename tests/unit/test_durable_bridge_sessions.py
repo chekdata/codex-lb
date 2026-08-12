@@ -32,6 +32,7 @@ from app.modules.proxy.durable_bridge_coordinator import DurableBridgeSessionCoo
 from app.modules.proxy.durable_bridge_repository import (
     DurableBridgeAliasRegistration,
     DurableBridgeRepository,
+    missing_durable_bridge_tables,
 )
 
 pytestmark = pytest.mark.unit
@@ -137,6 +138,25 @@ async def test_durable_bridge_lookup_prefers_turn_state_then_previous_response_t
     )
     assert by_session is not None
     assert by_session.canonical_key == "sid-123"
+
+
+@pytest.mark.asyncio
+async def test_missing_durable_bridge_tables_checks_current_postgres_schemas() -> None:
+    captured_sql: list[str] = []
+
+    class _PostgresSession:
+        def get_bind(self) -> SimpleNamespace:
+            return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+
+        async def execute(self, statement: object) -> SimpleNamespace:
+            captured_sql.append(str(statement))
+            return SimpleNamespace(fetchall=lambda: [("http_bridge_sessions",)])
+
+    missing = await missing_durable_bridge_tables(cast(AsyncSession, _PostgresSession()))
+
+    assert "http_bridge_session_aliases" in missing
+    assert any("current_schemas(false)" in sql for sql in captured_sql)
+    assert all("table_schema = 'public'" not in sql for sql in captured_sql)
 
 
 @pytest.mark.asyncio

@@ -123,6 +123,8 @@ serviceAccount:
 config:
   # @param config.databaseMigrateOnStartup Disable auto-migration (migration Job handles it)
   databaseMigrateOnStartup: false
+  # @param config.databasePostgresSchema Optional PostgreSQL schema search_path prefix for shared databases
+  databasePostgresSchema: ""
   # @param config.databasePoolSize SQLAlchemy connection pool size
   # Each supported replica has one worker with two pools (request + background).
   # Reserve 20 of PostgreSQL's default 100 slots for PG internals, migrations, and operations.
