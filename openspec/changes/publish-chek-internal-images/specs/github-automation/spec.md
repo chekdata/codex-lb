@@ -9,6 +9,11 @@ explicitly dispatches the workflow. The published manifest MUST support
 tag, and MAY update the `main` tag for operator convenience. Production GitOps
 consumers MUST be able to select the immutable tag.
 
+Before publishing, the workflow MUST prove that the full-SHA tag does not
+already exist. It MUST fail without building when the tag exists and MUST fail
+closed when a registry or network error prevents that absence check. It MUST
+NOT overwrite a previously published full-SHA tag.
+
 The workflow MUST use pinned action revisions and MUST limit its repository
 permissions to reading contents and writing packages. Pull request events MUST
 NOT publish images.
@@ -29,5 +34,19 @@ NOT publish images.
 #### Scenario: Operator can rebuild the current selected revision
 
 - **WHEN** an operator manually dispatches the workflow on an allowed ref
+- **AND** the selected commit's full-SHA tag does not yet exist
 - **THEN** the workflow builds and publishes the selected commit with its
   immutable full-SHA tag
+
+#### Scenario: Repeated publication cannot change an immutable tag
+
+- **GIVEN** the selected commit's full-SHA tag already exists in GHCR
+- **WHEN** the workflow is rerun or manually dispatched for that commit
+- **THEN** it fails before the image build
+- **AND** the existing tag is not overwritten
+
+#### Scenario: Registry uncertainty fails closed
+
+- **GIVEN** the workflow cannot determine whether the full-SHA tag exists
+- **WHEN** the pre-publish check encounters a registry or network error
+- **THEN** the workflow fails without publishing

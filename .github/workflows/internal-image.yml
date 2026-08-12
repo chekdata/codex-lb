@@ -38,6 +38,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Refuse to overwrite immutable tag
+        env:
+          IMAGE_REF: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+        run: |
+          if docker buildx imagetools inspect "${IMAGE_REF}" >/dev/null 2>inspect-error.log; then
+            echo "::error::Immutable image tag already exists: ${IMAGE_REF}"
+            exit 1
+          fi
+          if ! grep -Eiq 'manifest unknown|name unknown|not found' inspect-error.log; then
+            cat inspect-error.log >&2
+            echo "::error::Unable to prove immutable image tag is absent"
+            exit 1
+          fi
+
       - name: Extract image metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302

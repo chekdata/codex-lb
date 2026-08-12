@@ -14,6 +14,8 @@ repository-owned image publisher.
 - Publish both supported Linux architectures in one manifest.
 - Publish an immutable full-SHA tag for GitOps and a mutable `main` convenience
   tag while granting the workflow only read-content and write-package access.
+- Fail closed before building when the full-SHA tag already exists or the
+  registry cannot prove that it is absent.
 
 ## Impact
 

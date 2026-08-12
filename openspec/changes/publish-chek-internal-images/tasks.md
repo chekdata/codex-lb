@@ -5,6 +5,8 @@
 - [x] 1.1 Add a main-branch and manual-dispatch GHCR workflow with pinned actions
 - [x] 1.2 Build and publish a multi-architecture image for amd64 and arm64
 - [x] 1.3 Emit immutable full-SHA and mutable main tags with minimal permissions
+- [x] 1.4 Refuse to overwrite an existing full-SHA tag and fail closed when its
+      registry state cannot be confirmed
 
 ## 2. Verification
 
