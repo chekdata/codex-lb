@@ -499,7 +499,11 @@ class Settings(BaseSettings):
             return None
         if isinstance(value, str):
             stripped = value.strip()
-            return stripped or None
+            if not stripped:
+                return None
+            if len(stripped.encode("utf-8")) > 63:
+                raise ValueError("database_postgres_schema must be at most 63 UTF-8 bytes")
+            return stripped
         raise TypeError("database_postgres_schema must be a string")
 
     @field_validator("encryption_key_file", mode="before")

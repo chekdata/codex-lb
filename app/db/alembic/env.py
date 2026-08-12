@@ -10,6 +10,7 @@ from app.db.migration_url import (
     apply_postgres_migration_search_path,
     ensure_postgres_schema_exists,
     normalize_postgres_schema,
+    postgres_migration_search_path,
     to_sync_database_url,
 )
 from app.db.models import Base
@@ -45,6 +46,10 @@ def run_migrations_offline() -> None:
         render_as_batch=url.startswith("sqlite"),
         version_table_schema=schema,
     )
+
+    search_path = postgres_migration_search_path(schema)
+    if search_path is not None:
+        context.execute(f"SET search_path TO {search_path}")
 
     with context.begin_transaction():
         context.run_migrations()

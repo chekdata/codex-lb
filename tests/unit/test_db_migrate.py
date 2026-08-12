@@ -5,6 +5,7 @@ import json
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -230,6 +231,28 @@ def test_postgres_search_path_helper_normalizes_schema() -> None:
     assert postgres_search_path("codex_lb_prod") == '"codex_lb_prod",public'
     assert postgres_search_path('tenant"blue') == '"tenant""blue",public'
     assert postgres_migration_search_path("codex_lb_prod") == '"codex_lb_prod"'
+
+
+def test_postgres_offline_migration_sets_quoted_schema_only_search_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = StringIO()
+    config = _build_alembic_config("postgresql+asyncpg://user:pass@db.example.com:5432/codex_lb")
+    config.output_buffer = output
+    monkeypatch.setenv("CODEX_LB_DATABASE_POSTGRES_SCHEMA", 'tenant"blue')
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+    try:
+        # An empty head:head range still executes env.py without asking older
+        # data-aware revisions to reflect from Alembic's offline mock bind.
+        command.upgrade(config, "head:head", sql=True)
+    finally:
+        get_settings.cache_clear()
+
+    generated_sql = output.getvalue()
+    assert 'SET search_path TO "tenant""blue";' in generated_sql
+    assert 'SET search_path TO "tenant""blue",public;' not in generated_sql
 
 
 def test_apply_postgres_search_path_is_noop_for_non_postgres() -> None:

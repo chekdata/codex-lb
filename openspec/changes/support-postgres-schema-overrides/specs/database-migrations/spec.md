@@ -10,6 +10,10 @@ Alembic environment, startup migration upgrade path, startup drift check,
 the shared sync connection factories. When the setting is omitted or empty,
 existing migration behavior MUST remain unchanged.
 
+Configured PostgreSQL schema names MUST NOT exceed PostgreSQL's 63-byte UTF-8
+identifier limit. Alembic offline SQL generation MUST emit a safely quoted,
+schema-only search path before migration operations.
+
 #### Scenario: Startup migrations run inside the configured schema
 
 - **GIVEN** `database_url` resolves to PostgreSQL
@@ -27,6 +31,19 @@ existing migration behavior MUST remain unchanged.
 - **WHEN** `wait-for-head` or another schema-state check runs after migrations
 - **THEN** the check succeeds against `codex_lb_prod`
 - **AND** it does not report missing tables solely because `public` is empty
+
+#### Scenario: Offline migration SQL targets only the configured schema
+
+- **GIVEN** `database_postgres_schema = "codex_lb_prod"`
+- **WHEN** Alembic generates an offline upgrade script
+- **THEN** the script sets `search_path` to the safely quoted configured schema
+- **AND** migration operations do not fall back to `public`
+
+#### Scenario: Overlong PostgreSQL schema names fail during configuration
+
+- **GIVEN** `database_postgres_schema` exceeds 63 bytes when UTF-8 encoded
+- **WHEN** application settings are loaded
+- **THEN** validation fails before PostgreSQL can truncate the identifier
 
 ### Requirement: Migration bootstrap creates the configured PostgreSQL schema before reading schema state
 
