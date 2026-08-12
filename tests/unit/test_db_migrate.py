@@ -17,6 +17,7 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy import exc as sa_exc
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import Connection
+from sqlalchemy.schema import CreateSchema
 
 import app.db.migrate as migrate_module
 from app.db.alembic.revision_ids import OLD_TO_NEW_REVISION_MAP
@@ -276,12 +277,12 @@ def test_ensure_postgres_schema_exists_skips_public_schema() -> None:
 
 
 def test_ensure_postgres_schema_exists_creates_missing_postgres_schema() -> None:
-    calls: list[object] = []
+    calls: list[CreateSchema] = []
 
     class _Connection:
         dialect = SimpleNamespace(name="postgresql")
 
-        def execute(self, statement: object) -> None:
+        def execute(self, statement: CreateSchema) -> None:
             calls.append(statement)
 
     ensure_postgres_schema_exists(cast(Connection, _Connection()), "codex_lb_prod")

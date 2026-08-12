@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 from sqlalchemy import text
-from sqlalchemy.engine import Connection
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.schema import CreateSchema
 
 from app.db.sqlite_utils import normalize_sqlite_url
@@ -33,7 +32,7 @@ def postgres_search_path(schema: str | None) -> str | None:
 
 
 def ensure_postgres_schema_exists(connection: Connection, schema: str | None) -> None:
-    if connection.dialect.name != "postgresql" or schema is None:
+    if schema is None or connection.dialect.name != "postgresql":
         return
 
     normalized = schema.strip()

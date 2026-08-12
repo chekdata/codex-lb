@@ -283,6 +283,9 @@ Thanks goes to these wonderful people ([emoji key](https://allcontributors.org/e
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/glopyglerky"><img src="https://avatars.githubusercontent.com/u/189872235?v=4?s=100" width="100px;" alt="glopyglerky"/><br /><sub><b>glopyglerky</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=glopyglerky" title="Code">💻</a> <a href="https://github.com/Soju06/codex-lb/commits?author=glopyglerky" title="Tests">⚠️</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/iqbalmaulana03"><img src="https://avatars.githubusercontent.com/u/78488507?v=4?s=100" width="100px;" alt="Ahmad Maulana Iqbal"/><br /><sub><b>Ahmad Maulana Iqbal</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=iqbalmaulana03" title="Code">💻</a> <a href="https://github.com/Soju06/codex-lb/commits?author=iqbalmaulana03" title="Tests">⚠️</a></td>
     </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/hongzexin"><img src="https://avatars.githubusercontent.com/u/136784169?v=4?s=100" width="100px;" alt="Jason HONG"/><br /><sub><b>Jason HONG</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=hongzexin" title="Code">💻</a> <a href="https://github.com/Soju06/codex-lb/commits?author=hongzexin" title="Tests">⚠️</a> <a href="https://github.com/Soju06/codex-lb/commits?author=hongzexin" title="Documentation">📖</a></td>
+    </tr>
   </tbody>
 </table>
 

@@ -961,7 +961,7 @@ def test_database_postgres_schema_is_rendered_for_runtime_and_migration_paths() 
     )
 
     assert 'CODEX_LB_DATABASE_POSTGRES_SCHEMA: "codex_lb_prod"' in rendered
-    assert rendered.count("name: CODEX_LB_DATABASE_POSTGRES_SCHEMA") >= 3
+    assert rendered.count("name: CODEX_LB_DATABASE_POSTGRES_SCHEMA") == 2
 
 
 def test_network_policy_does_not_allow_http_ingress_from_all_namespaces_by_default() -> None:

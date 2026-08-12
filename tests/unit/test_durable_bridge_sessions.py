@@ -9,7 +9,6 @@ from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import text
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -143,29 +142,21 @@ async def test_durable_bridge_lookup_prefers_turn_state_then_previous_response_t
 
 @pytest.mark.asyncio
 async def test_missing_durable_bridge_tables_checks_current_postgres_schemas() -> None:
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    session_maker = async_sessionmaker(engine, expire_on_commit=False)
-    try:
-        async with session_maker() as session:
-            captured_sql: list[str] = []
-            original_execute = session.execute
+    captured_sql: list[str] = []
 
-            async def recording_execute(statement: object, *args: object, **kwargs: object):
-                if isinstance(statement, type(text(""))):
-                    captured_sql.append(str(statement))
-                    return SimpleNamespace(fetchall=lambda: [("http_bridge_sessions",)])
-                return await original_execute(statement, *args, **kwargs)
+    class _PostgresSession:
+        def get_bind(self) -> SimpleNamespace:
+            return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
 
-            session.bind.dialect.name = "postgresql"  # type: ignore[assignment]
-            session.execute = recording_execute  # type: ignore[method-assign]
+        async def execute(self, statement: object) -> SimpleNamespace:
+            captured_sql.append(str(statement))
+            return SimpleNamespace(fetchall=lambda: [("http_bridge_sessions",)])
 
-            missing = await missing_durable_bridge_tables(session)
+    missing = await missing_durable_bridge_tables(cast(AsyncSession, _PostgresSession()))
 
-        assert "http_bridge_session_aliases" in missing
-        assert any("current_schemas(false)" in sql for sql in captured_sql)
-        assert all("table_schema = 'public'" not in sql for sql in captured_sql)
-    finally:
-        await engine.dispose()
+    assert "http_bridge_session_aliases" in missing
+    assert any("current_schemas(false)" in sql for sql in captured_sql)
+    assert all("table_schema = 'public'" not in sql for sql in captured_sql)
 
 
 @pytest.mark.asyncio
