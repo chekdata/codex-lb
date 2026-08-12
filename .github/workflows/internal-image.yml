@@ -45,39 +45,51 @@ jobs:
           username: ${{ secrets.REGISTRY_USERNAME }}
           password: ${{ secrets.REGISTRY_PASSWORD }}
 
-      - name: Refuse to overwrite immutable tags
+      - name: Check immutable publication state
+        id: preflight
         env:
           GHCR_IMAGE_REF: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
           BEIJING_IMAGE_REF: ${{ secrets.REGISTRY_ENDPOINT }}/prod/codex-lb:sha-${{ github.sha }}
         run: |
-          check_absent() {
+          image_state() {
             image_ref="$1"
             error_log="$2"
             if docker buildx imagetools inspect "${image_ref}" >/dev/null 2>"${error_log}"; then
-              echo "::error::Immutable image tag already exists: ${image_ref}"
-              exit 1
+              echo exists
+              return
             fi
-            if ! grep -Eiq 'manifest unknown|name unknown|not found' "${error_log}"; then
-              cat "${error_log}" >&2
-              echo "::error::Unable to prove immutable image tag is absent: ${image_ref}"
-              exit 1
+            if grep -Eiq 'manifest unknown|name unknown|not found' "${error_log}"; then
+              echo absent
+              return
             fi
+            cat "${error_log}" >&2
+            echo "::error::Unable to determine immutable image state: ${image_ref}"
+            exit 1
           }
 
-          check_absent "${GHCR_IMAGE_REF}" ghcr-inspect-error.log
-          check_absent "${BEIJING_IMAGE_REF}" beijing-inspect-error.log
+          ghcr_state=$(image_state "${GHCR_IMAGE_REF}" ghcr-inspect-error.log)
+          beijing_state=$(image_state "${BEIJING_IMAGE_REF}" beijing-inspect-error.log)
+          if [[ "${beijing_state}" == exists ]]; then
+            echo "::error::Immutable Beijing image tag already exists: ${BEIJING_IMAGE_REF}"
+            exit 1
+          fi
+          if [[ "${ghcr_state}" == exists ]]; then
+            echo "Recovering the missing Beijing mirror from the existing immutable GHCR image"
+            echo "build_ghcr=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "build_ghcr=true" >> "${GITHUB_OUTPUT}"
+          fi
 
       - name: Extract image metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302
         with:
-          images: |
-            ghcr.io/${{ github.repository }}
-            ${{ secrets.REGISTRY_ENDPOINT }}/prod/codex-lb
+          images: ghcr.io/${{ github.repository }}
           tags: |
             type=sha,prefix=sha-,format=long
 
       - name: Build and push image
+        if: steps.preflight.outputs.build_ghcr == 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
         with:
           context: .
@@ -88,3 +100,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=codex-lb-internal
           cache-to: type=gha,mode=max,scope=codex-lb-internal
+
+      - name: Mirror immutable image to CHEK Beijing registry
+        env:
+          GHCR_IMAGE_REF: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+          BEIJING_IMAGE_REF: ${{ secrets.REGISTRY_ENDPOINT }}/prod/codex-lb:sha-${{ github.sha }}
+        run: docker buildx imagetools create --tag "${BEIJING_IMAGE_REF}" "${GHCR_IMAGE_REF}"

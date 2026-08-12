@@ -15,8 +15,9 @@ repository-owned image publisher.
 - Publish both supported Linux architectures in one manifest.
 - Publish an immutable full-SHA tag for GitOps while granting the workflow only
   read-content and write-package access; do not publish a mutable `main` tag.
-- Fail closed before building when either full-SHA tag already exists or either
-  registry cannot prove that its tag is absent.
+- Fail closed when the Beijing full-SHA tag already exists or either registry
+  state is uncertain, while allowing an interrupted publication to restore a
+  missing Beijing mirror from an existing immutable GHCR image.
 - Serialize all runs for the same commit across branch and tag aliases so the
   absence check and first publication cannot race.
 

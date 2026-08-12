@@ -10,13 +10,15 @@ workflow. Each published manifest MUST support `linux/amd64` and
 publish a mutable `main` tag. Production GitOps consumers MUST be able to
 select the immutable in-region tag.
 
-Before publishing, the workflow MUST prove that the full-SHA tag does not
-already exist in either registry. It MUST fail without building when either tag
-exists and MUST fail closed when a registry or network error prevents either
-absence check. It MUST NOT overwrite a previously published full-SHA tag. Runs
-selecting the same commit through different branch or tag refs MUST be
-serialized by the full commit SHA and MUST NOT cancel the run that currently
-owns publication.
+Before publishing, the workflow MUST determine the full-SHA tag state in both
+registries and MUST fail closed when a registry or network error prevents that
+check. It MUST fail without building when the Beijing tag already exists and
+MUST NOT overwrite a previously published full-SHA tag. When GHCR already has
+the selected immutable image but the Beijing tag is absent, the workflow MUST
+recover the missing mirror from that GHCR image without rebuilding or changing
+the GHCR tag. Runs selecting the same commit through different branch or tag
+refs MUST be serialized by the full commit SHA and MUST NOT cancel the run
+that currently owns publication.
 
 The workflow MUST use pinned action revisions and MUST limit its repository
 permissions to reading contents and writing packages. Pull request events MUST
@@ -45,7 +47,7 @@ NOT publish images.
 
 #### Scenario: Repeated publication cannot change an immutable tag
 
-- **GIVEN** the selected commit's full-SHA tag already exists in either registry
+- **GIVEN** the selected commit's full-SHA tag already exists in the Beijing registry
 - **WHEN** the workflow is rerun or manually dispatched for that commit
 - **THEN** it fails before the image build
 - **AND** the existing tag is not overwritten
@@ -55,6 +57,14 @@ NOT publish images.
 - **GIVEN** the workflow cannot determine whether either full-SHA tag exists
 - **WHEN** the pre-publish check encounters a registry or network error
 - **THEN** the workflow fails without publishing
+
+#### Scenario: Interrupted publication can restore the in-region mirror
+
+- **GIVEN** the selected commit's immutable full-SHA tag exists in GHCR
+- **AND** the Beijing full-SHA tag is absent
+- **WHEN** the workflow is rerun for that commit
+- **THEN** it copies the existing GHCR image to the Beijing registry
+- **AND** it does not rebuild or overwrite the GHCR image
 
 #### Scenario: Branch and tag aliases cannot race publication
 
