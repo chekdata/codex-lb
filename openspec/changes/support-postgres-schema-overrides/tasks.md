@@ -21,7 +21,7 @@
 
 - [x] 2.1 Expose the schema setting through Helm values, templates, and example
       overlays
-- [x] 2.2 Document shared PostgreSQL installs in the Helm README and
+- [x] 2.2 Document shared PostgreSQL installs in the Kubernetes guide and
       `.env.example`
 - [x] 2.3 Regenerate the checked-in settings reference page
 
