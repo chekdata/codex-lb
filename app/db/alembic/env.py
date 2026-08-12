@@ -65,6 +65,10 @@ def run_migrations_online() -> None:
         schema = normalize_postgres_schema(get_settings().database_postgres_schema)
         ensure_postgres_schema_exists(connection, schema)
         apply_postgres_migration_search_path(connection, schema)
+        if connection.dialect.name == "postgresql" and connection.in_transaction():
+            # Schema creation and set_config autobegin a transaction. Commit it
+            # before Alembic owns transaction boundaries and autocommit blocks.
+            connection.commit()
         context.configure(
             connection=connection,
             target_metadata=target_metadata,

@@ -83,6 +83,16 @@ def test_configured_schema_does_not_reuse_public_alembic_state(monkeypatch: pyte
                 inspector = inspect(connection)
                 assert inspector.has_table("alembic_version", schema=schema)
                 assert inspector.has_table("accounts", schema=schema)
+                enum_values = connection.execute(
+                    text(
+                        "SELECT e.enumlabel FROM pg_enum e "
+                        "JOIN pg_type t ON e.enumtypid = t.oid "
+                        "JOIN pg_namespace n ON t.typnamespace = n.oid "
+                        "WHERE n.nspname = :schema AND t.typname = 'account_status'"
+                    ),
+                    {"schema": schema},
+                ).scalars()
+                assert "reauth_required" in set(enum_values)
         finally:
             engine.dispose()
     finally:

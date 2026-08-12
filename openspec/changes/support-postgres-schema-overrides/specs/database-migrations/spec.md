@@ -57,3 +57,5 @@ MUST surface directly instead of silently falling back to `public`.
 - **THEN** it treats `codex_lb_prod` as uninitialized
 - **AND** it creates and migrates tables in `codex_lb_prod` instead of reusing
   the migration state from `public`
+- **AND** PostgreSQL catalog probes for enum types resolve only against
+  `codex_lb_prod`
