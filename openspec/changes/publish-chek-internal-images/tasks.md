@@ -7,6 +7,7 @@
 - [x] 1.3 Emit immutable full-SHA and mutable main tags with minimal permissions
 - [x] 1.4 Refuse to overwrite an existing full-SHA tag and fail closed when its
       registry state cannot be confirmed
+- [x] 1.5 Serialize publication by full commit SHA across branch and tag refs
 
 ## 2. Verification
 

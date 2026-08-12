@@ -12,7 +12,9 @@ consumers MUST be able to select the immutable tag.
 Before publishing, the workflow MUST prove that the full-SHA tag does not
 already exist. It MUST fail without building when the tag exists and MUST fail
 closed when a registry or network error prevents that absence check. It MUST
-NOT overwrite a previously published full-SHA tag.
+NOT overwrite a previously published full-SHA tag. Runs selecting the same
+commit through different branch or tag refs MUST be serialized by the full
+commit SHA and MUST NOT cancel the run that currently owns publication.
 
 The workflow MUST use pinned action revisions and MUST limit its repository
 permissions to reading contents and writing packages. Pull request events MUST
@@ -50,3 +52,11 @@ NOT publish images.
 - **GIVEN** the workflow cannot determine whether the full-SHA tag exists
 - **WHEN** the pre-publish check encounters a registry or network error
 - **THEN** the workflow fails without publishing
+
+#### Scenario: Branch and tag aliases cannot race publication
+
+- **GIVEN** a branch and a tag both select the same commit
+- **WHEN** push and manual-dispatch runs overlap for those refs
+- **THEN** the runs execute the absence check and publication serially
+- **AND** the later run observes the tag created by the first run and fails
+  before building

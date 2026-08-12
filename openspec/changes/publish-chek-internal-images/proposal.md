@@ -16,6 +16,8 @@ repository-owned image publisher.
   tag while granting the workflow only read-content and write-package access.
 - Fail closed before building when the full-SHA tag already exists or the
   registry cannot prove that it is absent.
+- Serialize all runs for the same commit across branch and tag aliases so the
+  absence check and first publication cannot race.
 
 ## Impact
 
