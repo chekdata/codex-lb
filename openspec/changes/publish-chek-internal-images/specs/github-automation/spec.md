@@ -2,19 +2,21 @@
 
 ### Requirement: CHEK fork publishes internally owned container images
 
-The `chekdata/codex-lb` repository SHALL build and publish a container image to
-`ghcr.io/chekdata/codex-lb` after changes land on `main` and when an operator
-explicitly dispatches the workflow. The published manifest MUST support
-`linux/amd64` and `linux/arm64`, MUST include an immutable `sha-<full-commit>`
-tag, and MUST NOT publish a mutable `main` tag. Production GitOps consumers
-MUST be able to select the immutable tag.
+The `chekdata/codex-lb` repository SHALL build and publish the same container
+image to `ghcr.io/chekdata/codex-lb` and CHEK's Beijing production registry
+after changes land on `main` and when an operator explicitly dispatches the
+workflow. Each published manifest MUST support `linux/amd64` and
+`linux/arm64`, MUST include an immutable `sha-<full-commit>` tag, and MUST NOT
+publish a mutable `main` tag. Production GitOps consumers MUST be able to
+select the immutable in-region tag.
 
 Before publishing, the workflow MUST prove that the full-SHA tag does not
-already exist. It MUST fail without building when the tag exists and MUST fail
-closed when a registry or network error prevents that absence check. It MUST
-NOT overwrite a previously published full-SHA tag. Runs selecting the same
-commit through different branch or tag refs MUST be serialized by the full
-commit SHA and MUST NOT cancel the run that currently owns publication.
+already exist in either registry. It MUST fail without building when either tag
+exists and MUST fail closed when a registry or network error prevents either
+absence check. It MUST NOT overwrite a previously published full-SHA tag. Runs
+selecting the same commit through different branch or tag refs MUST be
+serialized by the full commit SHA and MUST NOT cancel the run that currently
+owns publication.
 
 The workflow MUST use pinned action revisions and MUST limit its repository
 permissions to reading contents and writing packages. Pull request events MUST
@@ -24,6 +26,7 @@ NOT publish images.
 
 - **WHEN** a reviewed commit lands on `main`
 - **THEN** the workflow publishes `ghcr.io/chekdata/codex-lb:sha-<full-commit>`
+- **AND** it publishes the same tag to CHEK's Beijing production registry
 - **AND** the image manifest supports `linux/amd64` and `linux/arm64`
 - **AND** the run does not publish a mutable `main` tag
 
@@ -42,14 +45,14 @@ NOT publish images.
 
 #### Scenario: Repeated publication cannot change an immutable tag
 
-- **GIVEN** the selected commit's full-SHA tag already exists in GHCR
+- **GIVEN** the selected commit's full-SHA tag already exists in either registry
 - **WHEN** the workflow is rerun or manually dispatched for that commit
 - **THEN** it fails before the image build
 - **AND** the existing tag is not overwritten
 
 #### Scenario: Registry uncertainty fails closed
 
-- **GIVEN** the workflow cannot determine whether the full-SHA tag exists
+- **GIVEN** the workflow cannot determine whether either full-SHA tag exists
 - **WHEN** the pre-publish check encounters a registry or network error
 - **THEN** the workflow fails without publishing
 

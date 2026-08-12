@@ -38,25 +38,42 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Refuse to overwrite immutable tag
+      - name: Log in to CHEK Beijing registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ${{ secrets.REGISTRY_ENDPOINT }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Refuse to overwrite immutable tags
         env:
-          IMAGE_REF: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+          GHCR_IMAGE_REF: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+          BEIJING_IMAGE_REF: ${{ secrets.REGISTRY_ENDPOINT }}/prod/codex-lb:sha-${{ github.sha }}
         run: |
-          if docker buildx imagetools inspect "${IMAGE_REF}" >/dev/null 2>inspect-error.log; then
-            echo "::error::Immutable image tag already exists: ${IMAGE_REF}"
-            exit 1
-          fi
-          if ! grep -Eiq 'manifest unknown|name unknown|not found' inspect-error.log; then
-            cat inspect-error.log >&2
-            echo "::error::Unable to prove immutable image tag is absent"
-            exit 1
-          fi
+          check_absent() {
+            image_ref="$1"
+            error_log="$2"
+            if docker buildx imagetools inspect "${image_ref}" >/dev/null 2>"${error_log}"; then
+              echo "::error::Immutable image tag already exists: ${image_ref}"
+              exit 1
+            fi
+            if ! grep -Eiq 'manifest unknown|name unknown|not found' "${error_log}"; then
+              cat "${error_log}" >&2
+              echo "::error::Unable to prove immutable image tag is absent: ${image_ref}"
+              exit 1
+            fi
+          }
+
+          check_absent "${GHCR_IMAGE_REF}" ghcr-inspect-error.log
+          check_absent "${BEIJING_IMAGE_REF}" beijing-inspect-error.log
 
       - name: Extract image metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: |
+            ghcr.io/${{ github.repository }}
+            ${{ secrets.REGISTRY_ENDPOINT }}/prod/codex-lb
           tags: |
             type=sha,prefix=sha-,format=long
 
