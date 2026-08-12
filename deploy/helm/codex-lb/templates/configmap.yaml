@@ -14,6 +14,9 @@ data:
   CODEX_LB_DATABASE_MIGRATE_ON_STARTUP: {{ .Values.config.databaseMigrateOnStartup | toString | quote }}
   CODEX_LB_DATABASE_POOL_SIZE: {{ .Values.config.databasePoolSize | toString | quote }}
   CODEX_LB_DATABASE_MAX_OVERFLOW: {{ .Values.config.databaseMaxOverflow | toString | quote }}
+  {{- if .Values.config.databasePostgresSchema }}
+  CODEX_LB_DATABASE_POSTGRES_SCHEMA: {{ .Values.config.databasePostgresSchema | quote }}
+  {{- end }}
   # Upstream
   {{- if .Values.config.upstreamBaseUrl }}
   CODEX_LB_UPSTREAM_BASE_URL: {{ .Values.config.upstreamBaseUrl | quote }}

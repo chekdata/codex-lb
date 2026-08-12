@@ -15,6 +15,7 @@ from alembic import command
 from alembic.util.exc import CommandError
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy import exc as sa_exc
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import Connection
 
 import app.db.migrate as migrate_module
@@ -34,7 +35,12 @@ from app.db.migrate import (
     wait_for_connection,
     wait_for_head,
 )
-from app.db.migration_url import to_sync_database_url
+from app.db.migration_url import (
+    apply_postgres_search_path,
+    ensure_postgres_schema_exists,
+    postgres_search_path,
+    to_sync_database_url,
+)
 from app.db.models import Base
 from app.modules.usage.additional_quota_keys import clear_additional_quota_registry_cache
 
@@ -211,6 +217,122 @@ def test_wait_for_connection_times_out_when_database_stays_unreachable(monkeypat
 
     with pytest.raises(TimeoutError, match="Timed out waiting for database connectivity"):
         wait_for_connection("sqlite+aiosqlite:///tmp/test.db", timeout_seconds=2.0, interval_seconds=1.0)
+
+
+def test_postgres_search_path_helper_normalizes_schema() -> None:
+    assert postgres_search_path(None) is None
+    assert postgres_search_path("") is None
+    assert postgres_search_path("  ") is None
+    assert postgres_search_path("public") == "public"
+    assert postgres_search_path("codex_lb_prod") == "codex_lb_prod,public"
+
+
+def test_apply_postgres_search_path_is_noop_for_non_postgres() -> None:
+    class _Connection:
+        dialect = SimpleNamespace(name="sqlite")
+
+        def execute(self, *_args, **_kwargs) -> None:
+            raise AssertionError("execute should not be called for non-PostgreSQL backends")
+
+    apply_postgres_search_path(cast(Connection, _Connection()), "codex_lb_prod")
+
+
+def test_apply_postgres_search_path_sets_transaction_scope_path_for_postgres() -> None:
+    calls: list[tuple[object, object]] = []
+
+    class _Connection:
+        dialect = SimpleNamespace(name="postgresql")
+
+        def execute(self, statement: object, params: object) -> None:
+            calls.append((statement, params))
+
+    connection = cast(Connection, _Connection())
+
+    apply_postgres_search_path(connection, "codex_lb_prod")
+
+    assert len(calls) == 1
+    _statement, params = calls[0]
+    assert params == {"search_path": "codex_lb_prod,public"}
+
+
+def test_ensure_postgres_schema_exists_is_noop_for_non_postgres() -> None:
+    class _Connection:
+        dialect = SimpleNamespace(name="sqlite")
+
+        def execute(self, *_args, **_kwargs) -> None:
+            raise AssertionError("execute should not be called for non-PostgreSQL backends")
+
+    ensure_postgres_schema_exists(cast(Connection, _Connection()), "codex_lb_prod")
+
+
+def test_ensure_postgres_schema_exists_skips_public_schema() -> None:
+    class _Connection:
+        dialect = SimpleNamespace(name="postgresql")
+
+        def execute(self, *_args, **_kwargs) -> None:
+            raise AssertionError("public schema should not trigger CREATE SCHEMA")
+
+    ensure_postgres_schema_exists(cast(Connection, _Connection()), "public")
+
+
+def test_ensure_postgres_schema_exists_creates_missing_postgres_schema() -> None:
+    calls: list[object] = []
+
+    class _Connection:
+        dialect = SimpleNamespace(name="postgresql")
+
+        def execute(self, statement: object) -> None:
+            calls.append(statement)
+
+    ensure_postgres_schema_exists(cast(Connection, _Connection()), "codex_lb_prod")
+
+    assert len(calls) == 1
+    statement = calls[0]
+    compiled = str(statement.compile(dialect=postgresql.dialect()))
+    assert compiled == "CREATE SCHEMA IF NOT EXISTS codex_lb_prod"
+
+
+def test_sync_connection_creates_schema_before_search_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, str | None]] = []
+
+    class _ConnectionContext:
+        def __enter__(self) -> Connection:
+            return cast(Connection, object())
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+    class _Engine:
+        def connect(self) -> _ConnectionContext:
+            return _ConnectionContext()
+
+        def dispose(self) -> None:
+            return None
+
+    monkeypatch.setattr(migrate_module, "create_engine", lambda *_args, **_kwargs: _Engine())
+    monkeypatch.setattr(
+        migrate_module,
+        "get_settings",
+        lambda: SimpleNamespace(database_postgres_schema="codex_lb_prod"),
+    )
+    monkeypatch.setattr(
+        migrate_module,
+        "ensure_postgres_schema_exists",
+        lambda _connection, schema: calls.append(("ensure", schema)),
+    )
+    monkeypatch.setattr(
+        migrate_module,
+        "apply_postgres_search_path",
+        lambda _connection, schema: calls.append(("search_path", schema)),
+    )
+
+    with migrate_module._sync_connection("postgresql+psycopg://codex_lb:codex_lb@127.0.0.1:5432/codex_lb"):
+        pass
+
+    assert calls == [
+        ("ensure", "codex_lb_prod"),
+        ("search_path", "codex_lb_prod"),
+    ]
 
 
 def test_schema_migration_contract_matches_after_upgrade(tmp_path: Path) -> None:

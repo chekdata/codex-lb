@@ -76,13 +76,15 @@ Supported DB wiring:
 - `externalDatabase.host`, `externalDatabase.port`, `externalDatabase.database`, `externalDatabase.user`
 - `externalDatabase.existingSecret`
 - `auth.existingSecret` if one secret contains both `database-url` and `encryption-key`
+- `config.databasePostgresSchema` when you share one PostgreSQL database and want codex-lb isolated in its own schema
 
 Example using a direct URL:
 
 ```bash
 helm install codex-lb oci://ghcr.io/soju06/charts/codex-lb \
   --set postgresql.enabled=false \
-  --set externalDatabase.url='postgresql+asyncpg://user:pass@db.example.com:5432/codexlb'
+  --set externalDatabase.url='postgresql+asyncpg://user:pass@db.example.com:5432/codexlb' \
+  --set config.databasePostgresSchema=codex_lb_prod
 ```
 
 Example using separate secrets:
@@ -100,7 +102,8 @@ helm install codex-lb oci://ghcr.io/soju06/charts/codex-lb \
 ```bash
 helm upgrade --install codex-lb deploy/helm/codex-lb/ \
   -f deploy/helm/codex-lb/values-external-db.yaml \
-  --set externalDatabase.url='postgresql+asyncpg://user:pass@db.example.com:5432/codexlb'
+  --set externalDatabase.url='postgresql+asyncpg://user:pass@db.example.com:5432/codexlb' \
+  --set config.databasePostgresSchema=codex_lb_prod
 ```
 
 </details>
@@ -216,6 +219,7 @@ This chart intentionally keeps migration behavior explicit by install mode.
 - Application pods use a schema gate initContainer when `migration.enabled=true`, `config.databaseMigrateOnStartup=false`, and `migration.schemaGate.enabled=true`.
 - That initContainer runs `python -m app.db.migrate wait-for-head` and blocks the app container until the database is at Alembic head.
 - In bundled mode, `values-bundled.yaml` enables startup migration instead of the schema gate so fresh self-contained installs do not deadlock on `helm install --wait`.
+- When `config.databasePostgresSchema` is non-empty, the migration Job, schema-gate initContainers, and the main workload all use the same PostgreSQL `search_path` prefix so a shared database stays isolated by schema.
 
 This means:
 
@@ -239,6 +243,21 @@ Use `auth.existingSecret` when one secret contains both:
 Use `externalDatabase.existingSecret` for the database URL and let the chart manage or reference a separate app secret for `encryption-key`.
 
 When `externalDatabase.existingSecret` is set and `auth.existingSecret` is not, the chart-managed app secret contains only the encryption key; the StatefulSet reads `CODEX_LB_DATABASE_URL` from the external DB secret.
+
+## Shared PostgreSQL Databases
+
+If your platform shares one PostgreSQL database across multiple applications, set `config.databasePostgresSchema` so codex-lb uses its own schema while continuing to keep `public` on the search path for standard PostgreSQL behavior:
+
+```yaml
+config:
+  databasePostgresSchema: codex_lb_prod
+```
+
+On the first migration run codex-lb attempts `CREATE SCHEMA IF NOT EXISTS`
+before it reads or advances Alembic state. If your deployment user is not
+allowed to create schemas, pre-create the schema once and keep using the same
+`config.databasePostgresSchema` value for the workload, migration Job, and
+schema gate.
 
 ## Network Policy
 

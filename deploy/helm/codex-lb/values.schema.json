@@ -207,6 +207,9 @@
     "config": {
       "type": "object",
       "properties": {
+        "databasePostgresSchema": {
+          "type": "string"
+        },
         "shutdownDrainTimeoutSeconds": {
           "type": "integer",
           "minimum": 1

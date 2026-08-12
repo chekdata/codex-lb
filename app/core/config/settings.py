@@ -249,6 +249,7 @@ class Settings(BaseSettings):
     database_sqlite_pre_migrate_backup_enabled: bool = True
     database_sqlite_pre_migrate_backup_max_files: int = Field(default=5, ge=1)
     database_sqlite_startup_check_mode: Literal["quick", "full", "off"] = "quick"
+    database_postgres_schema: str | None = None
     database_alembic_auto_remap_enabled: bool = True
     database_migration_lock_timeout_seconds: float = Field(default=300.0, gt=0)
     upstream_base_url: str = "https://chatgpt.com/backend-api"
@@ -490,6 +491,16 @@ class Settings(BaseSettings):
                 if path.startswith("~"):
                     return f"{prefix}{Path(path).expanduser()}"
         return value
+
+    @field_validator("database_postgres_schema", mode="before")
+    @classmethod
+    def _normalize_database_postgres_schema(cls, value: OptionalStringInput) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        raise TypeError("database_postgres_schema must be a string")
 
     @field_validator("encryption_key_file", mode="before")
     @classmethod

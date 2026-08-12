@@ -6,7 +6,7 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from app.core.config.settings import get_settings
-from app.db.migration_url import to_sync_database_url
+from app.db.migration_url import apply_postgres_search_path, ensure_postgres_schema_exists, to_sync_database_url
 from app.db.models import Base
 
 config = context.config
@@ -53,6 +53,8 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
+        ensure_postgres_schema_exists(connection, get_settings().database_postgres_schema)
+        apply_postgres_search_path(connection, get_settings().database_postgres_schema)
         context.configure(
             connection=connection,
             target_metadata=target_metadata,

@@ -1786,7 +1786,7 @@ async def missing_durable_bridge_tables(session: AsyncSession) -> tuple[str, ...
         result = await session.execute(
             text(
                 "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = 'public' "
+                "WHERE table_schema = ANY (current_schemas(false)) "
                 "AND table_name IN ("
                 "'http_bridge_sessions', 'http_bridge_session_aliases', 'http_bridge_retry_circuits', "
                 "'http_bridge_recovery_attempts'"

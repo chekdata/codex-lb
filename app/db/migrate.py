@@ -22,7 +22,7 @@ from sqlalchemy.engine import Connection
 from app.core.config.settings import get_settings
 from app.db.alembic.revision_ids import LEGACY_MIGRATION_TO_NEW_REVISION, OLD_TO_NEW_REVISION_MAP, REVISION_ID_PATTERN
 from app.db.migration_lock import migration_lock
-from app.db.migration_url import to_sync_database_url
+from app.db.migration_url import apply_postgres_search_path, ensure_postgres_schema_exists, to_sync_database_url
 from app.db.models import Base
 
 logger = logging.getLogger(__name__)
@@ -178,6 +178,8 @@ def _sync_connection(sync_database_url: str) -> Iterator[Connection]:
     engine = create_engine(sync_database_url, future=True)
     try:
         with engine.connect() as connection:
+            ensure_postgres_schema_exists(connection, get_settings().database_postgres_schema)
+            apply_postgres_search_path(connection, get_settings().database_postgres_schema)
             yield connection
     finally:
         engine.dispose()
@@ -188,6 +190,8 @@ def _sync_transaction(sync_database_url: str) -> Iterator[Connection]:
     engine = create_engine(sync_database_url, future=True)
     try:
         with engine.begin() as connection:
+            ensure_postgres_schema_exists(connection, get_settings().database_postgres_schema)
+            apply_postgres_search_path(connection, get_settings().database_postgres_schema)
             yield connection
     finally:
         engine.dispose()
