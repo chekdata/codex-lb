@@ -13,7 +13,7 @@
 - [x] 1.3.2 Scope migration state and Alembic's version table to the configured
       schema without the runtime `public` fallback
 - [x] 1.3.3 Commit PostgreSQL schema setup before Alembic owns transaction
-      boundaries and scope historical enum catalog probes to the active schema
+      boundaries and scope historical enum catalog probes to the visible type
 - [x] 1.4 Make durable-bridge table guards resolve against the active
       PostgreSQL schemas instead of hard-coding `public`
 

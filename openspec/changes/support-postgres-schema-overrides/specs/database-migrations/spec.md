@@ -57,5 +57,14 @@ MUST surface directly instead of silently falling back to `public`.
 - **THEN** it treats `codex_lb_prod` as uninitialized
 - **AND** it creates and migrates tables in `codex_lb_prod` instead of reusing
   the migration state from `public`
-- **AND** PostgreSQL catalog probes for enum types resolve only against
-  `codex_lb_prod`
+- **AND** PostgreSQL catalog probes use the enum type visible through the active
+  migration search path
+
+#### Scenario: Existing default search paths retain visible public enum probes
+
+- **GIVEN** no schema override is configured
+- **AND** a user schema precedes `public` on the default search path
+- **AND** the visible codex-lb enum type exists in `public`
+- **WHEN** a historical migration probes that enum's labels
+- **THEN** it resolves the visible `public` type rather than assuming the first
+  schema owns the type

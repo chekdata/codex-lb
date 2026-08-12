@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from collections.abc import Callable
 from uuid import uuid4
 
@@ -104,6 +105,33 @@ def test_configured_schema_does_not_reuse_public_alembic_state(monkeypatch: pyte
             engine.dispose()
         monkeypatch.delenv("CODEX_LB_DATABASE_POSTGRES_SCHEMA", raising=False)
         get_settings.cache_clear()
+
+
+@pytest.mark.skipif(not _is_postgresql_database_url(_DATABASE_URL), reason="PostgreSQL-only enum visibility")
+def test_enum_probe_follows_visible_public_type_without_schema_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    schema = f"codex_lb_path_{uuid4().hex}"
+    sync_url = to_sync_database_url(_DATABASE_URL)
+    monkeypatch.delenv("CODEX_LB_DATABASE_POSTGRES_SCHEMA", raising=False)
+    get_settings.cache_clear()
+    run_upgrade(_DATABASE_URL, "head", bootstrap_legacy=False)
+
+    engine = create_engine(sync_url, future=True)
+    try:
+        with engine.begin() as connection:
+            connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+            connection.execute(
+                text("SELECT set_config('search_path', :search_path, false)"),
+                {"search_path": f'"{schema}",public'},
+            )
+            migration = importlib.import_module(
+                "app.db.alembic.versions.20260310_000000_fix_postgresql_enum_value_casing"
+            )
+
+            assert migration._enum_value_exists(connection, "account_status", "active") is True
+    finally:
+        with engine.begin() as connection:
+            connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        engine.dispose()
 
 
 def _make_account(account_id: str, email: str, plan_type: str) -> Account:
