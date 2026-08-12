@@ -5,7 +5,7 @@
 The `chekdata/codex-lb` repository SHALL build and publish a container image to
 `ghcr.io/chekdata/codex-lb` after changes land on `main` and when an operator
 explicitly dispatches the workflow. The published manifest MUST support
-`linux/amd64` and `linux/arm64`, MUST include an immutable `sha-<short-commit>`
+`linux/amd64` and `linux/arm64`, MUST include an immutable `sha-<full-commit>`
 tag, and MAY update the `main` tag for operator convenience. Production GitOps
 consumers MUST be able to select the immutable tag.
 
@@ -16,7 +16,7 @@ NOT publish images.
 #### Scenario: Main commit produces an immutable multi-architecture image
 
 - **WHEN** a reviewed commit lands on `main`
-- **THEN** the workflow publishes `ghcr.io/chekdata/codex-lb:sha-<short-commit>`
+- **THEN** the workflow publishes `ghcr.io/chekdata/codex-lb:sha-<full-commit>`
 - **AND** the image manifest supports `linux/amd64` and `linux/arm64`
 - **AND** the same run updates `ghcr.io/chekdata/codex-lb:main`
 
@@ -30,4 +30,4 @@ NOT publish images.
 
 - **WHEN** an operator manually dispatches the workflow on an allowed ref
 - **THEN** the workflow builds and publishes the selected commit with its
-  immutable short-SHA tag
+  immutable full-SHA tag

@@ -12,7 +12,7 @@ repository-owned image publisher.
 - Add a focused GitHub Actions workflow that publishes the fork to
   `ghcr.io/chekdata/codex-lb` after a push to `main` or an explicit manual run.
 - Publish both supported Linux architectures in one manifest.
-- Publish an immutable short-SHA tag for GitOps and a mutable `main` convenience
+- Publish an immutable full-SHA tag for GitOps and a mutable `main` convenience
   tag while granting the workflow only read-content and write-package access.
 
 ## Impact
@@ -20,4 +20,4 @@ repository-owned image publisher.
 - Affected capability: `github-automation`
 - Affected automation: `.github/workflows/internal-image.yml`
 - Production manifests can pin a reviewed `sha-*` image without depending on
-  upstream publishing permissions or tags.
+  upstream publishing permissions or abbreviated-tag collisions.
