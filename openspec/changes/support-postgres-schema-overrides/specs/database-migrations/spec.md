@@ -4,7 +4,7 @@
 
 When `database_url` resolves to PostgreSQL and `database_postgres_schema` is a
 non-empty string, every sync migration path MUST operate with a PostgreSQL
-search path of `<configured-schema>,public`. This requirement applies to the
+search path containing only `<configured-schema>`. This requirement applies to the
 Alembic environment, startup migration upgrade path, startup drift check,
 `wait-for-head`, and `wait-for-connection` / schema-inspection helpers that use
 the shared sync connection factories. When the setting is omitted or empty,
@@ -16,7 +16,7 @@ existing migration behavior MUST remain unchanged.
 - **AND** `database_postgres_schema = "codex_lb_prod"`
 - **WHEN** startup migration or drift-check code opens a sync PostgreSQL
   connection
-- **THEN** the connection uses `search_path = codex_lb_prod,public`
+- **THEN** the connection uses a migration-only `search_path = "codex_lb_prod"`
 - **AND** Alembic upgrades and ORM drift checks resolve unqualified schema
   objects inside `codex_lb_prod`
 
@@ -47,3 +47,13 @@ MUST surface directly instead of silently falling back to `public`.
 - **THEN** codex-lb creates `codex_lb_prod` before setting `search_path`
 - **AND** subsequent Alembic state reads and upgrades resolve inside
   `codex_lb_prod`
+
+#### Scenario: Public migration state cannot mask an uninitialized application schema
+
+- **GIVEN** `public.alembic_version` is already at the current head
+- **AND** `database_postgres_schema = "codex_lb_prod"`
+- **AND** `codex_lb_prod` has no Alembic version table
+- **WHEN** codex-lb inspects or upgrades the configured schema
+- **THEN** it treats `codex_lb_prod` as uninitialized
+- **AND** it creates and migrates tables in `codex_lb_prod` instead of reusing
+  the migration state from `public`

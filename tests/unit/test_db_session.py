@@ -345,7 +345,7 @@ def test_postgres_connect_args_include_search_path_when_schema_is_configured(mon
     assert connect_args == {
         "server_settings": {
             "timezone": "UTC",
-            "search_path": "codex_lb_prod,public",
+            "search_path": '"codex_lb_prod",public',
         }
     }
 

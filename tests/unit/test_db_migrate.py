@@ -37,8 +37,10 @@ from app.db.migrate import (
     wait_for_head,
 )
 from app.db.migration_url import (
+    apply_postgres_migration_search_path,
     apply_postgres_search_path,
     ensure_postgres_schema_exists,
+    postgres_migration_search_path,
     postgres_search_path,
     to_sync_database_url,
 )
@@ -224,8 +226,10 @@ def test_postgres_search_path_helper_normalizes_schema() -> None:
     assert postgres_search_path(None) is None
     assert postgres_search_path("") is None
     assert postgres_search_path("  ") is None
-    assert postgres_search_path("public") == "public"
-    assert postgres_search_path("codex_lb_prod") == "codex_lb_prod,public"
+    assert postgres_search_path("public") == '"public"'
+    assert postgres_search_path("codex_lb_prod") == '"codex_lb_prod",public'
+    assert postgres_search_path('tenant"blue') == '"tenant""blue",public'
+    assert postgres_migration_search_path("codex_lb_prod") == '"codex_lb_prod"'
 
 
 def test_apply_postgres_search_path_is_noop_for_non_postgres() -> None:
@@ -253,7 +257,25 @@ def test_apply_postgres_search_path_sets_transaction_scope_path_for_postgres() -
 
     assert len(calls) == 1
     _statement, params = calls[0]
-    assert params == {"search_path": "codex_lb_prod,public"}
+    assert params == {"search_path": '"codex_lb_prod",public'}
+
+
+def test_apply_postgres_migration_search_path_excludes_public_fallback() -> None:
+    calls: list[tuple[object, object]] = []
+
+    class _Connection:
+        dialect = SimpleNamespace(name="postgresql")
+
+        def execute(self, statement: object, params: object) -> None:
+            calls.append((statement, params))
+
+    connection = cast(Connection, _Connection())
+    apply_postgres_migration_search_path(connection, "codex_lb_prod")
+
+    assert len(calls) == 1
+    _statement, params = calls[0]
+    assert params == {"search_path": '"codex_lb_prod"'}
+    assert connection.dialect.default_schema_name == "codex_lb_prod"
 
 
 def test_ensure_postgres_schema_exists_is_noop_for_non_postgres() -> None:
@@ -323,7 +345,7 @@ def test_sync_connection_creates_schema_before_search_path(monkeypatch: pytest.M
     )
     monkeypatch.setattr(
         migrate_module,
-        "apply_postgres_search_path",
+        "apply_postgres_migration_search_path",
         lambda _connection, schema: calls.append(("search_path", schema)),
     )
 
@@ -334,6 +356,26 @@ def test_sync_connection_creates_schema_before_search_path(monkeypatch: pytest.M
         ("ensure", "codex_lb_prod"),
         ("search_path", "codex_lb_prod"),
     ]
+
+
+def test_read_table_names_scopes_postgres_inspection_to_configured_schema(monkeypatch) -> None:
+    calls: list[str | None] = []
+
+    class _Inspector:
+        def get_table_names(self, *, schema: str | None) -> list[str]:
+            calls.append(schema)
+            return ["alembic_version"]
+
+    connection = cast(Connection, SimpleNamespace(dialect=SimpleNamespace(name="postgresql")))
+    monkeypatch.setattr(migrate_module, "inspect", lambda _connection: _Inspector())
+    monkeypatch.setattr(
+        migrate_module,
+        "get_settings",
+        lambda: SimpleNamespace(database_postgres_schema="codex_lb_prod"),
+    )
+
+    assert migrate_module._read_table_names(connection) == {"alembic_version"}
+    assert calls == ["codex_lb_prod"]
 
 
 def test_schema_migration_contract_matches_after_upgrade(tmp_path: Path) -> None:
@@ -2106,6 +2148,8 @@ class _FakeConnection:
 
 
 class _MissingAlembicVersionConnection:
+    dialect = SimpleNamespace(name="postgresql")
+
     def execute(self, statement: object) -> None:
         raise sa_exc.ProgrammingError(
             str(statement),
@@ -2115,6 +2159,8 @@ class _MissingAlembicVersionConnection:
 
 
 class _MissingAlembicVersionSQLiteConnection:
+    dialect = SimpleNamespace(name="sqlite")
+
     def execute(self, statement: object) -> None:
         raise sa_exc.OperationalError(
             str(statement),
@@ -2128,12 +2174,14 @@ class _FakeInspector:
         self._has_table = has_table
         self._version_num_length = version_num_length
 
-    def has_table(self, table_name: str) -> bool:
+    def has_table(self, table_name: str, *, schema: str | None = None) -> bool:
         assert table_name == "alembic_version"
+        assert schema is None
         return self._has_table
 
-    def get_columns(self, table_name: str) -> list[dict[str, object]]:
+    def get_columns(self, table_name: str, *, schema: str | None = None) -> list[dict[str, object]]:
         assert table_name == "alembic_version"
+        assert schema is None
         return [
             {
                 "name": "version_num",
@@ -2150,7 +2198,7 @@ def test_ensure_alembic_version_table_capacity_creates_table_when_missing(monkey
     _ensure_alembic_version_table_capacity_for_connection(cast(Connection, connection), required_length=64)
 
     assert connection.executed_sql == [
-        "CREATE TABLE IF NOT EXISTS alembic_version ( version_num VARCHAR(64) NOT NULL, PRIMARY KEY (version_num) )"
+        'CREATE TABLE IF NOT EXISTS "alembic_version" ( version_num VARCHAR(64) NOT NULL, PRIMARY KEY (version_num) )'
     ]
 
 
@@ -2161,7 +2209,7 @@ def test_ensure_alembic_version_table_capacity_alters_short_column(monkeypatch) 
 
     _ensure_alembic_version_table_capacity_for_connection(cast(Connection, connection), required_length=64)
 
-    assert connection.executed_sql == ["ALTER TABLE alembic_version ALTER COLUMN version_num TYPE VARCHAR(64)"]
+    assert connection.executed_sql == ['ALTER TABLE "alembic_version" ALTER COLUMN version_num TYPE VARCHAR(64)']
 
 
 def test_read_current_revisions_returns_empty_when_alembic_version_table_is_missing() -> None:

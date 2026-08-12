@@ -15,7 +15,7 @@ behavior MUST remain unchanged.
 - **GIVEN** `database_url` uses `postgresql+asyncpg://`
 - **AND** `database_postgres_schema = "codex_lb_prod"`
 - **WHEN** the application opens a new runtime PostgreSQL connection
-- **THEN** the connection uses `search_path = codex_lb_prod,public`
+- **THEN** the connection uses `search_path = "codex_lb_prod",public`
 - **AND** unqualified table reads and writes resolve to `codex_lb_prod` before
   `public`
 

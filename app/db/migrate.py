@@ -22,7 +22,13 @@ from sqlalchemy.engine import Connection
 from app.core.config.settings import get_settings
 from app.db.alembic.revision_ids import LEGACY_MIGRATION_TO_NEW_REVISION, OLD_TO_NEW_REVISION_MAP, REVISION_ID_PATTERN
 from app.db.migration_lock import migration_lock
-from app.db.migration_url import apply_postgres_search_path, ensure_postgres_schema_exists, to_sync_database_url
+from app.db.migration_url import (
+    apply_postgres_migration_search_path,
+    ensure_postgres_schema_exists,
+    normalize_postgres_schema,
+    postgres_qualified_name,
+    to_sync_database_url,
+)
 from app.db.models import Base
 
 logger = logging.getLogger(__name__)
@@ -179,7 +185,7 @@ def _sync_connection(sync_database_url: str) -> Iterator[Connection]:
     try:
         with engine.connect() as connection:
             ensure_postgres_schema_exists(connection, get_settings().database_postgres_schema)
-            apply_postgres_search_path(connection, get_settings().database_postgres_schema)
+            apply_postgres_migration_search_path(connection, get_settings().database_postgres_schema)
             yield connection
     finally:
         engine.dispose()
@@ -191,7 +197,7 @@ def _sync_transaction(sync_database_url: str) -> Iterator[Connection]:
     try:
         with engine.begin() as connection:
             ensure_postgres_schema_exists(connection, get_settings().database_postgres_schema)
-            apply_postgres_search_path(connection, get_settings().database_postgres_schema)
+            apply_postgres_migration_search_path(connection, get_settings().database_postgres_schema)
             yield connection
     finally:
         engine.dispose()
@@ -199,18 +205,31 @@ def _sync_transaction(sync_database_url: str) -> Iterator[Connection]:
 
 def _read_table_names(connection: Connection) -> set[str]:
     inspector = inspect(connection)
-    return set(inspector.get_table_names())
+    schema = _configured_postgres_schema(connection)
+    return set(inspector.get_table_names(schema=schema))
+
+
+def _configured_postgres_schema(connection: Connection) -> str | None:
+    if connection.dialect.name != "postgresql":
+        return None
+    return normalize_postgres_schema(get_settings().database_postgres_schema)
+
+
+def _migration_table_name(connection: Connection, table_name: str) -> str:
+    return postgres_qualified_name(table_name, _configured_postgres_schema(connection))
 
 
 def _read_legacy_migration_names(connection: Connection) -> set[str]:
-    result = connection.execute(text(f"SELECT name FROM {_LEGACY_MIGRATIONS_TABLE}"))
+    table_name = _migration_table_name(connection, _LEGACY_MIGRATIONS_TABLE)
+    result = connection.execute(text(f"SELECT name FROM {table_name}"))
     names = {str(row[0]) for row in result.fetchall() if row and row[0] is not None}
     return names
 
 
 def _read_current_revisions_from_connection(connection: Connection) -> tuple[str, ...]:
+    table_name = _migration_table_name(connection, _ALEMBIC_VERSION_TABLE)
     try:
-        rows = connection.execute(text(f"SELECT {_ALEMBIC_VERSION_COLUMN} FROM {_ALEMBIC_VERSION_TABLE}")).fetchall()
+        rows = connection.execute(text(f"SELECT {_ALEMBIC_VERSION_COLUMN} FROM {table_name}")).fetchall()
     except (sa_exc.ProgrammingError, sa_exc.OperationalError) as exc:
         # PostgreSQL can still raise UndefinedTable here on a fresh database if
         # the alembic_version table is absent when startup migration state is
@@ -359,7 +378,9 @@ def _ensure_alembic_version_table_capacity_for_connection(connection: Connection
         return
 
     inspector = inspect(connection)
-    if not inspector.has_table(_ALEMBIC_VERSION_TABLE):
+    schema = _configured_postgres_schema(connection)
+    table_name = postgres_qualified_name(_ALEMBIC_VERSION_TABLE, schema)
+    if not inspector.has_table(_ALEMBIC_VERSION_TABLE, schema=schema):
         # IF NOT EXISTS is defense-in-depth against concurrent out-of-band
         # `alembic upgrade` invocations that bypass run_upgrade's migration
         # lock; the product paths are already serialized by migration_lock.
@@ -367,7 +388,7 @@ def _ensure_alembic_version_table_capacity_for_connection(connection: Connection
             text(
                 " ".join(
                     (
-                        f"CREATE TABLE IF NOT EXISTS {_ALEMBIC_VERSION_TABLE} (",
+                        f"CREATE TABLE IF NOT EXISTS {table_name} (",
                         f"{_ALEMBIC_VERSION_COLUMN} VARCHAR({required_length}) NOT NULL,",
                         f"PRIMARY KEY ({_ALEMBIC_VERSION_COLUMN})",
                         ")",
@@ -377,7 +398,7 @@ def _ensure_alembic_version_table_capacity_for_connection(connection: Connection
         )
         return
 
-    columns = inspector.get_columns(_ALEMBIC_VERSION_TABLE)
+    columns = inspector.get_columns(_ALEMBIC_VERSION_TABLE, schema=schema)
     version_num_column = next((column for column in columns if column.get("name") == _ALEMBIC_VERSION_COLUMN), None)
     if version_num_column is None:
         raise MigrationBootstrapError(
@@ -389,10 +410,7 @@ def _ensure_alembic_version_table_capacity_for_connection(connection: Connection
         return
 
     connection.execute(
-        text(
-            f"ALTER TABLE {_ALEMBIC_VERSION_TABLE} "
-            f"ALTER COLUMN {_ALEMBIC_VERSION_COLUMN} TYPE VARCHAR({required_length})"
-        )
+        text(f"ALTER TABLE {table_name} ALTER COLUMN {_ALEMBIC_VERSION_COLUMN} TYPE VARCHAR({required_length})")
     )
 
 
@@ -482,13 +500,11 @@ def _remap_legacy_alembic_revisions(config: Config) -> tuple[str, ...]:
         if remapped == current_revisions:
             return ()
 
-        connection.execute(text(f"DELETE FROM {_ALEMBIC_VERSION_TABLE}"))
+        table_name = _migration_table_name(connection, _ALEMBIC_VERSION_TABLE)
+        connection.execute(text(f"DELETE FROM {table_name}"))
         for revision in remapped:
             connection.execute(
-                text(
-                    f"INSERT INTO {_ALEMBIC_VERSION_TABLE} ({_ALEMBIC_VERSION_COLUMN}) "
-                    f"VALUES (:{_ALEMBIC_VERSION_COLUMN})"
-                ),
+                text(f"INSERT INTO {table_name} ({_ALEMBIC_VERSION_COLUMN}) VALUES (:{_ALEMBIC_VERSION_COLUMN})"),
                 {_ALEMBIC_VERSION_COLUMN: revision},
             )
 

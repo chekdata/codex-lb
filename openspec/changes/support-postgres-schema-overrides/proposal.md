@@ -13,13 +13,17 @@ deployment just to isolate objects.
 ## What Changes
 
 - Add one explicit `database_postgres_schema` setting that, when configured,
-  pins PostgreSQL runtime sessions and migration paths to `<schema>,public`.
+  pins PostgreSQL runtime sessions to `<schema>,public` and migration paths to
+  the configured schema only.
 - Make Alembic, startup drift checks, migration waits, and durable-bridge table
   detection honor the configured active PostgreSQL schemas instead of assuming
   `public`.
 - Ensure migration/bootstrap paths create the configured PostgreSQL schema on
   first use when the database user is allowed to do so, so shared-database
   installs do not accidentally fall back to `public` Alembic state.
+- Scope migration search paths and Alembic's version table to the configured
+  schema only, while retaining the documented `public` fallback for runtime
+  application queries.
 - Surface the setting through the Helm chart and environment examples so shared
   database installs can keep the app, migration job, and readiness guards on
   the same schema contract.

@@ -3,10 +3,15 @@ from __future__ import annotations
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import engine_from_config, make_url, pool
 
 from app.core.config.settings import get_settings
-from app.db.migration_url import apply_postgres_search_path, ensure_postgres_schema_exists, to_sync_database_url
+from app.db.migration_url import (
+    apply_postgres_migration_search_path,
+    ensure_postgres_schema_exists,
+    normalize_postgres_schema,
+    to_sync_database_url,
+)
 from app.db.models import Base
 
 config = context.config
@@ -27,6 +32,9 @@ def _sync_database_url() -> str:
 def run_migrations_offline() -> None:
     url = _sync_database_url()
     config.set_main_option("sqlalchemy.url", url)
+    schema = None
+    if make_url(url).get_backend_name() == "postgresql":
+        schema = normalize_postgres_schema(get_settings().database_postgres_schema)
 
     context.configure(
         url=url,
@@ -35,6 +43,7 @@ def run_migrations_offline() -> None:
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
         render_as_batch=url.startswith("sqlite"),
+        version_table_schema=schema,
     )
 
     with context.begin_transaction():
@@ -53,13 +62,15 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
-        ensure_postgres_schema_exists(connection, get_settings().database_postgres_schema)
-        apply_postgres_search_path(connection, get_settings().database_postgres_schema)
+        schema = normalize_postgres_schema(get_settings().database_postgres_schema)
+        ensure_postgres_schema_exists(connection, schema)
+        apply_postgres_migration_search_path(connection, schema)
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
             compare_type=True,
             render_as_batch=connection.dialect.name == "sqlite",
+            version_table_schema=schema if connection.dialect.name == "postgresql" else None,
         )
 
         with context.begin_transaction():

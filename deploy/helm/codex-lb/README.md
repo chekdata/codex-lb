@@ -219,7 +219,7 @@ This chart intentionally keeps migration behavior explicit by install mode.
 - Application pods use a schema gate initContainer when `migration.enabled=true`, `config.databaseMigrateOnStartup=false`, and `migration.schemaGate.enabled=true`.
 - That initContainer runs `python -m app.db.migrate wait-for-head` and blocks the app container until the database is at Alembic head.
 - In bundled mode, `values-bundled.yaml` enables startup migration instead of the schema gate so fresh self-contained installs do not deadlock on `helm install --wait`.
-- When `config.databasePostgresSchema` is non-empty, the migration Job, schema-gate initContainers, and the main workload all use the same PostgreSQL `search_path` prefix so a shared database stays isolated by schema.
+- When `config.databasePostgresSchema` is non-empty, the migration Job and schema-gate initContainers use only that schema, while the main workload keeps `public` as a read fallback. Alembic state cannot leak across schemas.
 
 This means:
 

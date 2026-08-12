@@ -6,10 +6,12 @@
       PostgreSQL database installs
 - [x] 1.2 Configure asyncpg runtime engines to apply `<schema>,public` when the
       setting is present
-- [x] 1.3 Apply the same PostgreSQL search path to sync migration, Alembic, and
-      startup schema-check connections
+- [x] 1.3 Apply a schema-only PostgreSQL search path to sync migration, Alembic,
+      and startup schema-check connections
 - [x] 1.3.1 Create the configured PostgreSQL schema before migration/bootstrap
       state reads so first installs do not fall back to `public`
+- [x] 1.3.2 Scope migration state and Alembic's version table to the configured
+      schema without the runtime `public` fallback
 - [x] 1.4 Make durable-bridge table guards resolve against the active
       PostgreSQL schemas instead of hard-coding `public`
 
@@ -25,5 +27,5 @@
 
 - [x] 3.1 Add focused unit coverage for runtime engine kwargs, migration search
       path helpers, Helm rendering, and durable-bridge schema detection
-- [ ] 3.2 Run focused unit tests for the new schema wiring
-- [ ] 3.3 Run `openspec validate --specs`
+- [x] 3.2 Run focused unit tests for the new schema wiring
+- [x] 3.3 Run `openspec validate --specs`
