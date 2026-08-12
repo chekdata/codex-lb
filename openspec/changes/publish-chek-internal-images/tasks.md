@@ -8,12 +8,11 @@
 - [x] 1.4 Refuse to overwrite an existing full-SHA tag and fail closed when its
       registry state cannot be confirmed
 - [x] 1.5 Serialize publication by full commit SHA across branch and tag refs
-- [x] 1.6 Publish the same immutable multi-architecture manifest to CHEK's
-      Beijing production registry
-- [x] 1.7 Refuse publication when the Beijing registry tag exists or either
-      registry state cannot be determined
-- [x] 1.8 Recover a missing Beijing mirror from the immutable GHCR source
-      without rebuilding or overwriting either tag
+- [x] 1.6 Request a private operations workflow to mirror the reviewed GHCR
+      SHA and digest into CHEK's Beijing production registry
+- [x] 1.7 Keep production registry credentials out of the public fork
+- [x] 1.8 Require main-history provenance and scoped temporary credentials in
+      the private mirror workflow
 
 ## 2. Verification
 
