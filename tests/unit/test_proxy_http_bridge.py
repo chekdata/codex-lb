@@ -36,6 +36,7 @@ from app.core.clients.proxy_websocket import (
 )
 from app.core.config.settings import Settings
 from app.core.errors import openai_error
+from app.core.types import JsonValue
 from app.core.utils.request_id import get_request_id, reset_request_scope_id, set_request_scope_id
 from app.db.models import AccountStatus, HttpBridgeSessionState
 from app.modules.proxy import http_bridge_forwarding as http_bridge_forwarding_module
@@ -115,6 +116,31 @@ def test_http_bridge_dead_owner_epoch_uses_standard_previous_response_not_found_
     assert proxy_error.payload["error"]["type"] == "invalid_request_error"
     assert proxy_error.payload["error"]["code"] == "previous_response_not_found"
     assert proxy_error.payload["error"]["param"] == "previous_response_id"
+
+
+def test_full_resend_suffix_shape_diagnostic_is_bounded_and_content_free() -> None:
+    input_items: list[JsonValue] = [
+        {"role": "user", "content": "stored secret"},
+        {"type": "reasoning", "encrypted_content": "opaque secret"},
+        {
+            "type": "agent_message",
+            "author": "/root/private_agent",
+            "recipient": "/root",
+            "content": [{"type": "input_text", "text": "private result"}],
+        },
+        {"type": "message", "role": "user", "content": "private retry"},
+        {"type": "unknown-user-controlled-type", "secret": "not logged"},
+        *[{"type": "input_text", "text": f"private-{index}"} for index in range(6)],
+    ]
+
+    shape = http_bridge_streaming_module._full_resend_suffix_shape_for_observability(
+        input_items,
+        stored_count=1,
+    )
+
+    assert shape == "reasoning>agent_message>user>other>input_part>input_part>input_part>input_part>more"
+    assert "private" not in shape
+    assert "unknown-user-controlled-type" not in shape
 
 
 def test_http_bridge_rejected_dead_owner_recovery_code_is_not_emitted_from_app() -> None:

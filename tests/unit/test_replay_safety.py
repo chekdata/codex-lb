@@ -1779,6 +1779,124 @@ def test_full_resend_retained_output_accepts_exact_settled_same_session_prefix()
     )
 
 
+def _canonical_agent_message() -> dict[str, JsonValue]:
+    return {
+        "type": "agent_message",
+        "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea0",
+        "author": "/root/episode_identity_final_audit",
+        "recipient": "/root",
+        "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+            "create_time": 1787431172.912141,
+        },
+        "content": [{"type": "input_text", "text": "verified inter-agent result"}],
+    }
+
+
+def test_full_resend_exact_prefix_accepts_canonical_agent_message_before_user_retries() -> None:
+    stored_input: list[JsonValue] = [{"role": "user", "content": "first question"}]
+    full_input: list[JsonValue] = [
+        *stored_input,
+        {
+            "type": "reasoning",
+            "id": "reasoning_previous",
+            "encrypted_content": "opaque",
+            "summary": [],
+        },
+        _canonical_agent_message(),
+        {"type": "message", "role": "user", "content": "first retry"},
+        {"type": "message", "role": "user", "content": "second retry"},
+    ]
+    classification = project_responses_input_for_account_neutral_fresh_replay(
+        full_input,
+        stored_count=len(stored_input),
+        preserve_response_owned_agent_message_ids=True,
+    )
+    serialized = project_responses_input_for_account_neutral_fresh_replay(
+        full_input,
+        stored_count=len(stored_input),
+    )
+
+    assert classification is not None
+    assert responses_input_suffix_retains_prior_output(
+        classification.input_items,
+        stored_count=classification.stored_prefix_count,
+        exact_stored_prefix_without_pending_manifest=True,
+    )
+    assert serialized is not None
+    assert not responses_input_suffix_retains_prior_output(
+        serialized.input_items,
+        stored_count=serialized.stored_prefix_count,
+        exact_stored_prefix_without_pending_manifest=True,
+    )
+    assert not responses_payload_is_account_neutral_fresh_replay({"input": serialized.input_items})
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda item: item.pop("id"), id="missing-id"),
+        pytest.param(lambda item: item.__setitem__("id", "msg_not_agent_owned"), id="wrong-id-prefix"),
+        pytest.param(lambda item: item.__setitem__("id", "amsg_not-a-uuid"), id="invalid-id-uuid"),
+        pytest.param(lambda item: item.__setitem__("author", "root/no-leading-slash"), id="invalid-author"),
+        pytest.param(lambda item: item.__setitem__("recipient", item["author"]), id="self-delivery"),
+        pytest.param(
+            lambda item: item["internal_chat_message_metadata_passthrough"].__setitem__("extra", True),
+            id="extra-metadata",
+        ),
+        pytest.param(
+            lambda item: item["internal_chat_message_metadata_passthrough"].__setitem__("turn_id", "bad-turn"),
+            id="invalid-turn-id",
+        ),
+        pytest.param(
+            lambda item: item["internal_chat_message_metadata_passthrough"].__setitem__("create_time", float("inf")),
+            id="nonfinite-create-time",
+        ),
+        pytest.param(
+            lambda item: item.__setitem__("content", [{"type": "output_text", "text": "wrong direction"}]),
+            id="output-content",
+        ),
+        pytest.param(lambda item: item.__setitem__("extra", "unbound"), id="extra-field"),
+    ],
+)
+def test_full_resend_agent_message_proof_rejects_malformed_lookalikes(mutate) -> None:
+    stored_input: list[JsonValue] = [{"role": "user", "content": "first question"}]
+    agent_message = _canonical_agent_message()
+    mutate(agent_message)
+    projection = project_responses_input_for_account_neutral_fresh_replay(
+        [*stored_input, agent_message, {"role": "user", "content": "follow-up"}],
+        stored_count=len(stored_input),
+        preserve_response_owned_agent_message_ids=True,
+    )
+
+    assert projection is not None
+    assert not responses_input_suffix_retains_prior_output(
+        projection.input_items,
+        stored_count=projection.stored_prefix_count,
+        exact_stored_prefix_without_pending_manifest=True,
+    )
+
+
+def test_full_resend_agent_message_after_fresh_user_is_not_a_prior_output_boundary() -> None:
+    stored_input: list[JsonValue] = [{"role": "user", "content": "first question"}]
+    projection = project_responses_input_for_account_neutral_fresh_replay(
+        [
+            *stored_input,
+            {"role": "user", "content": "follow-up"},
+            _canonical_agent_message(),
+        ],
+        stored_count=len(stored_input),
+        preserve_response_owned_agent_message_ids=True,
+    )
+
+    assert projection is not None
+    assert not responses_input_suffix_retains_prior_output(
+        projection.input_items,
+        stored_count=projection.stored_prefix_count,
+        exact_stored_prefix_without_pending_manifest=True,
+    )
+
+
 def test_full_resend_exact_settled_prefix_rejects_historical_call_id_reuse() -> None:
     input_items: list[JsonValue] = [
         {

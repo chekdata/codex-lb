@@ -13513,11 +13513,16 @@ async def test_v1_responses_http_bridge_rebinds_after_upstream_previous_response
     assert connect_count == 2
 
 
+@pytest.mark.parametrize(
+    "retained_output_shape",
+    ["assistant_message", "agent_message"],
+)
 @pytest.mark.asyncio
 async def test_v1_responses_http_bridge_recovers_store_context_trim_after_proxy_anchor_rejection(
     async_client,
     app_instance,
     monkeypatch,
+    retained_output_shape,
 ):
     """An exact live-session trim can replay its preserved full request once."""
     _install_bridge_settings(monkeypatch, enabled=True)
@@ -13594,11 +13599,37 @@ async def test_v1_responses_http_bridge_recovers_store_context_trim_after_proxy_
         "lookup_request_targets",
         AsyncMock(return_value=None),
     )
-    complete_follow_up = [
-        *historical_input,
-        *first_body["output"],
-        {"role": "user", "content": "continue from the complete context"},
-    ]
+    if retained_output_shape == "assistant_message":
+        retained_output = first_body["output"]
+        follow_up_messages = [{"role": "user", "content": "continue from the complete context"}]
+    else:
+        # Exact production shape from the stranded long-running Codex task:
+        # response-owned reasoning, one completed inter-agent delivery, and
+        # two later user retries after the stale anchor had already failed.
+        retained_output = [
+            {
+                "type": "reasoning",
+                "id": "reasoning_previous",
+                "encrypted_content": "opaque",
+                "summary": [],
+            },
+            {
+                "type": "agent_message",
+                "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea0",
+                "author": "/root/episode_identity_final_audit",
+                "recipient": "/root",
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+                    "create_time": 1787431172.912141,
+                },
+                "content": [{"type": "input_text", "text": "verified inter-agent result"}],
+            },
+        ]
+        follow_up_messages = [
+            {"role": "user", "content": "first retry after the completed inter-agent result"},
+            {"role": "user", "content": "second retry after the stale anchor error"},
+        ]
+    complete_follow_up = [*historical_input, *retained_output, *follow_up_messages]
     second = await async_client.post(
         "/v1/responses",
         headers=session_headers,
@@ -13620,11 +13651,19 @@ async def test_v1_responses_http_bridge_recovers_store_context_trim_after_proxy_
     assert len(recovered_upstream.sent_text) == 1
     recovered_payload = json.loads(recovered_upstream.sent_text[0])
     assert "previous_response_id" not in recovered_payload
-    assert recovered_payload["input"] == [
-        historical_input[0],
-        *first_body["output"],
-        complete_follow_up[-1],
-    ]
+    if retained_output_shape == "assistant_message":
+        assert recovered_payload["input"] == [
+            historical_input[0],
+            *first_body["output"],
+            complete_follow_up[-1],
+        ]
+    else:
+        recovered_agent_messages = [item for item in recovered_payload["input"] if item.get("type") == "agent_message"]
+        assert recovered_agent_messages == [retained_output[-1]]
+        assert [item.get("content") for item in recovered_payload["input"] if item.get("role") == "user"] == [
+            historical_input[0]["content"],
+            *[item["content"] for item in follow_up_messages],
+        ]
     assert recovered_payload["instructions"].endswith("stored per-turn control")
 
 

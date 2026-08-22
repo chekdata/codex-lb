@@ -46,6 +46,12 @@ loop and require the Codex client to be restarted.
   durable proof covers the complete client context; otherwise quarantine the
   logical key and recover on the next complete client resend while keeping
   delta-only requests fail-closed.
+- Recognize a narrowly validated completed Codex `agent_message` as the
+  retained-output boundary in an exact owner-bound full resend. Keep this
+  recovery pinned to the existing owning account, require the response-owned
+  `amsg_` identity plus canonical agent paths, timestamp/turn metadata, and one
+  self-contained text part, and continue rejecting malformed or client-shaped
+  lookalikes.
 
 ## Impact
 
@@ -65,3 +71,6 @@ loop and require the Codex client to be restarted.
   their local retry budget inside the advertised cooldown.
 - A stale durable response anchor can no longer strand a long-lived desktop
   task in an `Invalid previous_response_id` / reconnect / cooldown loop.
+- Long-lived multi-agent Codex tasks whose latest completed turn ends in a
+  sub-agent delivery can use the same one-shot, owner-bound stale-anchor
+  recovery without weakening cross-account replay eligibility.

@@ -238,6 +238,45 @@ logger = logging.getLogger("app.modules.proxy.service")
 T = TypeVar("T")
 _REQUEST_TRANSPORT_HTTP = "http"
 _RESPONSE_CREATE_GATE_RETRY_SLEEP_SECONDS = 10.0
+_OBSERVABLE_REPLAY_SUFFIX_ITEM_TYPES = frozenset(
+    {
+        "agent_message",
+        "apply_patch_call",
+        "apply_patch_call_output",
+        "custom_tool_call",
+        "custom_tool_call_output",
+        "function_call",
+        "function_call_output",
+        "reasoning",
+    }
+)
+
+
+def _full_resend_suffix_shape_for_observability(
+    input_items: list[JsonValue],
+    *,
+    stored_count: int,
+) -> str:
+    """Return a bounded, content-free shape for rejected replay proofs."""
+
+    labels: list[str] = []
+    for item in input_items[stored_count : stored_count + 8]:
+        if not isinstance(item, dict):
+            labels.append("scalar")
+            continue
+        item_type = item.get("type")
+        role = item.get("role")
+        if item_type in (None, "message") and role in {"assistant", "developer", "system", "user"}:
+            labels.append(str(role))
+        elif item_type in _OBSERVABLE_REPLAY_SUFFIX_ITEM_TYPES:
+            labels.append(str(item_type))
+        elif item_type in {"input_file", "input_image", "input_text"}:
+            labels.append("input_part")
+        else:
+            labels.append("other")
+    if len(input_items) - stored_count > 8:
+        labels.append("more")
+    return ">".join(labels) or "empty"
 
 
 def _http_bridge_continuity_bound_without_safe_replay(request_state: _WebSocketRequestState) -> bool:
@@ -358,6 +397,7 @@ class _VerifiedDurableFullResend:
             # inline Responses-Lite developer IDs must remain visible until
             # the exact-manifest check rejects response-owned messages.
             preserve_developer_message_ids=True,
+            preserve_response_owned_agent_message_ids=True,
         )
         pending_tool_calls = durable_lookup.latest_pending_tool_calls
         if replay_projection is None:
@@ -529,6 +569,7 @@ class _VerifiedStoreContextFullResend:
             input_items,
             stored_count=stored_count,
             preserve_developer_message_ids=True,
+            preserve_response_owned_agent_message_ids=True,
         )
         pending_tool_calls = session.last_pending_tool_calls or None
         if replay_projection is None:
@@ -1479,6 +1520,7 @@ class _HTTPBridgeStreamingMixin:
                 # response-owned messages. Cross-account replay uses the
                 # default ID-stripping projection below.
                 preserve_developer_message_ids=True,
+                preserve_response_owned_agent_message_ids=True,
             )
             safe_fresh_context = False
             if replay_projection is not None:
@@ -1495,6 +1537,23 @@ class _HTTPBridgeStreamingMixin:
                         pending_tool_calls=lookup.latest_pending_tool_calls,
                         canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
                     )
+                )
+            if not safe_fresh_context:
+                _log_http_bridge_event(
+                    "full_resend_proof_rejected",
+                    bridge_session_key,
+                    account_id=None,
+                    model=payload.model,
+                    detail=(
+                        "reason=invalid_or_incomplete_suffix, "
+                        f"stored_items={stored_count}, "
+                        f"suffix_items={len(payload.input) - stored_count}, "
+                        "suffix_shape="
+                        f"{_full_resend_suffix_shape_for_observability(payload.input, stored_count=stored_count)}"
+                    ),
+                    cache_key_family=bridge_session_key.affinity_kind,
+                    model_class=_extract_model_class(payload.model) if payload.model else None,
+                    owner_check_applied=True,
                 )
             return stored_count, lookup.latest_input_full_fingerprint, safe_fresh_context
 
@@ -1966,6 +2025,7 @@ class _HTTPBridgeStreamingMixin:
                     cast(list[JsonValue], payload.input),
                     stored_count=durable_full_resend_anchor_count,
                     preserve_developer_message_ids=True,
+                    preserve_response_owned_agent_message_ids=True,
                 )
                 if eligibility_projection is None:
                     return False
