@@ -18964,13 +18964,12 @@ async def test_submit_http_bridge_request_keeps_uploaded_file_recovery_on_owner_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("account_neutral", "expected_require_same_account"),
-    [(False, True), (True, False)],
+    "account_neutral",
+    [False, True],
 )
-async def test_submit_http_bridge_request_changes_accounts_only_for_account_neutral_fresh_body(
+async def test_submit_http_bridge_request_keeps_hard_affinity_fresh_body_on_owner(
     monkeypatch: pytest.MonkeyPatch,
     account_neutral: bool,
-    expected_require_same_account: bool,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     closed_send = AsyncMock(
@@ -19029,7 +19028,7 @@ async def test_submit_http_bridge_request_changes_accounts_only_for_account_neut
         request_state=request_state,
         text_data=request_state.request_text,
         send_request=True,
-        require_same_account=expected_require_same_account,
+        require_same_account=True,
     )
     await service._detach_http_bridge_request(session, request_state=request_state)
 
@@ -19970,8 +19969,19 @@ async def test_retry_http_bridge_request_on_fresh_upstream_refuses_to_resend_pre
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("key_kind", "account_neutral", "expected_require_same_account"),
+    [
+        ("session_header", True, True),
+        ("prompt_cache", True, False),
+        ("prompt_cache", False, True),
+    ],
+)
 async def test_retry_http_bridge_request_on_fresh_upstream_replays_retry_safe_injection_without_anchor(
     monkeypatch: pytest.MonkeyPatch,
+    key_kind: str,
+    account_neutral: bool,
+    expected_require_same_account: bool,
 ) -> None:
     """Durable-anchor injections opt in to fresh-turn replay on send failure.
 
@@ -19984,7 +19994,7 @@ async def test_retry_http_bridge_request_on_fresh_upstream_replays_retry_safe_in
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     send_text = AsyncMock()
     session = proxy_service._HTTPBridgeSession(
-        key=proxy_service._HTTPBridgeSessionKey("session_header", "sid-safe", None),
+        key=proxy_service._HTTPBridgeSessionKey(key_kind, "sid-safe", None),
         headers={"x-codex-session-id": "sid-safe"},
         affinity=proxy_service._AffinityPolicy(
             key="sid-safe",
@@ -20015,7 +20025,7 @@ async def test_retry_http_bridge_request_on_fresh_upstream_replays_retry_safe_in
             '"client_metadata":{"x-codex-installation-id":"installation-a"}}'
         ),
         fresh_upstream_request_is_retry_safe=True,
-        fresh_upstream_request_is_account_neutral=True,
+        fresh_upstream_request_is_account_neutral=account_neutral,
         transport="http",
     )
 
@@ -20023,15 +20033,16 @@ async def test_retry_http_bridge_request_on_fresh_upstream_replays_retry_safe_in
         assert args == (session,)
         assert kwargs["request_state"] is request_state
         assert kwargs["restart_reader"] is True
-        assert kwargs["require_same_account"] is False
-        session.account = cast(
-            Any,
-            SimpleNamespace(
-                id="acc-2",
-                status=AccountStatus.ACTIVE,
-                codex_installation_id="installation-b",
-            ),
-        )
+        assert kwargs["require_same_account"] is expected_require_same_account
+        if not expected_require_same_account:
+            session.account = cast(
+                Any,
+                SimpleNamespace(
+                    id="acc-2",
+                    status=AccountStatus.ACTIVE,
+                    codex_installation_id="installation-b",
+                ),
+            )
 
     monkeypatch.setattr(service, "_reconnect_http_bridge_session", reconnect)
 

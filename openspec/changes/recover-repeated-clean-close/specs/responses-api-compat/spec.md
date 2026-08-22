@@ -238,7 +238,10 @@ independent. If the retained fresh body still contains any account-scoped
 identifier, the replacement MUST remain on the owning account even after the
 continuity anchor is safely removed. Cross-account replacement is permitted
 only when the retained body separately satisfies the account-neutral replay
-contract.
+contract and the replacement also uses a new account-neutral logical key with
+all prior session and turn-state affinity headers removed. A hard-affinity
+session that has not performed that explicit fork MUST remain on its owning
+account even when its retained body is account neutral.
 
 Any error raised after the underlying send primitive is invoked MUST remain an
 ambiguous send failure. The proxy MUST NOT reconnect and resend from that path,
@@ -275,7 +278,17 @@ frame may already have crossed the kernel boundary.
 - **GIVEN** a continuity-bound request has both a complete fresh-body replay
   proof and a separate account-neutral replay proof
 - **WHEN** the original socket is proven closed before send
+- **AND** the bridge establishes a new account-neutral logical key and strips
+  all prior session and turn-state affinity headers
 - **THEN** the one-shot replacement may select another eligible account
+
+#### Scenario: hard affinity stays on its owner without an explicit fork
+
+- **GIVEN** a continuity-bound request has an account-neutral fresh-body proof
+- **AND** its current bridge still has a hard session or turn-state affinity key
+- **WHEN** the original socket is proven closed before send
+- **THEN** the replacement remains on the original owning account
+- **AND** no old session or turn-state identifier is sent to another account
 
 #### Scenario: post-dispatch close remains non-replayable
 

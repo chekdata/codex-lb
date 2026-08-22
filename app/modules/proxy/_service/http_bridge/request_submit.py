@@ -1205,12 +1205,6 @@ class _HTTPBridgeRequestSubmitMixin:
                                     _extract_model_class(session.request_model) if session.request_model else None
                                 ),
                             )
-                            proof_gated_account_neutral_fresh_body = bool(
-                                request_state.previous_response_id is not None
-                                and request_state.fresh_upstream_request_is_retry_safe
-                                and request_state.fresh_upstream_request_is_account_neutral
-                                and request_state.fresh_upstream_request_text
-                            )
                             try:
                                 recovered = await self._retry_http_bridge_request_on_fresh_upstream(
                                     session,
@@ -1219,10 +1213,7 @@ class _HTTPBridgeRequestSubmitMixin:
                                     send_request=True,
                                     require_same_account=(
                                         request_state.file_required_preferred_account
-                                        or (
-                                            _http_bridge_key_strength(session.key) == "hard"
-                                            and not proof_gated_account_neutral_fresh_body
-                                        )
+                                        or _http_bridge_key_strength(session.key) == "hard"
                                     ),
                                 )
                             except UpstreamWebSocketTransportError as retry_exc:
@@ -2119,7 +2110,10 @@ class _HTTPBridgeRequestSubmitMixin:
                 return False
             retry_text_data = request_state.fresh_upstream_request_text
             using_fresh_replay = True
-            if not request_state.fresh_upstream_request_is_account_neutral:
+            if (
+                _http_bridge_key_strength(session.key) == "hard"
+                or not request_state.fresh_upstream_request_is_account_neutral
+            ):
                 require_same_account = True
         if request_state.replay_count >= 1:
             return False
