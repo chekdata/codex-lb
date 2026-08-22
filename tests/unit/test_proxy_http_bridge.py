@@ -3312,6 +3312,46 @@ def test_durable_tool_call_manifest_rejects_unobserved_terminal_call() -> None:
     )
 
 
+def test_live_tool_call_manifest_rejects_added_only_but_allows_done_only() -> None:
+    completed_payload: dict[str, proxy_service.JsonValue] = {
+        "type": "response.completed",
+        "response": {"output": []},
+    }
+    added_only = proxy_service._WebSocketRequestState(
+        request_id="req-live-added-only",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+    )
+    added_only.added_tool_call_types = {"call_added": "function_call"}
+    assert (
+        http_bridge_upstream_events_module._live_pending_tool_call_manifest_is_invalid(
+            added_only,
+            completed_payload,
+        )
+        is True
+    )
+
+    done_only = proxy_service._WebSocketRequestState(
+        request_id="req-live-done-only",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+    )
+    done_only.pending_tool_call_types = {"call_done": "custom_tool_call"}
+    assert (
+        http_bridge_upstream_events_module._live_pending_tool_call_manifest_is_invalid(
+            done_only,
+            completed_payload,
+        )
+        is False
+    )
+
+
 def test_durable_tool_call_manifest_rejects_mixed_client_settled_call_types() -> None:
     state = proxy_service._WebSocketRequestState(
         request_id="req-mixed-client-settled-manifest",

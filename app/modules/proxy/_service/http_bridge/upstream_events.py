@@ -431,8 +431,13 @@ def _live_pending_tool_call_manifest_is_invalid(
     """
 
     terminal_calls = _response_completed_tool_call_types(payload)
+    added_calls_settled = all(
+        request_state.pending_tool_call_types.get(call_id) == call_type
+        for call_id, call_type in request_state.added_tool_call_types.items()
+    )
     return bool(
         request_state.tool_call_manifest_invalid
+        or not added_calls_settled
         or terminal_calls is None
         or (terminal_calls and terminal_calls != request_state.pending_tool_call_types)
     )
