@@ -827,9 +827,10 @@ class _InvalidRequestPreviousResponseUpstreamWebSocket(_FakeBridgeUpstreamWebSoc
 class _RejectStalePreviousResponseUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
     """Reject one stale anchor but accept a proved full unanchored resend."""
 
-    def __init__(self, stale_response_id: str) -> None:
+    def __init__(self, stale_response_id: str, *, canonical_invalid_shape: bool = False) -> None:
         super().__init__(response_id_prefix="resp_recovered")
         self._stale_response_id = stale_response_id
+        self._canonical_invalid_shape = canonical_invalid_shape
 
     async def send_text(self, text: str) -> None:
         payload = json.loads(text)
@@ -837,6 +838,18 @@ class _RejectStalePreviousResponseUpstreamWebSocket(_FakeBridgeUpstreamWebSocket
             await super().send_text(text)
             return
         self.sent_text.append(text)
+        error: dict[str, object] = {
+            "type": "invalid_request_error",
+            "code": "invalid_request_error",
+            "message": f"Previous response with id '{self._stale_response_id}' not found.",
+            "param": "previous_response_id",
+        }
+        if self._canonical_invalid_shape:
+            error = {
+                "type": "invalid_request_error",
+                "code": "invalid_request_error",
+                "message": "Invalid `previous_response_id`.",
+            }
         await self._messages.put(
             _FakeUpstreamMessage(
                 "text",
@@ -844,12 +857,7 @@ class _RejectStalePreviousResponseUpstreamWebSocket(_FakeBridgeUpstreamWebSocket
                     {
                         "type": "error",
                         "status": 400,
-                        "error": {
-                            "type": "invalid_request_error",
-                            "code": "invalid_request_error",
-                            "message": (f"Previous response with id '{self._stale_response_id}' not found."),
-                            "param": "previous_response_id",
-                        },
+                        "error": error,
                     },
                     separators=(",", ":"),
                 ),
@@ -13412,11 +13420,17 @@ async def test_v1_responses_http_bridge_recovers_store_context_trim_after_proxy_
     assert recovered_payload["input"] == complete_follow_up
 
 
+@pytest.mark.parametrize(
+    "canonical_invalid_shape",
+    [False, True],
+    ids=["previous-response-not-found", "canonical-invalid-previous-response-id"],
+)
 @pytest.mark.asyncio
 async def test_v1_responses_http_bridge_quarantines_persistently_stale_proxy_anchor_then_recovers_full_resend(
     async_client,
     app_instance,
     monkeypatch,
+    canonical_invalid_shape,
 ):
     _install_bridge_settings(monkeypatch, enabled=True)
     account_id = await _import_account(
@@ -13510,8 +13524,14 @@ async def test_v1_responses_http_bridge_quarantines_persistently_stale_proxy_anc
     first_body = first.json()
 
     service = get_proxy_service_for_app(app_instance)
-    stale_upstream = _RejectStalePreviousResponseUpstreamWebSocket(first_body["id"])
-    recovered_upstream = _RejectStalePreviousResponseUpstreamWebSocket(first_body["id"])
+    stale_upstream = _RejectStalePreviousResponseUpstreamWebSocket(
+        first_body["id"],
+        canonical_invalid_shape=canonical_invalid_shape,
+    )
+    recovered_upstream = _RejectStalePreviousResponseUpstreamWebSocket(
+        first_body["id"],
+        canonical_invalid_shape=canonical_invalid_shape,
+    )
     async with service._http_bridge_lock:
         session = next(iter(service._http_bridge_sessions.values()))
     await service._reset_http_bridge_session_after_local_terminal_error(
