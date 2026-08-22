@@ -1217,7 +1217,11 @@ class _HTTPBridgeRequestSubmitMixin:
                                     text_data=text_data,
                                     send_request=True,
                                     require_same_account=(
-                                        _http_bridge_key_strength(session.key) == "hard" and not proof_gated_fresh_body
+                                        request_state.file_required_preferred_account
+                                        or (
+                                            _http_bridge_key_strength(session.key) == "hard"
+                                            and not proof_gated_fresh_body
+                                        )
                                     ),
                                 )
                             except UpstreamWebSocketTransportError as retry_exc:
@@ -1291,6 +1295,53 @@ class _HTTPBridgeRequestSubmitMixin:
                                 session.closed = True
                                 session.upstream_control.reconnect_requested = True
                                 session.upstream_control.retire_after_drain = True
+                                if (
+                                    recovery_receipt is not None
+                                    and not request_state.fresh_upstream_send_primitive_reached
+                                ):
+                                    # Reconnect/setup failed before the
+                                    # replacement send primitive was reached.
+                                    # No physical socket observed this turn,
+                                    # so restore the predecessor alias instead
+                                    # of fencing the next retry onto an
+                                    # undispatched request.
+                                    rollback_cancellation: asyncio.CancelledError | None = None
+                                    async with session.recovery_alias_lock:
+                                        try:
+                                            (
+                                                rolled_back,
+                                                rollback_cancellation,
+                                            ) = await _rollback_http_bridge_recovery_turn_state_registration(
+                                                self,
+                                                recovery_receipt,
+                                            )
+                                        except Exception:
+                                            rolled_back = False
+                                            logger.warning(
+                                                "Failed to roll back HTTP bridge recovery alias after setup failure",
+                                                exc_info=True,
+                                            )
+                                    recovery_receipt = None
+                                    if not rolled_back:
+                                        _record_continuity_fail_closed(
+                                            surface="http_bridge",
+                                            reason="recovery_alias_rollback_failed",
+                                            previous_response_id=request_state.previous_response_id,
+                                            session_id=request_state.session_id,
+                                            upstream_error_code="bridge_continuity_persistence_failed",
+                                        )
+                                        raise ProxyResponseError(
+                                            502,
+                                            openai_error(
+                                                "bridge_continuity_persistence_failed",
+                                                (
+                                                    "The unsent recovery alias could not be restored safely; "
+                                                    "retry the request."
+                                                ),
+                                            ),
+                                        ) from exc
+                                    if rollback_cancellation is not None:
+                                        raise rollback_cancellation
                                 raise
                         else:
                             request_state.recovery_attempt_dispatched = True
