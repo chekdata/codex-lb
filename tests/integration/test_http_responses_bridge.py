@@ -13718,13 +13718,21 @@ async def test_v1_responses_http_bridge_quarantines_persistently_stale_proxy_anc
     monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
     monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
 
+    historical_input = [
+        {"role": "user", "content": "hello"},
+        {
+            "type": "message",
+            "role": "developer",
+            "content": "stored per-turn control",
+        },
+    ]
     first = await async_client.post(
         "/v1/responses",
         headers={"x-codex-session-id": "persistent-stale-anchor"},
         json={
             "model": "gpt-5.1",
             "instructions": "Return exactly OK.",
-            "input": [{"role": "user", "content": "hello"}],
+            "input": historical_input,
             "prompt_cache_key": "invalid-request-rebind",
         },
     )
@@ -13759,7 +13767,7 @@ async def test_v1_responses_http_bridge_quarantines_persistently_stale_proxy_anc
             "model": "gpt-5.1",
             "instructions": "Return exactly OK.",
             "input": [
-                {"role": "user", "content": "hello"},
+                *historical_input,
                 {"role": "user", "content": "hello-again"},
             ],
             "prompt_cache_key": "invalid-request-rebind",
@@ -13781,7 +13789,7 @@ async def test_v1_responses_http_bridge_quarantines_persistently_stale_proxy_anc
             "model": "gpt-5.1",
             "instructions": "Return exactly OK.",
             "input": [
-                {"role": "user", "content": "hello"},
+                *historical_input,
                 *first_body["output"],
                 {"role": "user", "content": "hello-again"},
             ],
@@ -13797,6 +13805,8 @@ async def test_v1_responses_http_bridge_quarantines_persistently_stale_proxy_anc
     recovered_payload = json.loads(recovered_upstream.sent_text[0])
     assert "previous_response_id" not in recovered_payload
     assert len(recovered_payload["input"]) == 3
+    assert recovered_payload["input"][0] == historical_input[0]
+    assert recovered_payload["instructions"].endswith("stored per-turn control")
 
 
 @pytest.mark.asyncio
@@ -15163,6 +15173,24 @@ async def test_v1_responses_http_bridge_quarantines_reattach_that_streams_withou
         timeout=_TEST_SYNC_TIMEOUT_SECONDS,
     )
     assert first.status_code == 200, first.text
+
+    # ``response.completed`` resolves the HTTP caller before the reader task
+    # necessarily consumes the immediately following clean-close frame. Wait
+    # for that exact physical bridge to retire before issuing the reattach;
+    # otherwise a loaded runner can race the follow-up into a session that is
+    # already closed but not yet unregistered, bypassing the wedge this test
+    # is meant to exercise.
+    first_bridge_retired = False
+    deadline = time.monotonic() + _TEST_SYNC_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        async with service._http_bridge_lock:
+            first_bridge_retired = all(
+                candidate.upstream is not first_upstream for candidate in service._http_bridge_sessions.values()
+            )
+        if first_bridge_retired:
+            break
+        await asyncio.sleep(0.01)
+    assert first_bridge_retired
 
     wedging_resend = [
         *historical_input,

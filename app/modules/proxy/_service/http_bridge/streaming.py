@@ -1486,6 +1486,7 @@ class _HTTPBridgeStreamingMixin:
                     replay_projection.input_items,
                     stored_count=replay_projection.stored_prefix_count,
                     canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+                    exact_stored_prefix_without_pending_manifest=not lookup.latest_pending_tool_calls,
                 ) or (
                     lookup.latest_pending_tool_calls is not None
                     and responses_input_suffix_matches_pending_tool_calls(
@@ -1517,6 +1518,9 @@ class _HTTPBridgeStreamingMixin:
                     replay_projection.input_items,
                     stored_count=replay_projection.stored_prefix_count,
                     canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+                    exact_stored_prefix_without_pending_manifest=(
+                        durable_lookup is not None and not durable_lookup.latest_pending_tool_calls
+                    ),
                 )
                 durable_full_resend_fresh_payload = _http_bridge_payload_without_previous_response_id(
                     payload
@@ -1969,6 +1973,9 @@ class _HTTPBridgeStreamingMixin:
                     eligibility_projection.input_items,
                     stored_count=eligibility_projection.stored_prefix_count,
                     canonical_lite_developer_index=eligibility_projection.canonical_lite_developer_index,
+                    exact_stored_prefix_without_pending_manifest=(
+                        durable_lookup is not None and not durable_lookup.latest_pending_tool_calls
+                    ),
                 )
                 if not durable_full_resend_retains_prior_output:
                     return False
