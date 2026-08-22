@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import ssl
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Mapping, NoReturn, Protocol, Sequence, cast
@@ -132,6 +133,31 @@ _LIVE_SIDEBAND_WEBSOCKET_POLICY = _UpstreamWebSocketPolicy(
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _ProxySetupSafeClientConnection(ClientConnection):
+    """Close a proxied connection safely before ``connection_made``.
+
+    ``websockets`` transfers the proxy transport to this protocol before a
+    TLS upgrade, but initializes ``recv_messages`` only after that upgrade
+    succeeds. If the transport closes during the upgrade, asyncio calls
+    ``connection_lost`` first and the dependency dereferences the missing
+    receive assembler. Complete only the state that exists at this point;
+    established connections continue through the dependency's full close
+    path unchanged.
+    """
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        if hasattr(self, "recv_messages"):
+            super().connection_lost(exc)
+            return
+
+        self.protocol.receive_eof()
+        self.set_recv_exc(exc)
+        if self.keepalive_task is not None:
+            self.keepalive_task.cancel()
+        if not self.connection_lost_waiter.done():
+            self.connection_lost_waiter.set_result(None)
 
 
 def normalize_realtime_call_id(value: str) -> str | None:
@@ -946,6 +972,9 @@ async def _connect_upstream_websocket(
     )
     try:
         subprotocol_kwargs = {"subprotocols": cast(Sequence[Subprotocol], subprotocols)} if subprotocols else {}
+        proxy_connection_kwargs = (
+            {"create_connection": _ProxySetupSafeClientConnection} if proxy_url is not None else {}
+        )
         response = await websocket_connect(
             url,
             origin=origin,
@@ -955,12 +984,18 @@ async def _connect_upstream_websocket(
             ping_timeout=ping_timeout,
             max_size=settings.max_sse_event_bytes,
             proxy=proxy_url,
+            **proxy_connection_kwargs,
             **subprotocol_kwargs,
         )
     except asyncio.TimeoutError as exc:
+        retryable_proxy_setup = proxy_url is not None
         raise ProxyResponseError(
             502,
             openai_error("upstream_unavailable", "Request to upstream timed out"),
+            failure_phase="connect",
+            retryable_same_contract=retryable_proxy_setup,
+            failure_detail="proxy_connect_pre_dispatch" if retryable_proxy_setup else None,
+            failure_exception_type=type(exc).__name__,
         ) from exc
     except InvalidStatus as exc:
         response = exc.response
@@ -1007,11 +1042,14 @@ async def _connect_upstream_websocket(
             include_permanent_dns=proxy_url is None,
         )
         message = "Upstream websocket connection failed" if policy.credential_safe_connect_errors else str(exc)
+        retryable_proxy_setup = proxy_url is not None and not isinstance(exc, ssl.SSLCertVerificationError)
         raise ProxyResponseError(
             502,
             openai_error(error_code, message),
             failure_phase="connect",
-            retryable_same_contract=error_code == PROCESS_NETWORK_UNAVAILABLE_CODE,
+            retryable_same_contract=(error_code == PROCESS_NETWORK_UNAVAILABLE_CODE or retryable_proxy_setup),
+            failure_detail="proxy_connect_pre_dispatch" if retryable_proxy_setup else None,
+            failure_exception_type=type(exc).__name__,
         ) from exc
 
     return ArchivingUpstreamWebSocket(

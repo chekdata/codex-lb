@@ -10,10 +10,12 @@ from unittest.mock import AsyncMock
 import aiohttp
 import pytest
 from websockets.asyncio.server import serve as websocket_serve
+from websockets.client import ClientProtocol
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedError, InvalidHandshake, InvalidProxy, InvalidStatus
 from websockets.frames import Close
 from websockets.http11 import Response
+from websockets.uri import parse_uri
 
 import app.core.clients.proxy_websocket as proxy_websocket_module
 from app.core.clients.codex import CodexTransportError, CodexWebSocketResult
@@ -412,6 +414,7 @@ async def test_connect_responses_websocket_uses_websockets_transport(monkeypatch
     assert kwargs["origin"] == "https://chatgpt.com"
     assert kwargs["user_agent_header"] == "Codex CLI Test"
     assert kwargs["proxy"] is None
+    assert "create_connection" not in kwargs
     assert kwargs["open_timeout"] == 7.0
     assert "ping_interval" not in kwargs
     assert kwargs["ping_timeout"] == 120.0
@@ -425,6 +428,175 @@ async def test_connect_responses_websocket_uses_websockets_transport(monkeypatch
     assert "Cookie" not in additional_headers
     assert "User-Agent" not in additional_headers
     assert "Origin" not in additional_headers
+
+
+@pytest.mark.asyncio
+async def test_proxy_connection_lost_before_connection_made_is_safe():
+    protocol = ClientProtocol(parse_uri("wss://chatgpt.com/backend-api/codex/responses"))
+    connection = proxy_websocket_module._ProxySetupSafeClientConnection(protocol)
+    failure = ConnectionResetError("proxy TLS transport closed")
+
+    assert not hasattr(connection, "recv_messages")
+
+    connection.connection_lost(failure)
+
+    assert not hasattr(connection, "recv_messages")
+    assert connection.connection_lost_waiter.done()
+    assert connection.recv_exc is failure
+    assert protocol.state.name == "CLOSED"
+    assert protocol.handshake_exc is not None
+
+
+@pytest.mark.asyncio
+async def test_proxy_connection_lost_after_connection_made_delegates(monkeypatch):
+    protocol = ClientProtocol(parse_uri("wss://chatgpt.com/backend-api/codex/responses"))
+    connection = proxy_websocket_module._ProxySetupSafeClientConnection(protocol)
+    connection.recv_messages = cast(Any, object())
+    delegated: list[tuple[object, Exception | None]] = []
+
+    def fake_connection_lost(self, exc):
+        delegated.append((self, exc))
+
+    monkeypatch.setattr(proxy_websocket_module.ClientConnection, "connection_lost", fake_connection_lost)
+    failure = ConnectionResetError("established transport closed")
+
+    connection.connection_lost(failure)
+
+    assert delegated == [(connection, failure)]
+
+
+@pytest.mark.asyncio
+async def test_proxied_websocket_uses_safe_connection_adapter(monkeypatch):
+    fake_connection = _FakeConnection()
+    seen: dict[str, object] = {}
+
+    async def fake_websocket_connect(url: str, **kwargs):
+        seen["url"] = url
+        seen["kwargs"] = kwargs
+        return fake_connection
+
+    monkeypatch.setattr(proxy_websocket_module, "websocket_connect", fake_websocket_connect)
+    monkeypatch.setattr(
+        proxy_websocket_module,
+        "resolve_websocket_proxy_from_env",
+        lambda url, env: "http://proxy.test:3128",
+    )
+    monkeypatch.setattr(
+        proxy_websocket_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            upstream_base_url="https://chatgpt.com/backend-api",
+            upstream_connect_timeout_seconds=7.0,
+            proxy_downstream_websocket_idle_timeout_seconds=120.0,
+            max_sse_event_bytes=4321,
+            upstream_websocket_trust_env=True,
+            upstream_websocket_proxy_env=lambda: {},
+        ),
+    )
+
+    await connect_responses_websocket(
+        {"openai-beta": "responses_websockets=2026-02-06"},
+        "access-token",
+        "account-123",
+        allow_direct_egress=True,
+    )
+
+    kwargs = cast(dict[str, object], seen["kwargs"])
+    assert kwargs["proxy"] == "http://proxy.test:3128"
+    assert kwargs["create_connection"] is proxy_websocket_module._ProxySetupSafeClientConnection
+
+
+@pytest.mark.asyncio
+async def test_proxied_websocket_early_close_is_confirmed_pre_dispatch(monkeypatch):
+    async def failing_websocket_connect(url: str, **kwargs):
+        del url, kwargs
+        raise ConnectionResetError("proxy TLS transport closed")
+
+    monkeypatch.setattr(proxy_websocket_module, "websocket_connect", failing_websocket_connect)
+    monkeypatch.setattr(
+        proxy_websocket_module,
+        "resolve_websocket_proxy_from_env",
+        lambda url, env: "http://proxy.test:3128",
+    )
+    monkeypatch.setattr(
+        proxy_websocket_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            upstream_base_url="https://chatgpt.com/backend-api",
+            upstream_connect_timeout_seconds=7.0,
+            proxy_downstream_websocket_idle_timeout_seconds=120.0,
+            max_sse_event_bytes=4321,
+            upstream_websocket_trust_env=True,
+            upstream_websocket_proxy_env=lambda: {},
+        ),
+    )
+
+    with pytest.raises(ProxyResponseError) as exc_info:
+        await connect_responses_websocket(
+            {"openai-beta": "responses_websockets=2026-02-06"},
+            "access-token",
+            "account-123",
+            allow_direct_egress=True,
+        )
+
+    assert exc_info.value.failure_phase == "connect"
+    assert exc_info.value.failure_detail == "proxy_connect_pre_dispatch"
+    assert exc_info.value.failure_exception_type == "ConnectionResetError"
+    assert is_confirmed_pre_dispatch_transport_error(exc_info.value) is True
+
+
+@pytest.mark.asyncio
+async def test_real_proxy_tunnel_close_before_tls_has_no_event_loop_callback_failure(monkeypatch):
+    async def closing_proxy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(closing_proxy, "127.0.0.1", 0)
+    proxy_port = server.sockets[0].getsockname()[1]
+    loop = asyncio.get_running_loop()
+    previous_exception_handler = loop.get_exception_handler()
+    callback_failures: list[dict[str, object]] = []
+    loop.set_exception_handler(lambda _loop, context: callback_failures.append(context))
+    monkeypatch.setattr(
+        proxy_websocket_module,
+        "resolve_websocket_proxy_from_env",
+        lambda url, env: f"http://127.0.0.1:{proxy_port}",
+    )
+    monkeypatch.setattr(
+        proxy_websocket_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            upstream_base_url="https://chatgpt.com/backend-api",
+            upstream_connect_timeout_seconds=2.0,
+            proxy_downstream_websocket_idle_timeout_seconds=120.0,
+            max_sse_event_bytes=4321,
+            upstream_websocket_trust_env=True,
+            upstream_websocket_proxy_env=lambda: {},
+        ),
+    )
+
+    try:
+        with pytest.raises(ProxyResponseError) as exc_info:
+            await connect_responses_websocket(
+                {"openai-beta": "responses_websockets=2026-02-06"},
+                "access-token",
+                "account-123",
+                allow_direct_egress=True,
+            )
+        await asyncio.sleep(0)
+    finally:
+        server.close()
+        await server.wait_closed()
+        loop.set_exception_handler(previous_exception_handler)
+
+    assert exc_info.value.failure_phase == "connect"
+    assert exc_info.value.failure_detail == "proxy_connect_pre_dispatch"
+    assert exc_info.value.failure_exception_type == "ConnectionResetError"
+    assert is_confirmed_pre_dispatch_transport_error(exc_info.value) is True
+    assert callback_failures == []
 
 
 @pytest.mark.asyncio

@@ -1703,7 +1703,7 @@ def _make_api_key_data(
 
 
 @pytest.mark.asyncio
-async def test_v1_responses_http_bridge_fails_over_confirmed_proxy_connect_before_dispatch(
+async def test_v1_responses_http_bridge_fails_over_proxy_tls_early_close_before_dispatch(
     async_client,
     monkeypatch,
 ):
@@ -1752,7 +1752,7 @@ async def test_v1_responses_http_bridge_fails_over_confirmed_proxy_connect_befor
                 failure_phase="connect",
                 retryable_same_contract=True,
                 failure_detail="proxy_connect_pre_dispatch",
-                failure_exception_type="ClientProxyConnectionError",
+                failure_exception_type="ConnectionResetError",
             )
         return upstream
 
