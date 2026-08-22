@@ -703,7 +703,15 @@ def _is_uuid(value: JsonValue | None) -> bool:
 
 
 def _is_finite_nonnegative_number(value: JsonValue | None) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        # Python integers are unbounded, while JSON numbers accepted by the
+        # upstream timestamp contract must still be representable as finite
+        # numeric metadata.  Oversized integers therefore fail closed.
+        return False
 
 
 def _is_fresh_followup_input(item: Mapping[str, JsonValue]) -> bool:

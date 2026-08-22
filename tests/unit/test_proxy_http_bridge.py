@@ -3437,6 +3437,40 @@ async def test_http_bridge_malformed_tool_lifecycle_persists_unknown_manifest(
     registration = register_previous.await_args
     assert registration is not None
     assert registration.kwargs["pending_tool_calls"] is None
+    assert session.last_pending_tool_call_manifest_invalid is True
+    assert session.last_pending_tool_calls == {"call_1": "function_call"}
+
+    valid_request_state = proxy_service._WebSocketRequestState(
+        request_id="req-valid-lifecycle-after-invalid",
+        response_id="resp_valid_lifecycle_after_invalid",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=2.0,
+        transport="http",
+        skip_request_log=True,
+    )
+    session.pending_requests.append(valid_request_state)
+    session.queued_request_count = 1
+    await service._process_http_bridge_upstream_text(
+        session,
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_valid_lifecycle_after_invalid",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [],
+                },
+            },
+            separators=(",", ":"),
+        ),
+    )
+
+    assert session.last_pending_tool_call_manifest_invalid is False
+    assert session.last_pending_tool_calls == {}
 
 
 @pytest.mark.parametrize(
@@ -9806,8 +9840,14 @@ def test_verified_agent_message_recovery_requires_explicitly_empty_tool_manifest
     session.last_completed_input_count = len(stored_input_items)
     session.last_completed_input_prefix_fingerprint = proxy_service._fingerprint_input_items(stored_input_items)
     session.last_pending_tool_calls = {}
-    assert http_bridge_streaming_module._verify_store_context_full_resend(payload, session) is not None
+    proof = http_bridge_streaming_module._verify_store_context_full_resend(payload, session)
+    assert proof is not None
 
+    session.last_pending_tool_call_manifest_invalid = True
+    assert proof.matches(payload, session) is False
+    assert http_bridge_streaming_module._verify_store_context_full_resend(payload, session) is None
+
+    session.last_pending_tool_call_manifest_invalid = False
     session.last_pending_tool_calls = {"call-pending": "function_call"}
     assert http_bridge_streaming_module._verify_store_context_full_resend(payload, session) is None
 

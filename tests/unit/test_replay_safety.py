@@ -1853,6 +1853,13 @@ def test_full_resend_exact_prefix_accepts_canonical_agent_message_before_user_re
             id="nonfinite-create-time",
         ),
         pytest.param(
+            lambda item: item["internal_chat_message_metadata_passthrough"].__setitem__(
+                "create_time",
+                10**400,
+            ),
+            id="oversized-integer-create-time",
+        ),
+        pytest.param(
             lambda item: item.__setitem__("content", [{"type": "output_text", "text": "wrong direction"}]),
             id="output-content",
         ),

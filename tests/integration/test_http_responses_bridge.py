@@ -13678,6 +13678,20 @@ async def test_v1_responses_http_bridge_recovers_store_context_trim_after_proxy_
             {"type": "message", "role": {"unhashable": "role"}, "content": "not replay authority"},
             id="unhashable-role",
         ),
+        pytest.param(
+            {
+                "type": "agent_message",
+                "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea0",
+                "author": "/root/episode_identity_final_audit",
+                "recipient": "/root",
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+                    "create_time": 10**400,
+                },
+                "content": [{"type": "input_text", "text": "not replay authority"}],
+            },
+            id="oversized-agent-message-create-time",
+        ),
     ],
 )
 @pytest.mark.asyncio

@@ -537,6 +537,7 @@ class _VerifiedStoreContextFullResend:
             and session.last_completed_response_id == self._latest_response_id
             and session.last_completed_input_count == self._stored_input_item_count
             and session.last_completed_input_prefix_fingerprint == self._stored_input_fingerprint
+            and not session.last_pending_tool_call_manifest_invalid
             and _pending_tool_calls_identity(session.last_pending_tool_calls) == self._pending_tool_calls
             and _fingerprint_input_items(cast(list[JsonValue], input_items)) == self._full_input_fingerprint
         )
@@ -558,6 +559,7 @@ class _VerifiedStoreContextFullResend:
             or latest_response_id is None
             or stored_count <= 0
             or stored_fingerprint is None
+            or session.last_pending_tool_call_manifest_invalid
             or not _http_bridge_payload_looks_like_full_resend(payload)
             or not isinstance(payload.input, list)
             or not _input_prefix_matches_stored_context(
@@ -2613,7 +2615,10 @@ class _HTTPBridgeStreamingMixin:
                             }
                         )
                         if durable_lookup.latest_response_id != session.last_completed_response_id:
-                            session.last_pending_tool_calls = {}
+                            session.last_pending_tool_call_manifest_invalid = (
+                                durable_lookup.latest_pending_tool_calls is None
+                            )
+                            session.last_pending_tool_calls = dict(durable_lookup.latest_pending_tool_calls or {})
                         session.last_completed_response_id = durable_lookup.latest_response_id
                         session.last_completed_response_account_id = durable_lookup.account_id
                         session.last_completed_input_count = durable_full_resend_anchor_count
@@ -2740,9 +2745,11 @@ class _HTTPBridgeStreamingMixin:
         ):
             if durable_lookup.latest_response_id != session.last_completed_response_id:
                 # The pending tool calls were recorded for the session's own
-                # last completed response; a durable anchor pointing elsewhere
-                # must not trigger interrupted-output injection.
-                session.last_pending_tool_calls = {}
+                # last completed response.  Rebind them to the durable anchor,
+                # preserving an unavailable manifest as invalid instead of
+                # silently treating it as a verified empty manifest.
+                session.last_pending_tool_call_manifest_invalid = durable_lookup.latest_pending_tool_calls is None
+                session.last_pending_tool_calls = dict(durable_lookup.latest_pending_tool_calls or {})
             session.last_completed_response_id = durable_lookup.latest_response_id
             # The durable anchor is owned by the durable session's account, which
             # may differ from this session's account after a failover. Record the
