@@ -40,7 +40,7 @@ Public Responses endpoints MUST NOT return an OpenAI-shaped previous-response co
 ## ADDED Requirements
 
 ### Requirement: Reader-retired replacements preserve cross-replica ownership
-When a local reader-retired HTTP bridge session is replaced before its bounded close releases the durable row, the replacement MUST advance the durable owner epoch if this replica still owns the row. A stale pre-connect ownership lookup MUST NOT grant takeover permission if another replica claims an active lease while the replacement opens its upstream connection.
+When a local reader-retired HTTP bridge session is replaced before its bounded close releases the durable row, the replacement MUST advance the durable owner epoch if this replica still owns the row and MUST be able to reclaim a row that the old close already released. The pre-connect owner instance and process identity MUST be rechecked atomically under the durable row lock. A stale pre-connect ownership lookup MUST NOT grant takeover permission if another replica or newer process incarnation claims an active lease while the replacement opens its upstream connection.
 
 #### Scenario: another replica claims during replacement connect
 - **GIVEN** the pre-connect durable lookup identifies the current replica as owner
@@ -48,3 +48,9 @@ When a local reader-retired HTTP bridge session is replaced before its bounded c
 - **WHEN** another replica claims an active lease before the replacement commits its durable claim
 - **THEN** the replacement fails closed with an owner mismatch
 - **AND** the other replica remains the durable owner at the same fencing epoch
+
+#### Scenario: old close releases before replacement claim
+- **GIVEN** the pre-connect durable lookup identifies the current replica and process as owner
+- **WHEN** the old bounded close releases the row before the replacement commits its durable claim
+- **THEN** the replacement reclaims the released row
+- **AND** it advances the fencing epoch so the old close cannot affect the replacement

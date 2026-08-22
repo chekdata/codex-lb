@@ -549,6 +549,8 @@ class DurableBridgeRepository:
         allow_takeover: bool,
         owner_process_epoch: str,
         force_owner_epoch_advance: bool = False,
+        expected_takeover_owner_instance_id: str | None = None,
+        expected_takeover_owner_process_epoch: str | None = None,
     ) -> DurableBridgeSessionSnapshot:
         session_key_hash = durable_bridge_hash(session_key_value)
         for attempt in range(2):
@@ -600,8 +602,21 @@ class DurableBridgeRepository:
             }
             account_changed = existing.account_id != account_id
             owner_changed = existing.owner_instance_id != instance_id
+            lease_expired = existing.lease_expires_at is None or to_utc_naive(existing.lease_expires_at) <= now
+            expected_owner_identity_changed = bool(
+                expected_takeover_owner_instance_id is not None
+                and existing.owner_instance_id is not None
+                and (
+                    existing.owner_instance_id != expected_takeover_owner_instance_id
+                    or (
+                        expected_takeover_owner_process_epoch is not None
+                        and existing.owner_process_epoch != expected_takeover_owner_process_epoch
+                    )
+                )
+            )
+            if expected_owner_identity_changed and not lease_expired and not state_allows_takeover:
+                return _to_snapshot_required(existing)
             if owner_changed:
-                lease_expired = existing.lease_expires_at is None or to_utc_naive(existing.lease_expires_at) <= now
                 if not allow_takeover and not lease_expired and not state_allows_takeover:
                     return _to_snapshot_required(existing)
                 next_epoch = existing.owner_epoch + 1

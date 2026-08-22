@@ -11046,8 +11046,17 @@ async def test_v1_responses_http_bridge_forks_parallel_unanchored_session_reques
         *,
         allow_takeover,
         force_owner_epoch_advance=False,
+        expected_takeover_owner_instance_id=None,
+        expected_takeover_owner_process_epoch=None,
     ):
-        del self, session, allow_takeover, force_owner_epoch_advance
+        del (
+            self,
+            session,
+            allow_takeover,
+            force_owner_epoch_advance,
+            expected_takeover_owner_instance_id,
+            expected_takeover_owner_process_epoch,
+        )
 
     monkeypatch.setattr(proxy_module.ProxyService, "_create_http_bridge_session", fake_create_http_bridge_session)
     monkeypatch.setattr(
@@ -11515,8 +11524,15 @@ async def test_v1_responses_http_bridge_forks_follower_when_account_assignment_c
         *,
         allow_takeover,
         force_owner_epoch_advance=False,
+        expected_takeover_owner_instance_id=None,
+        expected_takeover_owner_process_epoch=None,
     ):
-        del self, allow_takeover
+        del (
+            self,
+            allow_takeover,
+            expected_takeover_owner_instance_id,
+            expected_takeover_owner_process_epoch,
+        )
         durable_claims.append((session.account.id, force_owner_epoch_advance))
         session.durable_session_id = "durable-session"
         session.durable_owner_epoch = 2 if force_owner_epoch_advance else 1

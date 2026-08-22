@@ -430,6 +430,8 @@ class _HTTPBridgeSessionRegistryMixin:
         *,
         allow_takeover: bool,
         force_owner_epoch_advance: bool = False,
+        expected_takeover_owner_instance_id: str | None = None,
+        expected_takeover_owner_process_epoch: str | None = None,
         claim_account_id: str | None = None,
         clear_latest_turn_state: bool = False,
     ) -> None:
@@ -452,6 +454,8 @@ class _HTTPBridgeSessionRegistryMixin:
                     latest_response_id=None,
                     allow_takeover=allow_takeover,
                     force_owner_epoch_advance=force_owner_epoch_advance or claim_attempt > 0,
+                    expected_takeover_owner_instance_id=expected_takeover_owner_instance_id,
+                    expected_takeover_owner_process_epoch=expected_takeover_owner_process_epoch,
                 )
                 if lookup.owner_instance_id == current_instance:
                     break

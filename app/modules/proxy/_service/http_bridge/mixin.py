@@ -1524,11 +1524,7 @@ class _HTTPBridgeMixin(
                         if optional_kwarg not in create_signature.parameters:
                             create_kwargs.pop(optional_kwarg, None)
                 created_session = await create_session(key, **create_kwargs)
-                # A reader-failure retirement removes the local session before
-                # its bounded close has necessarily released the durable row.
-                # If a replacement for that same canonical key is created in
-                # the overlap window, advance the epoch so the old close is
-                # fenced out instead of releasing the replacement owner.
+                # Reader failure detaches locally before bounded close releases the durable row.
                 same_instance_orphan = bool(
                     durable_lookup is not None
                     and durable_lookup.canonical_kind == key.affinity_kind
@@ -1536,16 +1532,20 @@ class _HTTPBridgeMixin(
                     and _durable_bridge_lookup_active_owner(durable_lookup)
                     == settings.http_responses_session_bridge_instance_id
                 )
-                force_owner_epoch_advance = force_durable_takeover or same_instance_orphan
+                expected_owner_instance = (
+                    settings.http_responses_session_bridge_instance_id if same_instance_orphan else None
+                )
+                expected_owner_process = (
+                    durable_lookup.owner_process_epoch if same_instance_orphan and durable_lookup is not None else None
+                )
+                force_durable_takeover = force_durable_takeover or same_instance_orphan
                 await self._claim_durable_http_bridge_session(
                     created_session,
                     allow_takeover=force_durable_takeover or _http_bridge_allow_durable_takeover(durable_lookup),
-                    # A same-instance orphan needs a new fencing epoch only
-                    # while this replica still owns the durable row. Do not
-                    # turn a stale pre-connect lookup into permission to steal
-                    # an active lease that another replica claimed while the
-                    # upstream connection was being created.
-                    force_owner_epoch_advance=force_owner_epoch_advance,
+                    force_owner_epoch_advance=force_durable_takeover,
+                    # Row-lock check permits released-row reclaim but fences foreign/restarted owners.
+                    expected_takeover_owner_instance_id=expected_owner_instance,
+                    expected_takeover_owner_process_epoch=expected_owner_process,
                 )
                 async with self._http_bridge_lock:
                     current_future = self._http_bridge_inflight_sessions.get(key)

@@ -304,6 +304,8 @@ class DurableBridgeSessionCoordinator:
         allow_takeover: bool,
         owner_process_epoch: str,
         force_owner_epoch_advance: bool = False,
+        expected_takeover_owner_instance_id: str | None = None,
+        expected_takeover_owner_process_epoch: str | None = None,
     ) -> DurableBridgeLookup:
         api_key_scope = durable_bridge_api_key_scope(api_key_id)
         async with self._session() as session:
@@ -321,6 +323,8 @@ class DurableBridgeSessionCoordinator:
                 allow_takeover=allow_takeover,
                 owner_process_epoch=owner_process_epoch,
                 force_owner_epoch_advance=force_owner_epoch_advance,
+                expected_takeover_owner_instance_id=expected_takeover_owner_instance_id,
+                expected_takeover_owner_process_epoch=expected_takeover_owner_process_epoch,
             )
         return _to_lookup(snapshot)
 
