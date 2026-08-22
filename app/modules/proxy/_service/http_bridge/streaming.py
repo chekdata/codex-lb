@@ -3366,7 +3366,19 @@ class _HTTPBridgeStreamingMixin:
                 and store_context_full_resend_proof is not None
                 and store_context_full_resend_proof.matches(untrimmed_effective_payload, session)
             )
-            proof_gated_stale_anchor_replay = durable_stale_anchor_replay or store_context_stale_anchor_replay
+            client_provided_stale_anchor_replay = bool(
+                should_attempt_previous_response_recovery
+                and stale_anchor_rejected
+                and not request_state.proxy_injected_previous_response_id
+                and request_state.response_event_count == 0
+                and effective_payload.previous_response_id is not None
+                and durable_lookup is not None
+                and durable_full_resend_proof is not None
+                and durable_full_resend_proof.matches(untrimmed_effective_payload, durable_lookup)
+            )
+            proof_gated_stale_anchor_replay = (
+                durable_stale_anchor_replay or store_context_stale_anchor_replay or client_provided_stale_anchor_replay
+            )
             should_attempt_context_overflow_fresh_turn_recovery = (
                 is_context_overflow
                 and effective_payload.previous_response_id is not None
@@ -3438,7 +3450,9 @@ class _HTTPBridgeStreamingMixin:
                 # Keep the durable response anchor until the replacement
                 # request reaches response.completed and atomically publishes
                 # its new anchor. Quarantine plus the sealed full-resend proof
-                # below is the only authority to bypass the rejected anchor.
+                # below is the only authority to bypass the rejected anchor,
+                # including an explicit client anchor whose complete resend
+                # exactly matches this durable session's stored prefix.
                 # If replacement creation, reservation, or pre-dispatch send
                 # fails, the old durable row remains intact: delta requests
                 # stay anchored/fail closed and a later verified full resend
@@ -3456,15 +3470,19 @@ class _HTTPBridgeStreamingMixin:
                             else "stale_anchor_full_resend"
                         )
                     ).inc()
+                proof_source = (
+                    "client_explicit"
+                    if client_provided_stale_anchor_replay
+                    else "store_context"
+                    if store_context_stale_anchor_replay
+                    else "durable"
+                )
                 _log_http_bridge_event(
                     "previous_response_recover_full_resend",
                     bridge_session_key,
                     account_id=session.account.id,
                     model=effective_payload.model,
-                    detail=(
-                        "outcome=single_unanchored_same_account_replay, "
-                        f"proof_source={'store_context' if store_context_stale_anchor_replay else 'durable'}"
-                    ),
+                    detail=(f"outcome=single_unanchored_same_account_replay, proof_source={proof_source}"),
                     cache_key_family=bridge_session_key.affinity_kind,
                     model_class=_extract_model_class(effective_payload.model) if effective_payload.model else None,
                     owner_check_applied=True,
@@ -3472,7 +3490,7 @@ class _HTTPBridgeStreamingMixin:
                 await self._reset_http_bridge_session_after_local_terminal_error(
                     session,
                     error_code="previous_response_anchor_invalid",
-                    error_message="The proxy-injected previous response anchor was rejected before execution",
+                    error_message="A verified previous response anchor was rejected before execution",
                     preserve_durable_lease=True,
                 )
                 recovery_path = (

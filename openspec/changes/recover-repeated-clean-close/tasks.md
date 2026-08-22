@@ -23,6 +23,7 @@
 - [x] Add regressions for pre-dispatch recovery, duplicate prevention, circuit opening/reset, and cooldown rendering.
 - [x] Quarantine an explicitly rejected proxy-injected anchor and recover the next complete full resend unanchored.
 - [x] Keep incomplete/delta-only and client-owned continuity fail-closed.
+- [x] Recover a rejected explicit client anchor only when the same immutable durable proof binds the exact owner and complete resend; keep incomplete explicit-anchor requests fail-closed.
 - [x] Validate the amended OpenSpec and run formatting, lint, type, focused, unit, and bridge regression gates.
 - [x] Build and deploy the exact merged source image, then verify production rollout, health, and recovery observability.
 - [x] Treat only a canonical response-owned `agent_message` as a completed output boundary for exact-prefix owner-bound recovery.
