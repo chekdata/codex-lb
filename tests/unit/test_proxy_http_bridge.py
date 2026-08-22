@@ -12973,6 +12973,8 @@ async def _run_owner_forward_recovery_with_session(
     input_items: list[dict[str, Any]],
     capacity_error_on_first_submit: bool = False,
     submit_attempts: list[str] | None = None,
+    rewritten_file_account_id: str | None = None,
+    submitted_states: list[proxy_service._WebSocketRequestState] | None = None,
 ) -> list[Any]:
     """Drive owner-forward failure -> local recovery; return prepared inputs.
 
@@ -13039,6 +13041,8 @@ async def _run_owner_forward_recovery_with_session(
         del _session, text_data, queue_limit
         if submit_attempts is not None:
             submit_attempts.append(request_state.request_id)
+        if submitted_states is not None:
+            submitted_states.append(request_state)
         if capacity_error_on_first_submit and submit_attempts is not None and len(submit_attempts) == 1:
             raise ProxyResponseError(
                 429,
@@ -13096,6 +13100,7 @@ async def _run_owner_forward_recovery_with_session(
             codex_idle_ttl_seconds=900.0,
             max_sessions=8,
             queue_limit=4,
+            rewritten_file_account_id=rewritten_file_account_id,
         )
     ]
     if capacity_error_on_first_submit:
@@ -13146,6 +13151,25 @@ async def test_stream_via_http_bridge_owner_forward_recovery_waits_for_local_sub
     )
 
     assert submit_attempts == ["req-2", "req-2"]
+
+
+@pytest.mark.asyncio
+async def test_stream_via_http_bridge_owner_forward_recovery_preserves_uploaded_file_account_pin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    submitted_states: list[proxy_service._WebSocketRequestState] = []
+
+    await _run_owner_forward_recovery_with_session(
+        monkeypatch,
+        recovery_session=_make_owner_forward_recovery_session(),
+        input_items=[{"role": "user", "content": "continue with uploaded file"}],
+        rewritten_file_account_id="acc-1",
+        submitted_states=submitted_states,
+    )
+
+    assert len(submitted_states) == 1
+    assert submitted_states[0].preferred_account_id == "acc-1"
+    assert submitted_states[0].file_required_preferred_account is True
 
 
 @pytest.mark.asyncio
@@ -13202,6 +13226,7 @@ async def test_stream_via_http_bridge_local_recovery_retry_keeps_injected_interr
     retry_session = _make_owner_forward_recovery_session()
 
     prepared_inputs: list[Any] = []
+    submitted_states: list[proxy_service._WebSocketRequestState] = []
 
     def fake_prepare(
         prepared_payload: proxy_service.ResponsesRequest,
@@ -13240,6 +13265,7 @@ async def test_stream_via_http_bridge_local_recovery_retry_keeps_injected_interr
         nonlocal submit_calls
         del _session, text_data, queue_limit
         submit_calls += 1
+        submitted_states.append(request_state)
         if submit_calls == 1:
             raise ProxyResponseError(400, proxy_service.openai_error("previous_response_not_found", "missing"))
         event_queue = request_state.event_queue
@@ -13290,6 +13316,7 @@ async def test_stream_via_http_bridge_local_recovery_retry_keeps_injected_interr
             codex_idle_ttl_seconds=900.0,
             max_sessions=8,
             queue_limit=4,
+            rewritten_file_account_id="acc-1",
         )
     ]
 
@@ -13307,6 +13334,10 @@ async def test_stream_via_http_bridge_local_recovery_retry_keeps_injected_interr
     assert prepared_inputs[0] == input_items
     assert prepared_inputs[1] == [synthetic_item, *input_items]
     assert prepared_inputs[2] == [synthetic_item, *input_items]
+    assert len(submitted_states) == 2
+    assert submitted_states[0].file_required_preferred_account is True
+    assert submitted_states[1].file_required_preferred_account is True
+    assert submitted_states[1].preferred_account_id == "acc-1"
 
 
 @pytest.mark.asyncio

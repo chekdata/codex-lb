@@ -2430,6 +2430,7 @@ class _HTTPBridgeStreamingMixin:
                         request_state.request_stage if owner_forward_fresh_replay else "reattach"
                     )
                     retry_request_state.preferred_account_id = request_state.preferred_account_id
+                    retry_request_state.file_required_preferred_account = file_required_preferred_account
                     retry_request_state.excluded_account_ids.update(request_state.excluded_account_ids)
                     if recovery_anchor_input_count is not None:
                         retry_request_state.input_item_count = recovery_anchor_input_count
@@ -3389,6 +3390,7 @@ class _HTTPBridgeStreamingMixin:
                 retry_request_state.transport = _REQUEST_TRANSPORT_HTTP
                 retry_request_state.request_stage = retry_request_stage
                 retry_request_state.preferred_account_id = retry_preferred_account_id
+                retry_request_state.file_required_preferred_account = file_required_preferred_account
                 retry_request_state.excluded_account_ids.update(request_state.excluded_account_ids)
 
                 retry_events: AsyncGenerator[str, None] = self._stream_http_bridge_session_events(
