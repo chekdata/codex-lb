@@ -394,7 +394,14 @@ silently discard prior conversation context. A completed response MUST clear
 the bounded quarantine.
 
 Client-supplied `previous_response_id` values MUST NOT be cleared or replayed
-unanchored by this recovery path.
+unanchored by this recovery path unless the same request carries a
+request-bound immutable durable proof that matches the current durable owner,
+the exact stored input prefix, pending-tool manifest, and complete fresh
+suffix. When that proof exists and upstream rejects the explicit anchor before
+any response event, the bridge MAY quarantine the rejected physical session
+and replay the proved complete request exactly once without the anchor on the
+same owning account. An incomplete, delta-only, owner-conflicting, or
+unproved explicit-anchor request remains fail-closed.
 
 #### Scenario: proved complete request recovers in the same turn
 
@@ -419,10 +426,28 @@ unanchored by this recovery path.
 
 #### Scenario: delta-only and client-owned anchors remain fail-closed
 
-- **GIVEN** a quarantined key receives a delta payload or a full-resend-shaped payload without exact durable completeness proof, or the rejected anchor was client supplied
+- **GIVEN** a client explicitly supplies `previous_response_id`
+- **AND** its request omits the prior completed output or otherwise lacks the
+  immutable owner-bound complete-context proof
+- **WHEN** upstream rejects that anchor before execution
+- **THEN** the bridge does not clear the anchor or dispatch an unanchored copy
+- **GIVEN** a quarantined key receives a delta payload, a full-resend-shaped
+  payload without exact durable completeness proof, or an unproved
+  client-supplied anchor
 - **WHEN** recovery is evaluated
 - **THEN** the proxy does not remove the anchor
 - **AND** it does not issue an unanchored replay that could omit prior context
+
+#### Scenario: proved explicit stale anchor recovers once
+
+- **GIVEN** a client explicitly supplies `previous_response_id`
+- **AND** the same request's immutable durable proof binds the current owner,
+  exact stored prefix, pending-tool manifest, and complete fresh suffix
+- **WHEN** upstream rejects that anchor before any response event
+- **THEN** the bridge retires the rejected physical session
+- **AND** sends the proved complete request once without
+  `previous_response_id` on the same owning account
+- **AND** a failed replacement cannot authorize a second duplicate replay
 
 ### Requirement: Upstream websocket drops penalize affected accounts
 

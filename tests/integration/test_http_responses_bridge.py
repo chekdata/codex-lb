@@ -13983,6 +13983,133 @@ async def test_v1_responses_http_bridge_quarantines_persistently_stale_proxy_anc
     assert recovered_payload["instructions"].endswith("stored per-turn control")
 
 
+@pytest.mark.parametrize("use_latest_durable_anchor", [True, False], ids=["known-anchor", "unknown-anchor"])
+@pytest.mark.parametrize("include_completed_output", [True, False], ids=["complete-context", "incomplete-context"])
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_recovers_verified_full_resend_with_explicit_stale_anchor(
+    async_client,
+    app_instance,
+    monkeypatch,
+    use_latest_durable_anchor,
+    include_completed_output,
+):
+    """A complete owner-bound resend may drop its rejected explicit anchor once."""
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_explicit_stale_anchor",
+        "http-bridge-explicit-stale-anchor@example.com",
+    )
+    account = await _get_account(account_id)
+    first_upstream = _FakeBridgeUpstreamWebSocket("resp_explicit_stale")
+    stale_upstream: _RejectStalePreviousResponseUpstreamWebSocket | None = None
+    recovered_upstream: _RejectStalePreviousResponseUpstreamWebSocket | None = None
+    connect_count = 0
+
+    async def fake_select_account_with_budget(self, deadline, **kwargs):
+        del self, deadline, kwargs
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        nonlocal connect_count
+        del headers, access_token, account_id_header, base_url, session
+        connect_count += 1
+        if connect_count == 1:
+            return first_upstream
+        if connect_count == 2:
+            assert stale_upstream is not None
+            return stale_upstream
+        assert recovered_upstream is not None
+        return recovered_upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    session_id = "explicit-stale-anchor"
+    session_headers = {"x-codex-session-id": session_id}
+    historical_input = [{"role": "user", "content": "hello"}]
+    first = await async_client.post(
+        "/v1/responses",
+        headers=session_headers,
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": historical_input,
+            "prompt_cache_key": session_id,
+        },
+    )
+    assert first.status_code == 200, first.text
+    first_body = first.json()
+    stale_response_id = (
+        first_body["id"]
+        if use_latest_durable_anchor
+        else "resp_0000000000000000000000000000000000000000000000000000000000000000"
+    )
+    stale_upstream = _RejectStalePreviousResponseUpstreamWebSocket(stale_response_id)
+    recovered_upstream = _RejectStalePreviousResponseUpstreamWebSocket(stale_response_id)
+
+    service = get_proxy_service_for_app(app_instance)
+    async with service._http_bridge_lock:
+        session = next(iter(service._http_bridge_sessions.values()))
+    await service._reset_http_bridge_session_after_local_terminal_error(
+        session,
+        error_code="test_transport_replaced",
+        error_message="Force a fresh socket while preserving the durable anchor",
+        preserve_durable_lease=True,
+    )
+
+    complete_resend = [
+        *historical_input,
+        *(first_body["output"] if include_completed_output else []),
+        {"role": "user", "content": "continue from complete context"},
+    ]
+    recovered = await async_client.post(
+        "/v1/responses",
+        headers=session_headers,
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": complete_resend,
+            "prompt_cache_key": session_id,
+            "previous_response_id": stale_response_id,
+        },
+    )
+
+    if not include_completed_output:
+        assert recovered.status_code == 502, recovered.text
+        assert recovered.json()["error"]["code"] == "bridge_previous_response_not_found"
+        assert connect_count == 3
+        assert stale_upstream is not None
+        assert recovered_upstream is not None
+        assert all(
+            json.loads(sent)["previous_response_id"] == stale_response_id
+            for sent in [*stale_upstream.sent_text, *recovered_upstream.sent_text]
+        )
+        return
+
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["id"] == "resp_recovered_1"
+    assert connect_count == 3
+    assert stale_upstream is not None
+    assert json.loads(stale_upstream.sent_text[0])["previous_response_id"] == stale_response_id
+    assert recovered_upstream is not None
+    recovered_payload = json.loads(recovered_upstream.sent_text[0])
+    assert "previous_response_id" not in recovered_payload
+    assert recovered_payload["input"] == complete_resend
+
+
 @pytest.mark.asyncio
 async def test_v1_responses_http_bridge_retains_stale_anchor_until_verified_replay_completes(
     async_client,

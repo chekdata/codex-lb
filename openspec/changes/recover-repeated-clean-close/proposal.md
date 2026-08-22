@@ -40,12 +40,13 @@ loop and require the Codex client to be restarted.
   remaining cooldown. Use it for both the HTTP `Retry-After` header and an
   accurate operator-facing message instead of describing every WebSocket
   failure as a timeout.
-- Treat an upstream rejection of a proxy-injected `previous_response_id` as a
-  stale continuity anchor, not as a reason to inject the same identifier into
-  another physical WebSocket. Replay immediately only when the immutable
-  durable proof covers the complete client context; otherwise quarantine the
-  logical key and recover on the next complete client resend while keeping
-  delta-only requests fail-closed.
+- Treat an upstream rejection of a proxy-injected `previous_response_id`, or
+  an explicit client anchor accompanied by the same immutable owner-bound
+  complete-context proof, as a stale continuity anchor rather than a reason
+  to inject the same rejected identifier into another physical WebSocket.
+  Replay immediately only when the proof covers the complete client context;
+  otherwise quarantine the logical key and recover on the next complete
+  client resend while keeping delta-only requests fail-closed.
 - Recognize a narrowly validated completed Codex `agent_message` as the
   retained-output boundary in an exact owner-bound full resend. Keep this
   recovery pinned to the existing owning account, require the response-owned
