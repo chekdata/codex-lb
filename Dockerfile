@@ -40,7 +40,9 @@ WORKDIR /app
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --only-upgrade \
-        libc-bin libc6 libcap2 libssl3t64 libsystemd0 libudev1 openssl sed \
+        bsdutils libc-bin libc6 libblkid1 libcap2 liblastlog2-2 libmount1 \
+        libsmartcols1 libssl3t64 libsystemd0 libudev1 libuuid1 login mount \
+        openssl sed util-linux \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         openssl-provider-legacy \
     && rm -rf /var/lib/apt/lists/*
