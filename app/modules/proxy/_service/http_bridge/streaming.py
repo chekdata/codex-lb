@@ -404,6 +404,165 @@ def _verify_durable_full_resend(
     return _VerifiedDurableFullResend._verify(payload, durable_lookup)
 
 
+class _VerifiedStoreContextFullResend:
+    """Request-local proof for an exact store-context prefix trim.
+
+    This proof is intentionally separate from durable full-resend evidence.
+    It is minted only while the live bridge still owns the response anchor and
+    only after the incoming full input exactly matches that bridge's stored
+    prefix.  The complete untrimmed request therefore remains available for a
+    single same-account recovery if upstream rejects the proxy-injected anchor
+    before producing any response event.
+    """
+
+    _affinity_key: str
+    _affinity_kind: str
+    _api_key_id: str | None
+    _full_input_fingerprint: str
+    _latest_response_id: str
+    _owner_account_id: str
+    _pending_tool_calls: tuple[tuple[str, str], ...] | None
+    _stored_input_fingerprint: str
+    _stored_input_item_count: int
+    __slots__ = (
+        "_affinity_key",
+        "_affinity_kind",
+        "_api_key_id",
+        "_full_input_fingerprint",
+        "_latest_response_id",
+        "_owner_account_id",
+        "_pending_tool_calls",
+        "_stored_input_fingerprint",
+        "_stored_input_item_count",
+    )
+    __construction_token = object()
+
+    def __init__(
+        self,
+        *,
+        _token: object,
+        affinity_kind: str,
+        affinity_key: str,
+        api_key_id: str | None,
+        owner_account_id: str,
+        latest_response_id: str,
+        stored_input_item_count: int,
+        stored_input_fingerprint: str,
+        full_input_fingerprint: str,
+        pending_tool_calls: tuple[tuple[str, str], ...] | None,
+    ) -> None:
+        if _token is not self.__construction_token:
+            raise TypeError("verified store-context full resend proofs are created only by the verifier")
+        object.__setattr__(self, "_affinity_kind", affinity_kind)
+        object.__setattr__(self, "_affinity_key", affinity_key)
+        object.__setattr__(self, "_api_key_id", api_key_id)
+        object.__setattr__(self, "_owner_account_id", owner_account_id)
+        object.__setattr__(self, "_latest_response_id", latest_response_id)
+        object.__setattr__(self, "_stored_input_item_count", stored_input_item_count)
+        object.__setattr__(self, "_stored_input_fingerprint", stored_input_fingerprint)
+        object.__setattr__(self, "_full_input_fingerprint", full_input_fingerprint)
+        object.__setattr__(self, "_pending_tool_calls", pending_tool_calls)
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("verified store-context full resend proofs are immutable")
+
+    def __copy__(self) -> "_VerifiedStoreContextFullResend":
+        return self
+
+    def __deepcopy__(self, _memo: dict[int, object]) -> "_VerifiedStoreContextFullResend":
+        return self
+
+    def __reduce_ex__(self, _protocol: object) -> str | tuple[Any, ...]:
+        raise TypeError("verified store-context full resend proofs cannot be serialized")
+
+    def matches(self, payload: ResponsesRequest, session: _HTTPBridgeSession) -> bool:
+        input_items = payload.input
+        return (
+            payload.previous_response_id is None
+            and isinstance(input_items, list)
+            and session.key.affinity_kind == self._affinity_kind
+            and session.key.affinity_key == self._affinity_key
+            and session.key.api_key_id == self._api_key_id
+            and session.account.id == self._owner_account_id
+            and session.last_completed_response_account_id == self._owner_account_id
+            and session.last_completed_response_id == self._latest_response_id
+            and session.last_completed_input_count == self._stored_input_item_count
+            and session.last_completed_input_prefix_fingerprint == self._stored_input_fingerprint
+            and _pending_tool_calls_identity(session.last_pending_tool_calls or None) == self._pending_tool_calls
+            and _fingerprint_input_items(cast(list[JsonValue], input_items)) == self._full_input_fingerprint
+        )
+
+    @classmethod
+    def _verify(
+        cls,
+        payload: ResponsesRequest,
+        session: _HTTPBridgeSession,
+    ) -> "_VerifiedStoreContextFullResend | None":
+        owner_account_id = session.last_completed_response_account_id
+        latest_response_id = session.last_completed_response_id
+        stored_count = session.last_completed_input_count
+        stored_fingerprint = session.last_completed_input_prefix_fingerprint
+        if (
+            payload.previous_response_id is not None
+            or owner_account_id is None
+            or owner_account_id != session.account.id
+            or latest_response_id is None
+            or stored_count <= 0
+            or stored_fingerprint is None
+            or not _http_bridge_payload_looks_like_full_resend(payload)
+            or not isinstance(payload.input, list)
+            or not _input_prefix_matches_stored_context(
+                payload.input,
+                stored_count=stored_count,
+                stored_fingerprint=stored_fingerprint,
+            )
+        ):
+            return None
+        input_items = cast(list[JsonValue], payload.input)
+        replay_projection = project_responses_input_for_account_neutral_fresh_replay(
+            input_items,
+            stored_count=stored_count,
+            preserve_developer_message_ids=True,
+        )
+        pending_tool_calls = session.last_pending_tool_calls or None
+        if replay_projection is None:
+            return None
+        safe_fresh_context = responses_input_suffix_retains_prior_output(
+            replay_projection.input_items,
+            stored_count=replay_projection.stored_prefix_count,
+            canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+        ) or (
+            pending_tool_calls is not None
+            and responses_input_suffix_matches_pending_tool_calls(
+                replay_projection.input_items,
+                stored_count=replay_projection.stored_prefix_count,
+                pending_tool_calls=pending_tool_calls,
+                canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+            )
+        )
+        if not safe_fresh_context:
+            return None
+        return cls(
+            _token=cls.__construction_token,
+            affinity_kind=session.key.affinity_kind,
+            affinity_key=session.key.affinity_key,
+            api_key_id=session.key.api_key_id,
+            owner_account_id=owner_account_id,
+            latest_response_id=latest_response_id,
+            stored_input_item_count=stored_count,
+            stored_input_fingerprint=stored_fingerprint,
+            full_input_fingerprint=_fingerprint_input_items(input_items),
+            pending_tool_calls=_pending_tool_calls_identity(pending_tool_calls),
+        )
+
+
+def _verify_store_context_full_resend(
+    payload: ResponsesRequest,
+    session: _HTTPBridgeSession,
+) -> _VerifiedStoreContextFullResend | None:
+    return _VerifiedStoreContextFullResend._verify(payload, session)
+
+
 _HTTP_BRIDGE_DEAD_OWNER_NOT_FOUND_DETAIL = "The previous bridge owner is no longer available."
 
 
@@ -2624,6 +2783,7 @@ class _HTTPBridgeStreamingMixin:
         store_context_trim_applied = False
         store_context_original_count = 0
         store_context_original_fingerprint: str | None = None
+        store_context_full_resend_proof: _VerifiedStoreContextFullResend | None = None
         if (
             has_previous_response_id
             and stored_count > 0
@@ -2634,6 +2794,10 @@ class _HTTPBridgeStreamingMixin:
             incoming_input_list = cast(list[JsonValue], incoming_input)
             incoming_prefix_fingerprint = _fingerprint_input_items(incoming_input_list[:stored_count])
             if incoming_prefix_fingerprint == stored_fingerprint:
+                store_context_full_resend_proof = _verify_store_context_full_resend(
+                    untrimmed_effective_payload,
+                    session,
+                )
                 store_context_trim_applied = True
                 store_context_original_count = len(incoming_input_list)
                 store_context_original_fingerprint = _fingerprint_input_items(incoming_input_list)
@@ -2713,7 +2877,7 @@ class _HTTPBridgeStreamingMixin:
                 # keep the replay-safety decision made when the anchor was
                 # injected.
                 request_state.fresh_upstream_request_is_retry_safe = (
-                    (durable_full_resend_anchor_count is None or durable_full_resend_has_safe_fresh_context)
+                    store_context_full_resend_proof is not None
                     if store_context_trim_applied
                     else previous_request_state.fresh_upstream_request_is_retry_safe
                 )
@@ -3099,13 +3263,20 @@ class _HTTPBridgeStreamingMixin:
                 and request_state.response_event_count == 0
                 and untrimmed_effective_payload.previous_response_id is None
             )
-            proof_gated_stale_anchor_replay = bool(
+            durable_stale_anchor_replay = bool(
                 proxy_injected_stale_anchor
                 and request_state.proxy_injected_anchor_had_full_resend_payload
                 and durable_lookup is not None
                 and durable_full_resend_proof is not None
                 and durable_full_resend_proof.matches(untrimmed_effective_payload, durable_lookup)
             )
+            store_context_stale_anchor_replay = bool(
+                proxy_injected_stale_anchor
+                and request_state.proxy_injected_anchor_had_full_resend_payload
+                and store_context_full_resend_proof is not None
+                and store_context_full_resend_proof.matches(untrimmed_effective_payload, session)
+            )
+            proof_gated_stale_anchor_replay = durable_stale_anchor_replay or store_context_stale_anchor_replay
             should_attempt_context_overflow_fresh_turn_recovery = (
                 is_context_overflow
                 and effective_payload.previous_response_id is not None
@@ -3188,13 +3359,22 @@ class _HTTPBridgeStreamingMixin:
                     reason=_HTTP_BRIDGE_QUARANTINE_REJECTED_STALE_ANCHOR_REASON,
                 )
                 if PROMETHEUS_AVAILABLE and bridge_durable_recover_total is not None:
-                    bridge_durable_recover_total.labels(path="stale_anchor_full_resend").inc()
+                    bridge_durable_recover_total.labels(
+                        path=(
+                            "stale_anchor_store_context_full_resend"
+                            if store_context_stale_anchor_replay
+                            else "stale_anchor_full_resend"
+                        )
+                    ).inc()
                 _log_http_bridge_event(
                     "previous_response_recover_full_resend",
                     bridge_session_key,
                     account_id=session.account.id,
                     model=effective_payload.model,
-                    detail="outcome=single_unanchored_same_account_replay",
+                    detail=(
+                        "outcome=single_unanchored_same_account_replay, "
+                        f"proof_source={'store_context' if store_context_stale_anchor_replay else 'durable'}"
+                    ),
                     cache_key_family=bridge_session_key.affinity_kind,
                     model_class=_extract_model_class(effective_payload.model) if effective_payload.model else None,
                     owner_check_applied=True,
@@ -3205,7 +3385,11 @@ class _HTTPBridgeStreamingMixin:
                     error_message="The proxy-injected previous response anchor was rejected before execution",
                     preserve_durable_lease=True,
                 )
-                recovery_path = "stale_anchor_full_resend"
+                recovery_path = (
+                    "stale_anchor_store_context_full_resend"
+                    if store_context_stale_anchor_replay
+                    else "stale_anchor_full_resend"
+                )
                 retry_payload = _http_bridge_payload_without_previous_response_id(untrimmed_effective_payload)
                 retry_previous_response_id = None
                 retry_request_stage = "durable_recovery"

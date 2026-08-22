@@ -1909,6 +1909,34 @@ When a direct Responses WebSocket request has a prepared retry-safe fresh upstre
 - **THEN** the service reconnects and replays the prepared no-anchor request
 - **AND** it does not rewrite the turn to `previous_response_owner_unavailable`
 
+### Requirement: Exact HTTP store-context trims recover rejected proxy anchors from the retained request
+When an HTTP Responses bridge request arrives without `previous_response_id`,
+contains complete conversation context, and has an input prefix that exactly
+matches the current live session checkpoint, the service MAY trim that prefix
+and inject the checkpoint anchor. Before doing so, it MUST seal a request-local
+proof binding the logical session key, owning account, response anchor, stored
+input count and fingerprint, pending tool-call manifest, and full request
+fingerprint. If upstream rejects the proxy-injected anchor before any response
+event, the service MAY retry the retained complete request exactly once without
+the anchor on the same account. It MUST preserve the prior durable checkpoint
+until replacement completion and MUST keep incomplete inputs, changed proof
+inputs, client-supplied anchors, post-event failures, and account changes fail
+closed.
+
+#### Scenario: verified store-context trim recovers in the same HTTP request
+- **GIVEN** a live HTTP bridge checkpoint has an owning account, response anchor, and exact stored input fingerprint
+- **AND** an unanchored follow-up exactly matches that prefix and retains prior response or pending tool context
+- **WHEN** the bridge trims the prefix, injects the anchor, and upstream rejects it before any response event
+- **THEN** the service reconnects once on the same account
+- **AND** sends the sealed complete request once without `previous_response_id`
+- **AND** replacement completion atomically supersedes the old checkpoint
+
+#### Scenario: store-context recovery cannot broaden replay authority
+- **GIVEN** the input is incomplete, the exact prefix or proof binding changed, the anchor was supplied by the client, an event was observed, or the replacement send is ambiguous
+- **WHEN** recovery is evaluated
+- **THEN** the service does not dispatch a request-local unanchored replay
+- **AND** it does not switch accounts or consume another replay attempt
+
 ### Requirement: Codex WebSocket prewarm completions are classified separately
 For a direct Responses WebSocket, the service MUST treat Codex turn metadata received on the HTTP handshake as connection-scoped metadata rather than applying its `request_kind` to every `response.create` frame. The service MUST classify an individual turn as `prewarm` when the connection metadata is `prewarm` and either that turn carries `generate: false` or its completed usage reports zero output tokens. Other turns on the same connection MUST be classified as `normal`.
 

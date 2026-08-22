@@ -1,0 +1,7 @@
+- [x] Define request-local store-context completeness proof semantics.
+- [x] Add proof immutability and exact-binding unit coverage.
+- [x] Add a production-shape bridge regression for exact-prefix trim followed by stale-anchor rejection.
+- [x] Implement one same-account unanchored replay before any response event.
+- [x] Run OpenSpec validation and focused formatting, lint, type, unit, and integration gates.
+- [ ] Merge through required repository gates and publish the exact source image.
+- [ ] Deploy through immutable GitOps and verify production continuity plus the affected long-running task.
