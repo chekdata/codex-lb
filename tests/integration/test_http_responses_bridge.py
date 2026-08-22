@@ -7366,7 +7366,19 @@ async def test_v1_responses_http_bridge_classifies_responses_lite_developer_inte
     monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
     monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
 
-    session_headers = {"x-codex-session-id": "fresh-reattach-full-resend"}
+    if developer_message_extra:
+        scenario_id = "response-owned-developer-message"
+    elif fresh_developer_message is not None:
+        scenario_id = "fresh-developer-interleave"
+    elif leading_input_item is not None:
+        scenario_id = "lite-bundle-not-at-prefix-start"
+    else:
+        scenario_id = "unowned-developer-message"
+    # Durable bridge ownership intentionally survives process-local session
+    # teardown. Give each independently parameterized scenario its own
+    # logical session so a delayed release from one case cannot fence the
+    # next case as though it were a cross-replica retry.
+    session_headers = {"x-codex-session-id": f"fresh-reattach-full-resend-{scenario_id}"}
     historical_input = [
         *([leading_input_item] if leading_input_item is not None else []),
         {
