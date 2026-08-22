@@ -238,6 +238,49 @@ logger = logging.getLogger("app.modules.proxy.service")
 T = TypeVar("T")
 _REQUEST_TRANSPORT_HTTP = "http"
 _RESPONSE_CREATE_GATE_RETRY_SLEEP_SECONDS = 10.0
+_OBSERVABLE_REPLAY_SUFFIX_ITEM_TYPES = frozenset(
+    {
+        "agent_message",
+        "apply_patch_call",
+        "apply_patch_call_output",
+        "custom_tool_call",
+        "custom_tool_call_output",
+        "function_call",
+        "function_call_output",
+        "reasoning",
+    }
+)
+
+
+def _full_resend_suffix_shape_for_observability(
+    input_items: list[JsonValue],
+    *,
+    stored_count: int,
+) -> str:
+    """Return a bounded, content-free shape for rejected replay proofs."""
+
+    labels: list[str] = []
+    for item in input_items[stored_count : stored_count + 8]:
+        if not isinstance(item, dict):
+            labels.append("scalar")
+            continue
+        item_type = item.get("type")
+        role = item.get("role")
+        if (
+            item_type in (None, "message")
+            and isinstance(role, str)
+            and role in {"assistant", "developer", "system", "user"}
+        ):
+            labels.append(str(role))
+        elif isinstance(item_type, str) and item_type in _OBSERVABLE_REPLAY_SUFFIX_ITEM_TYPES:
+            labels.append(item_type)
+        elif isinstance(item_type, str) and item_type in {"input_file", "input_image", "input_text"}:
+            labels.append("input_part")
+        else:
+            labels.append("other")
+    if len(input_items) - stored_count > 8:
+        labels.append("more")
+    return ">".join(labels) or "empty"
 
 
 def _http_bridge_continuity_bound_without_safe_replay(request_state: _WebSocketRequestState) -> bool:
@@ -358,6 +401,7 @@ class _VerifiedDurableFullResend:
             # inline Responses-Lite developer IDs must remain visible until
             # the exact-manifest check rejects response-owned messages.
             preserve_developer_message_ids=True,
+            preserve_response_owned_agent_message_ids=True,
         )
         pending_tool_calls = durable_lookup.latest_pending_tool_calls
         if replay_projection is None:
@@ -367,11 +411,10 @@ class _VerifiedDurableFullResend:
             stored_count=replay_projection.stored_prefix_count,
             canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
             # The prefix fingerprint matched the exact context previously
-            # completed by this same-account session, and an empty pending
-            # manifest proves no tool call is left unsettled. Historical
-            # developer interleaves inside that sealed prefix are therefore
-            # not new replay authority and must not strand long Codex tasks.
+            # completed by this same-account session. Only the new inter-agent
+            # boundary additionally requires an explicitly empty manifest.
             exact_stored_prefix_without_pending_manifest=not pending_tool_calls,
+            allow_response_owned_agent_message=pending_tool_calls == {},
         ) or (
             pending_tool_calls is not None
             and responses_input_suffix_matches_pending_tool_calls(
@@ -494,7 +537,8 @@ class _VerifiedStoreContextFullResend:
             and session.last_completed_response_id == self._latest_response_id
             and session.last_completed_input_count == self._stored_input_item_count
             and session.last_completed_input_prefix_fingerprint == self._stored_input_fingerprint
-            and _pending_tool_calls_identity(session.last_pending_tool_calls or None) == self._pending_tool_calls
+            and not session.last_pending_tool_call_manifest_invalid
+            and _pending_tool_calls_identity(session.last_pending_tool_calls) == self._pending_tool_calls
             and _fingerprint_input_items(cast(list[JsonValue], input_items)) == self._full_input_fingerprint
         )
 
@@ -515,6 +559,7 @@ class _VerifiedStoreContextFullResend:
             or latest_response_id is None
             or stored_count <= 0
             or stored_fingerprint is None
+            or session.last_pending_tool_call_manifest_invalid
             or not _http_bridge_payload_looks_like_full_resend(payload)
             or not isinstance(payload.input, list)
             or not _input_prefix_matches_stored_context(
@@ -529,8 +574,9 @@ class _VerifiedStoreContextFullResend:
             input_items,
             stored_count=stored_count,
             preserve_developer_message_ids=True,
+            preserve_response_owned_agent_message_ids=True,
         )
-        pending_tool_calls = session.last_pending_tool_calls or None
+        pending_tool_calls = session.last_pending_tool_calls
         if replay_projection is None:
             return None
         safe_fresh_context = responses_input_suffix_retains_prior_output(
@@ -538,6 +584,7 @@ class _VerifiedStoreContextFullResend:
             stored_count=replay_projection.stored_prefix_count,
             canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
             exact_stored_prefix_without_pending_manifest=not pending_tool_calls,
+            allow_response_owned_agent_message=pending_tool_calls == {},
         ) or (
             pending_tool_calls is not None
             and responses_input_suffix_matches_pending_tool_calls(
@@ -1479,6 +1526,7 @@ class _HTTPBridgeStreamingMixin:
                 # response-owned messages. Cross-account replay uses the
                 # default ID-stripping projection below.
                 preserve_developer_message_ids=True,
+                preserve_response_owned_agent_message_ids=True,
             )
             safe_fresh_context = False
             if replay_projection is not None:
@@ -1487,6 +1535,7 @@ class _HTTPBridgeStreamingMixin:
                     stored_count=replay_projection.stored_prefix_count,
                     canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
                     exact_stored_prefix_without_pending_manifest=not lookup.latest_pending_tool_calls,
+                    allow_response_owned_agent_message=lookup.latest_pending_tool_calls == {},
                 ) or (
                     lookup.latest_pending_tool_calls is not None
                     and responses_input_suffix_matches_pending_tool_calls(
@@ -1495,6 +1544,23 @@ class _HTTPBridgeStreamingMixin:
                         pending_tool_calls=lookup.latest_pending_tool_calls,
                         canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
                     )
+                )
+            if not safe_fresh_context:
+                _log_http_bridge_event(
+                    "full_resend_proof_rejected",
+                    bridge_session_key,
+                    account_id=None,
+                    model=payload.model,
+                    detail=(
+                        "reason=invalid_or_incomplete_suffix, "
+                        f"stored_items={stored_count}, "
+                        f"suffix_items={len(payload.input) - stored_count}, "
+                        "suffix_shape="
+                        f"{_full_resend_suffix_shape_for_observability(payload.input, stored_count=stored_count)}"
+                    ),
+                    cache_key_family=bridge_session_key.affinity_kind,
+                    model_class=_extract_model_class(payload.model) if payload.model else None,
+                    owner_check_applied=True,
                 )
             return stored_count, lookup.latest_input_full_fingerprint, safe_fresh_context
 
@@ -1514,13 +1580,15 @@ class _HTTPBridgeStreamingMixin:
                 stored_count=durable_full_resend_anchor_count,
             )
             if replay_projection is not None:
-                durable_full_resend_retains_prior_output = responses_input_suffix_retains_prior_output(
-                    replay_projection.input_items,
-                    stored_count=replay_projection.stored_prefix_count,
-                    canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
-                    exact_stored_prefix_without_pending_manifest=(
-                        durable_lookup is not None and not durable_lookup.latest_pending_tool_calls
-                    ),
+                durable_full_resend_retains_prior_output = (
+                    durable_lookup is not None
+                    and responses_input_suffix_retains_prior_output(
+                        replay_projection.input_items,
+                        stored_count=replay_projection.stored_prefix_count,
+                        canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+                        exact_stored_prefix_without_pending_manifest=not durable_lookup.latest_pending_tool_calls,
+                        allow_response_owned_agent_message=durable_lookup.latest_pending_tool_calls == {},
+                    )
                 )
                 durable_full_resend_fresh_payload = _http_bridge_payload_without_previous_response_id(
                     payload
@@ -1966,16 +2034,19 @@ class _HTTPBridgeStreamingMixin:
                     cast(list[JsonValue], payload.input),
                     stored_count=durable_full_resend_anchor_count,
                     preserve_developer_message_ids=True,
+                    preserve_response_owned_agent_message_ids=True,
                 )
                 if eligibility_projection is None:
                     return False
-                durable_full_resend_retains_prior_output = responses_input_suffix_retains_prior_output(
-                    eligibility_projection.input_items,
-                    stored_count=eligibility_projection.stored_prefix_count,
-                    canonical_lite_developer_index=eligibility_projection.canonical_lite_developer_index,
-                    exact_stored_prefix_without_pending_manifest=(
-                        durable_lookup is not None and not durable_lookup.latest_pending_tool_calls
-                    ),
+                durable_full_resend_retains_prior_output = (
+                    durable_lookup is not None
+                    and responses_input_suffix_retains_prior_output(
+                        eligibility_projection.input_items,
+                        stored_count=eligibility_projection.stored_prefix_count,
+                        canonical_lite_developer_index=eligibility_projection.canonical_lite_developer_index,
+                        exact_stored_prefix_without_pending_manifest=not durable_lookup.latest_pending_tool_calls,
+                        allow_response_owned_agent_message=durable_lookup.latest_pending_tool_calls == {},
+                    )
                 )
                 if not durable_full_resend_retains_prior_output:
                     return False
@@ -2544,7 +2615,10 @@ class _HTTPBridgeStreamingMixin:
                             }
                         )
                         if durable_lookup.latest_response_id != session.last_completed_response_id:
-                            session.last_pending_tool_calls = {}
+                            session.last_pending_tool_call_manifest_invalid = (
+                                durable_lookup.latest_pending_tool_calls is None
+                            )
+                            session.last_pending_tool_calls = dict(durable_lookup.latest_pending_tool_calls or {})
                         session.last_completed_response_id = durable_lookup.latest_response_id
                         session.last_completed_response_account_id = durable_lookup.account_id
                         session.last_completed_input_count = durable_full_resend_anchor_count
@@ -2671,9 +2745,11 @@ class _HTTPBridgeStreamingMixin:
         ):
             if durable_lookup.latest_response_id != session.last_completed_response_id:
                 # The pending tool calls were recorded for the session's own
-                # last completed response; a durable anchor pointing elsewhere
-                # must not trigger interrupted-output injection.
-                session.last_pending_tool_calls = {}
+                # last completed response.  Rebind them to the durable anchor,
+                # preserving an unavailable manifest as invalid instead of
+                # silently treating it as a verified empty manifest.
+                session.last_pending_tool_call_manifest_invalid = durable_lookup.latest_pending_tool_calls is None
+                session.last_pending_tool_calls = dict(durable_lookup.latest_pending_tool_calls or {})
             session.last_completed_response_id = durable_lookup.latest_response_id
             # The durable anchor is owned by the durable session's account, which
             # may differ from this session's account after a failover. Record the

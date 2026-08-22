@@ -417,6 +417,32 @@ def _durable_pending_tool_call_manifest(
     return dict(request_state.pending_tool_call_types)
 
 
+def _live_pending_tool_call_manifest_is_invalid(
+    request_state: _WebSocketRequestState,
+    payload: dict[str, JsonValue] | None,
+) -> bool:
+    """Keep explicitly invalid live manifests distinct from valid empty ones.
+
+    A live session may safely synthesize an interrupted output from a completed
+    ``output_item.done`` event even when the optional ``added`` event was not
+    observed.  Durable replay needs the stricter added/done equality above,
+    while live replay must still reject malformed/unsupported events and any
+    terminal tool-call set that contradicts the observed completed calls.
+    """
+
+    terminal_calls = _response_completed_tool_call_types(payload)
+    added_calls_settled = all(
+        request_state.pending_tool_call_types.get(call_id) == call_type
+        for call_id, call_type in request_state.added_tool_call_types.items()
+    )
+    return bool(
+        request_state.tool_call_manifest_invalid
+        or not added_calls_settled
+        or terminal_calls is None
+        or (terminal_calls and terminal_calls != request_state.pending_tool_call_types)
+    )
+
+
 _SECURITY_WORK_AUTHORIZATION_REQUIRED_CODE = "security_work_authorization_required"
 _SECURITY_WORK_RETRY_MESSAGE = (
     "Upstream flagged this request as possible cybersecurity work. "
@@ -2004,12 +2030,17 @@ class _HTTPBridgeUpstreamEventsMixin:
             and completed_usage.output_tokens == 0
         )
 
+        completed_pending_tool_call_manifest: dict[str, str] | None = None
         if (
             response_id is not None
             and matched_request_state is not None
             and event_type == "response.completed"
             and not completed_empty_prewarm
         ):
+            completed_pending_tool_call_manifest = _durable_pending_tool_call_manifest(
+                matched_request_state,
+                payload,
+            )
             alias_registered = await self._register_http_bridge_previous_response_id(
                 session,
                 response_id,
@@ -2019,7 +2050,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                 input_full_fingerprint=(
                     matched_request_state.input_full_fingerprint if matched_request_state.input_item_count > 0 else None
                 ),
-                pending_tool_calls=_durable_pending_tool_call_manifest(matched_request_state, payload),
+                pending_tool_calls=completed_pending_tool_call_manifest,
             )
             if not alias_registered and is_http_bridge_account_neutral_replay(
                 kind=session.key.affinity_kind,
@@ -2143,6 +2174,10 @@ class _HTTPBridgeUpstreamEventsMixin:
                 # pending so an anchored follow-up that omits their outputs
                 # (interrupted turn) can receive synthetic interrupted
                 # outputs instead of an upstream missing-tool-output 400.
+                session.last_pending_tool_call_manifest_invalid = _live_pending_tool_call_manifest_is_invalid(
+                    terminal_request_state,
+                    payload,
+                )
                 session.last_pending_tool_calls = dict(terminal_request_state.pending_tool_call_types)
             # Prefix trimming is only meaningful for list-shaped inputs, so
             # keep the input-count / fingerprint update scoped to that path.

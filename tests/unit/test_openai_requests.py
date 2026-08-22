@@ -3125,6 +3125,15 @@ def test_extract_input_file_ids_string_input_returns_empty_set():
     assert extract_input_file_ids("Hello world") == set()
 
 
+def test_extract_input_file_ids_ignores_non_string_item_types() -> None:
+    input_value: list[JsonValue] = [
+        {"type": ["unhashable", "type"], "output": [{"type": "input_file", "file_id": "not-a-reference"}]},
+        {"type": {"unhashable": "type"}, "content": "malformed"},
+    ]
+
+    assert extract_input_file_ids(input_value) == set()
+
+
 def test_extract_input_file_ids_finds_actual_input_references_but_not_tool_metadata():
     input_value: list[JsonValue] = [
         {

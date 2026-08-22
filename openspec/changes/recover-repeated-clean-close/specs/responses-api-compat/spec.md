@@ -251,6 +251,28 @@ ambiguous send failure. The proxy MUST NOT reconnect and resend from that path,
 even when the exception reports a clean WebSocket close, because the complete
 frame may already have crossed the kernel boundary.
 
+For an exact stored-prefix full resend owned by the same durable or live
+session, a completed Codex inter-agent delivery MAY serve as the retained
+prior-output boundary when it has the exact response-owned `agent_message`
+shape: an `amsg_` UUID identity, distinct canonical absolute agent paths for
+author and recipient, exact `turn_id` plus finite `create_time` metadata, and
+one self-contained `input_text` content part. The proof MUST reject missing,
+extra, malformed, reordered, or client-shaped fields. This shape MUST remain
+owner-bound and MUST NOT by itself make a request eligible for account-neutral
+reallocation. The proof MUST additionally bind a persisted tool-call manifest
+that is present and exactly empty; a missing manifest or any unsettled call
+MUST reject the inter-agent boundary. A matching request MAY remove only the
+proxy-injected stale `previous_response_id`, replay the complete context once
+on the same account, and publish a replacement anchor only after
+`response.completed`.
+
+Rejected-proof observability MUST classify only known string-valued `type` and
+`role` fields. Non-string or otherwise malformed values MUST be labeled as an
+opaque `other` shape without logging their content and MUST NOT turn the
+fail-closed bridge response into an internal server error. Pre-bridge request
+inspection, including file-reference extraction, MUST apply the same typed
+classification and MUST NOT fail on non-string item types.
+
 #### Scenario: socket already closed before send recovers once
 
 - **GIVEN** an HTTP bridge socket is already closed before `response.create` dispatch
@@ -266,6 +288,47 @@ frame may already have crossed the kernel boundary.
 - **WHEN** the replacement socket is also already closed before send
 - **THEN** the proxy does not open a third socket
 - **AND** the request fails through the existing terminal transport path
+
+#### Scenario: completed inter-agent delivery recovers an exact long-session resend
+
+- **GIVEN** a live or durable session stores an exact completed input prefix
+- **AND** no tool-call manifest remains pending
+- **AND** the full resend suffix contains response-owned reasoning, one
+  canonical completed `agent_message`, and one or more later user messages
+- **WHEN** upstream rejects the proxy-injected stale `previous_response_id`
+  before any response event
+- **THEN** the proxy sends the original complete request exactly once without
+  `previous_response_id` on the same owning account
+- **AND** preserves the canonical inter-agent message in that request
+- **AND** publishes a new anchor only after successful completion
+
+#### Scenario: malformed inter-agent lookalikes remain anchored
+
+- **GIVEN** a full-resend-shaped suffix contains an `agent_message` with a
+  missing or non-`amsg_` identity, invalid agent path, non-finite timestamp,
+  extra metadata, hosted/account-scoped content, or a user item before it
+- **WHEN** stale-anchor recovery is evaluated
+- **THEN** the inter-agent item does not satisfy retained-output proof
+- **AND** the proxy keeps the continuity request owner-bound and fail-closed
+- **AND** it does not dispatch an unanchored replay
+
+#### Scenario: pending or unknown tool state rejects an inter-agent boundary
+
+- **GIVEN** a full resend suffix contains a canonical completed `agent_message`
+- **AND** the durable or live owner has a nonempty or unavailable persisted
+  tool-call manifest
+- **WHEN** stale-anchor recovery is evaluated
+- **THEN** the inter-agent item does not satisfy retained-output proof
+- **AND** the existing continuity anchor remains attached
+
+#### Scenario: malformed diagnostic fields remain fail-closed
+
+- **GIVEN** a rejected full-resend suffix contains a non-string `type` or
+  `role` value
+- **WHEN** the bridge emits its bounded suffix-shape diagnostic
+- **THEN** it records only the `other` classification
+- **AND** does not expose the malformed value
+- **AND** does not return HTTP 500 from the diagnostic path
 
 #### Scenario: complete but account-scoped fresh body stays on its owner
 

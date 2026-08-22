@@ -36,6 +36,7 @@ from app.core.clients.proxy_websocket import (
 )
 from app.core.config.settings import Settings
 from app.core.errors import openai_error
+from app.core.types import JsonValue
 from app.core.utils.request_id import get_request_id, reset_request_scope_id, set_request_scope_id
 from app.db.models import AccountStatus, HttpBridgeSessionState
 from app.modules.proxy import http_bridge_forwarding as http_bridge_forwarding_module
@@ -115,6 +116,33 @@ def test_http_bridge_dead_owner_epoch_uses_standard_previous_response_not_found_
     assert proxy_error.payload["error"]["type"] == "invalid_request_error"
     assert proxy_error.payload["error"]["code"] == "previous_response_not_found"
     assert proxy_error.payload["error"]["param"] == "previous_response_id"
+
+
+def test_full_resend_suffix_shape_diagnostic_is_bounded_and_content_free() -> None:
+    input_items: list[JsonValue] = [
+        {"role": "user", "content": "stored secret"},
+        {"type": "reasoning", "encrypted_content": "opaque secret"},
+        {
+            "type": "agent_message",
+            "author": "/root/private_agent",
+            "recipient": "/root",
+            "content": [{"type": "input_text", "text": "private result"}],
+        },
+        {"type": "message", "role": "user", "content": "private retry"},
+        {"type": "unknown-user-controlled-type", "secret": "not logged"},
+        {"type": ["unhashable", "type"], "secret": "not logged"},
+        {"type": "message", "role": {"unhashable": "role"}, "secret": "not logged"},
+        *[{"type": "input_text", "text": f"private-{index}"} for index in range(6)],
+    ]
+
+    shape = http_bridge_streaming_module._full_resend_suffix_shape_for_observability(
+        input_items,
+        stored_count=1,
+    )
+
+    assert shape == "reasoning>agent_message>user>other>other>other>input_part>input_part>more"
+    assert "private" not in shape
+    assert "unknown-user-controlled-type" not in shape
 
 
 def test_http_bridge_rejected_dead_owner_recovery_code_is_not_emitted_from_app() -> None:
@@ -3284,6 +3312,46 @@ def test_durable_tool_call_manifest_rejects_unobserved_terminal_call() -> None:
     )
 
 
+def test_live_tool_call_manifest_rejects_added_only_but_allows_done_only() -> None:
+    completed_payload: dict[str, proxy_service.JsonValue] = {
+        "type": "response.completed",
+        "response": {"output": []},
+    }
+    added_only = proxy_service._WebSocketRequestState(
+        request_id="req-live-added-only",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+    )
+    added_only.added_tool_call_types = {"call_added": "function_call"}
+    assert (
+        http_bridge_upstream_events_module._live_pending_tool_call_manifest_is_invalid(
+            added_only,
+            completed_payload,
+        )
+        is True
+    )
+
+    done_only = proxy_service._WebSocketRequestState(
+        request_id="req-live-done-only",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+    )
+    done_only.pending_tool_call_types = {"call_done": "custom_tool_call"}
+    assert (
+        http_bridge_upstream_events_module._live_pending_tool_call_manifest_is_invalid(
+            done_only,
+            completed_payload,
+        )
+        is False
+    )
+
+
 def test_durable_tool_call_manifest_rejects_mixed_client_settled_call_types() -> None:
     state = proxy_service._WebSocketRequestState(
         request_id="req-mixed-client-settled-manifest",
@@ -3409,6 +3477,40 @@ async def test_http_bridge_malformed_tool_lifecycle_persists_unknown_manifest(
     registration = register_previous.await_args
     assert registration is not None
     assert registration.kwargs["pending_tool_calls"] is None
+    assert session.last_pending_tool_call_manifest_invalid is True
+    assert session.last_pending_tool_calls == {"call_1": "function_call"}
+
+    valid_request_state = proxy_service._WebSocketRequestState(
+        request_id="req-valid-lifecycle-after-invalid",
+        response_id="resp_valid_lifecycle_after_invalid",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=2.0,
+        transport="http",
+        skip_request_log=True,
+    )
+    session.pending_requests.append(valid_request_state)
+    session.queued_request_count = 1
+    await service._process_http_bridge_upstream_text(
+        session,
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_valid_lifecycle_after_invalid",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [],
+                },
+            },
+            separators=(",", ":"),
+        ),
+    )
+
+    assert session.last_pending_tool_call_manifest_invalid is False
+    assert session.last_pending_tool_calls == {}
 
 
 @pytest.mark.parametrize(
@@ -9713,6 +9815,81 @@ def test_verified_durable_full_resend_accepts_response_bound_pending_tool_calls(
         )
         is None
     )
+
+
+def test_verified_agent_message_recovery_requires_explicitly_empty_tool_manifest() -> None:
+    stored_input_items: list[proxy_service.JsonValue] = [
+        {"role": "user", "content": "first question"},
+    ]
+    agent_message: dict[str, proxy_service.JsonValue] = {
+        "type": "agent_message",
+        "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea0",
+        "author": "/root/episode_identity_final_audit",
+        "recipient": "/root",
+        "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+            "create_time": 1787431172.912141,
+        },
+        "content": [{"type": "input_text", "text": "verified inter-agent result"}],
+    }
+    full_input: list[proxy_service.JsonValue] = [
+        *stored_input_items,
+        agent_message,
+        {"role": "user", "content": "continue"},
+    ]
+    payload = proxy_service.ResponsesRequest.model_validate(
+        {"model": "gpt-5.4", "instructions": "hi", "input": full_input}
+    )
+    durable_lookup = proxy_service.DurableBridgeLookup(
+        session_id="sess-agent-message-proof",
+        canonical_kind="session_header",
+        canonical_key="sid-agent-message-proof",
+        api_key_scope="__anonymous__",
+        account_id="acc-proof",
+        owner_instance_id=None,
+        owner_epoch=3,
+        lease_expires_at=None,
+        state=HttpBridgeSessionState.CLOSED,
+        latest_turn_state="http_turn_agent_message_proof",
+        latest_response_id="resp-agent-message-proof",
+        latest_input_item_count=len(stored_input_items),
+        latest_input_full_fingerprint=proxy_service._fingerprint_input_items(stored_input_items),
+        latest_pending_tool_calls={},
+        model="gpt-5.4",
+    )
+
+    assert http_bridge_streaming_module._verify_durable_full_resend(payload, durable_lookup) is not None
+    assert (
+        http_bridge_streaming_module._verify_durable_full_resend(
+            payload,
+            replace(durable_lookup, latest_pending_tool_calls=None),
+        )
+        is None
+    )
+    assert (
+        http_bridge_streaming_module._verify_durable_full_resend(
+            payload,
+            replace(durable_lookup, latest_pending_tool_calls={"call-pending": "function_call"}),
+        )
+        is None
+    )
+
+    session = _make_bridge_session(key_value="store-agent-message-proof")
+    session.last_completed_response_id = "resp-store-agent-message-proof"
+    session.last_completed_response_account_id = session.account.id
+    session.last_completed_input_count = len(stored_input_items)
+    session.last_completed_input_prefix_fingerprint = proxy_service._fingerprint_input_items(stored_input_items)
+    session.last_pending_tool_calls = {}
+    proof = http_bridge_streaming_module._verify_store_context_full_resend(payload, session)
+    assert proof is not None
+
+    session.last_pending_tool_call_manifest_invalid = True
+    assert proof.matches(payload, session) is False
+    assert http_bridge_streaming_module._verify_store_context_full_resend(payload, session) is None
+
+    session.last_pending_tool_call_manifest_invalid = False
+    session.last_pending_tool_calls = {"call-pending": "function_call"}
+    assert http_bridge_streaming_module._verify_store_context_full_resend(payload, session) is None
 
 
 def test_verified_store_context_full_resend_proof_is_sealed_and_live_session_bound() -> None:

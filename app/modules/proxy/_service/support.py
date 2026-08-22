@@ -1044,6 +1044,11 @@ class _HTTPBridgeSession:
     last_completed_response_account_id: str | None = None
     last_completed_input_prefix_fingerprint: str | None = None
     last_pending_tool_calls: dict[str, str] = field(default_factory=dict)
+    # A false value means the completed response's pending-tool manifest was
+    # physically verified (including the valid empty-manifest case).  Keep an
+    # invalid/unrepresentable live manifest distinct from an empty one so a
+    # later full-history resend cannot mint an unanchored replay proof.
+    last_pending_tool_call_manifest_invalid: bool = False
     durable_session_id: str | None = None
     durable_owner_epoch: int | None = None
     upstream_reader: asyncio.Task[None] | None = None

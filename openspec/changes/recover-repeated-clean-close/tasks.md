@@ -24,4 +24,11 @@
 - [x] Quarantine an explicitly rejected proxy-injected anchor and recover the next complete full resend unanchored.
 - [x] Keep incomplete/delta-only and client-owned continuity fail-closed.
 - [x] Validate the amended OpenSpec and run formatting, lint, type, focused, unit, and bridge regression gates.
-- [ ] Build and deploy the exact merged source image, then verify production rollout, health, and recovery observability.
+- [x] Build and deploy the exact merged source image, then verify production rollout, health, and recovery observability.
+- [x] Treat only a canonical response-owned `agent_message` as a completed output boundary for exact-prefix owner-bound recovery.
+- [x] Preserve `agent_message` identifiers during proof classification while keeping the replay ineligible for account-neutral reallocation.
+- [x] Add negative shape tests and an end-to-end stale-anchor regression matching reasoning + agent message + repeated user follow-ups.
+- [x] Emit content-free proof-rejection shape diagnostics for future long-session incidents.
+- [x] Require an explicitly empty persisted tool manifest for inter-agent output boundaries and keep malformed diagnostic fields fail-closed.
+- [x] Validate the amended OpenSpec and rerun focused, unit, integration, lint, type, architecture, and diff gates.
+- [ ] Build and deploy the exact merged source image, then verify the previously failing long task and both operator windows remain healthy.

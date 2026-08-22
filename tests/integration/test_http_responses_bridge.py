@@ -13513,11 +13513,16 @@ async def test_v1_responses_http_bridge_rebinds_after_upstream_previous_response
     assert connect_count == 2
 
 
+@pytest.mark.parametrize(
+    "retained_output_shape",
+    ["assistant_message", "agent_message"],
+)
 @pytest.mark.asyncio
 async def test_v1_responses_http_bridge_recovers_store_context_trim_after_proxy_anchor_rejection(
     async_client,
     app_instance,
     monkeypatch,
+    retained_output_shape,
 ):
     """An exact live-session trim can replay its preserved full request once."""
     _install_bridge_settings(monkeypatch, enabled=True)
@@ -13594,11 +13599,37 @@ async def test_v1_responses_http_bridge_recovers_store_context_trim_after_proxy_
         "lookup_request_targets",
         AsyncMock(return_value=None),
     )
-    complete_follow_up = [
-        *historical_input,
-        *first_body["output"],
-        {"role": "user", "content": "continue from the complete context"},
-    ]
+    if retained_output_shape == "assistant_message":
+        retained_output = first_body["output"]
+        follow_up_messages = [{"role": "user", "content": "continue from the complete context"}]
+    else:
+        # Exact production shape from the stranded long-running Codex task:
+        # response-owned reasoning, one completed inter-agent delivery, and
+        # two later user retries after the stale anchor had already failed.
+        retained_output = [
+            {
+                "type": "reasoning",
+                "id": "reasoning_previous",
+                "encrypted_content": "opaque",
+                "summary": [],
+            },
+            {
+                "type": "agent_message",
+                "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea0",
+                "author": "/root/episode_identity_final_audit",
+                "recipient": "/root",
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+                    "create_time": 1787431172.912141,
+                },
+                "content": [{"type": "input_text", "text": "verified inter-agent result"}],
+            },
+        ]
+        follow_up_messages = [
+            {"role": "user", "content": "first retry after the completed inter-agent result"},
+            {"role": "user", "content": "second retry after the stale anchor error"},
+        ]
+    complete_follow_up = [*historical_input, *retained_output, *follow_up_messages]
     second = await async_client.post(
         "/v1/responses",
         headers=session_headers,
@@ -13620,12 +13651,155 @@ async def test_v1_responses_http_bridge_recovers_store_context_trim_after_proxy_
     assert len(recovered_upstream.sent_text) == 1
     recovered_payload = json.loads(recovered_upstream.sent_text[0])
     assert "previous_response_id" not in recovered_payload
-    assert recovered_payload["input"] == [
-        historical_input[0],
-        *first_body["output"],
-        complete_follow_up[-1],
-    ]
+    if retained_output_shape == "assistant_message":
+        assert recovered_payload["input"] == [
+            historical_input[0],
+            *first_body["output"],
+            complete_follow_up[-1],
+        ]
+    else:
+        recovered_agent_messages = [item for item in recovered_payload["input"] if item.get("type") == "agent_message"]
+        assert recovered_agent_messages == [retained_output[-1]]
+        assert [item.get("content") for item in recovered_payload["input"] if item.get("role") == "user"] == [
+            historical_input[0]["content"],
+            *[item["content"] for item in follow_up_messages],
+        ]
     assert recovered_payload["instructions"].endswith("stored per-turn control")
+
+
+@pytest.mark.parametrize(
+    "malformed_suffix",
+    [
+        pytest.param(
+            [{"type": ["unhashable", "type"], "content": "not replay authority"}],
+            id="unhashable-type",
+        ),
+        pytest.param(
+            [{"type": "message", "role": {"unhashable": "role"}, "content": "not replay authority"}],
+            id="unhashable-role",
+        ),
+        pytest.param(
+            [
+                {
+                    "type": "agent_message",
+                    "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea0",
+                    "author": "/root/episode_identity_final_audit",
+                    "recipient": "/root",
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+                        "create_time": 10**400,
+                    },
+                    "content": [{"type": "input_text", "text": "not replay authority"}],
+                },
+            ],
+            id="oversized-agent-message-create-time",
+        ),
+        *[
+            pytest.param(
+                [
+                    {
+                        "type": "agent_message",
+                        "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea0",
+                        "author": author,
+                        "recipient": "/root",
+                        "internal_chat_message_metadata_passthrough": {
+                            "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+                            "create_time": 1787431172.912141,
+                        },
+                        "content": [{"type": "input_text", "text": "not replay authority"}],
+                    },
+                    {"role": "user", "content": "fresh retry"},
+                ],
+                id=test_id,
+            )
+            for test_id, author in (
+                ("agent-message-non-root-path", "/foo"),
+                ("agent-message-path-traversal", "/root/.."),
+                ("agent-message-uppercase-task", "/root/UPPER"),
+            )
+        ],
+    ],
+)
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_malformed_full_resend_diagnostic_stays_fail_closed(
+    async_client,
+    app_instance,
+    monkeypatch,
+    malformed_suffix,
+):
+    """Malformed diagnostics must not turn an anchored rejection into HTTP 500."""
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_malformed_full_resend",
+        "http-bridge-malformed-full-resend@example.com",
+    )
+    account = await _get_account(account_id)
+    upstream = _FakeBridgeUpstreamWebSocket("resp_malformed_full_resend")
+
+    async def fake_select_account_with_budget(self, deadline, **kwargs):
+        del self, deadline, kwargs
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del headers, access_token, account_id_header, base_url, session
+        return upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    stored_input: list[proxy_module.JsonValue] = [{"role": "user", "content": "stored question"}]
+    durable_lookup = proxy_module.DurableBridgeLookup(
+        session_id="durable-malformed-full-resend",
+        canonical_kind="prompt_cache",
+        canonical_key="malformed-full-resend",
+        api_key_scope="__anonymous__",
+        account_id=account.id,
+        owner_instance_id=None,
+        owner_epoch=1,
+        lease_expires_at=None,
+        state=HttpBridgeSessionState.ACTIVE,
+        latest_turn_state=None,
+        latest_response_id="resp_malformed_anchor",
+        latest_input_item_count=len(stored_input),
+        latest_input_full_fingerprint=proxy_module._fingerprint_input_items(stored_input),
+        latest_pending_tool_calls={},
+        model="gpt-5.1",
+    )
+    service = get_proxy_service_for_app(app_instance)
+    monkeypatch.setattr(
+        service._durable_bridge,
+        "lookup_request_targets",
+        AsyncMock(return_value=durable_lookup),
+    )
+
+    response = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": [*stored_input, *malformed_suffix],
+            "prompt_cache_key": "malformed-full-resend",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(upstream.sent_text) == 1
+    forwarded = json.loads(upstream.sent_text[0])
+    assert "previous_response_id" not in forwarded
+    assert forwarded["input"] == [*stored_input, *malformed_suffix]
 
 
 @pytest.mark.parametrize(

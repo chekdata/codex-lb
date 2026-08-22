@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import math
+import re
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import cast
 from urllib.parse import urlsplit
+from uuid import UUID
 
 from app.core.openai.requests import extract_input_file_ids
 from app.core.types import JsonValue
@@ -34,6 +37,15 @@ _ACCOUNT_NEUTRAL_WEB_SEARCH_CONTEXT_SIZES = frozenset({"high", "low", "medium"})
 _ACCOUNT_NEUTRAL_WEB_SEARCH_FILTER_FIELDS = frozenset({"allowed_domains"})
 _ACCOUNT_NEUTRAL_WEB_SEARCH_LOCATION_FIELDS = frozenset({"city", "country", "region", "timezone", "type"})
 _ACCOUNT_NEUTRAL_MESSAGE_ROLES = frozenset({"assistant", "developer", "system", "user"})
+_RESPONSE_OWNED_AGENT_MESSAGE_FIELDS = frozenset(
+    {"author", "content", "id", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD, "recipient", "type"}
+)
+_RESPONSE_OWNED_AGENT_MESSAGE_METADATA_FIELDS = frozenset({"create_time", "turn_id"})
+# Agent paths are produced by the collaboration runtime, whose root is
+# literally ``/root`` and whose task-name segments are restricted to lowercase
+# letters, digits, and underscores.  This is replay authority, so accepting a
+# merely path-shaped client string would be too broad.
+_AGENT_PATH_PATTERN = re.compile(r"^/root(?:/[a-z0-9_]+)*$")
 _ACCOUNT_NEUTRAL_INPUT_ITEM_TYPES = frozenset(
     {
         "additional_tools",
@@ -166,12 +178,13 @@ def project_responses_input_for_account_neutral_fresh_replay(
     *,
     stored_count: int,
     preserve_developer_message_ids: bool = False,
+    preserve_response_owned_agent_message_ids: bool = False,
 ) -> AccountNeutralReplayProjection | None:
     """Remove known response-owned bookkeeping after durable prefix proof.
 
-    ``preserve_developer_message_ids`` is classification-only evidence for
-    inline Responses-Lite messages. A projection created with that option must
-    not be serialized as an account-neutral replay payload.
+    The two ``preserve_*_ids`` options are classification-only evidence for
+    response-owned items. A projection created with either option must not be
+    serialized as an account-neutral replay payload.
     """
 
     if stored_count <= 0 or stored_count > len(input_items):
@@ -185,6 +198,7 @@ def project_responses_input_for_account_neutral_fresh_replay(
         projected_item = _project_account_neutral_replay_item(
             item,
             preserve_developer_message_ids=preserve_developer_message_ids,
+            preserve_response_owned_agent_message_ids=preserve_response_owned_agent_message_ids,
         )
         if projected_item is not None:
             projected_items.append(projected_item)
@@ -227,6 +241,7 @@ def _project_account_neutral_replay_item(
     item: JsonValue,
     *,
     preserve_developer_message_ids: bool,
+    preserve_response_owned_agent_message_ids: bool,
 ) -> JsonValue | None:
     if not isinstance(item, dict):
         return item
@@ -237,6 +252,8 @@ def _project_account_neutral_replay_item(
         # projection can omit response-owned bookkeeping types. The
         # additional_tools bundle is a distinct Responses-Lite input item,
         # not an inline developer message.
+        return item
+    if preserve_response_owned_agent_message_ids and item_type == "agent_message":
         return item
     if item_type is not None and not isinstance(item_type, str):
         return item
@@ -313,6 +330,7 @@ def responses_input_suffix_retains_prior_output(
     stored_count: int,
     canonical_lite_developer_index: int | None = None,
     exact_stored_prefix_without_pending_manifest: bool = False,
+    allow_response_owned_agent_message: bool = True,
 ) -> bool:
     """Prove that a stored input prefix is followed by prior output and new input."""
 
@@ -389,6 +407,21 @@ def responses_input_suffix_retains_prior_output(
             fresh_followup_seen = False
             fresh_followup_count = 0
             fresh_followup_is_user_message = False
+            continue
+        if item_type == "agent_message":
+            if (
+                not allow_response_owned_agent_message
+                or pending_suffix_calls
+                or retained_output_seen
+                or fresh_followup_seen
+                or not _is_retained_agent_message(item)
+            ):
+                return False
+            retained_output_seen = True
+            # An inter-agent delivery closes the prior task but is not an
+            # assistant final answer. Keep the stricter developer-followup
+            # rule while still permitting one or more later user messages.
+            retained_output_is_final_answer = False
             continue
         if _is_fresh_followup_input(item):
             if not retained_output_seen or pending_suffix_calls:
@@ -627,6 +660,62 @@ def _is_retained_response_message(item: Mapping[str, JsonValue]) -> bool:
     ):
         return False
     return _message_has_valid_account_neutral_content(item)
+
+
+def _is_retained_agent_message(item: Mapping[str, JsonValue]) -> bool:
+    """Validate the exact response-owned Codex inter-agent delivery shape."""
+
+    item_id = item.get("id")
+    author = item.get("author")
+    recipient = item.get("recipient")
+    metadata = item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
+    content = item.get("content")
+    if (
+        set(item) != _RESPONSE_OWNED_AGENT_MESSAGE_FIELDS
+        or item.get("type") != "agent_message"
+        or not isinstance(item_id, str)
+        or not item_id.startswith("amsg_")
+        or not _is_uuid(item_id.removeprefix("amsg_"))
+        or not isinstance(author, str)
+        or not _AGENT_PATH_PATTERN.fullmatch(author)
+        or not isinstance(recipient, str)
+        or not _AGENT_PATH_PATTERN.fullmatch(recipient)
+        or author == recipient
+        or not isinstance(metadata, dict)
+        or set(metadata) != _RESPONSE_OWNED_AGENT_MESSAGE_METADATA_FIELDS
+        or not _is_uuid(metadata.get("turn_id"))
+        or not _is_finite_nonnegative_number(metadata.get("create_time"))
+        or not isinstance(content, list)
+        or len(content) != 1
+        or not isinstance(content[0], dict)
+        or content[0].get("type") != "input_text"
+    ):
+        return False
+    return _input_content_part_is_self_contained(
+        cast(dict[str, JsonValue], content[0]),
+        allow_output=False,
+    )
+
+
+def _is_uuid(value: JsonValue | None) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        return str(UUID(value)) == value.lower()
+    except ValueError:
+        return False
+
+
+def _is_finite_nonnegative_number(value: JsonValue | None) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        # Python integers are unbounded, while JSON numbers accepted by the
+        # upstream timestamp contract must still be representable as finite
+        # numeric metadata.  Oversized integers therefore fail closed.
+        return False
 
 
 def _is_fresh_followup_input(item: Mapping[str, JsonValue]) -> bool:
