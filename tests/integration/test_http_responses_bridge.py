@@ -857,6 +857,37 @@ class _RejectStalePreviousResponseUpstreamWebSocket(_FakeBridgeUpstreamWebSocket
         )
 
 
+class _CompleteThenRejectStalePreviousResponseUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    """Complete one turn, then reject its proxy-injected continuation anchor."""
+
+    async def send_text(self, text: str) -> None:
+        if not self.sent_text:
+            await super().send_text(text)
+            return
+        payload = json.loads(text)
+        stale_response_id = f"{self.response_id_prefix}_1"
+        assert payload.get("previous_response_id") == stale_response_id
+        self.sent_text.append(text)
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "error",
+                        "status": 400,
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "invalid_request_error",
+                            "message": f"Previous response with id '{stale_response_id}' not found.",
+                            "param": "previous_response_id",
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+
+
 class _ClosedBeforeSendUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
     """Prove that no response.create bytes reached this physical socket."""
 
@@ -13211,6 +13242,110 @@ async def test_v1_responses_http_bridge_rebinds_after_upstream_previous_response
     assert second.status_code == 200
     assert second.json()["output"][0]["content"][0]["text"] == "OK"
     assert connect_count == 2
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_recovers_store_context_trim_after_proxy_anchor_rejection(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    """An exact live-session trim can replay its preserved full request once."""
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_store_context_recovery",
+        "http-bridge-store-context-recovery@example.com",
+    )
+    account = await _get_account(account_id)
+    stale_upstream = _CompleteThenRejectStalePreviousResponseUpstreamWebSocket("resp_store_context")
+    recovered_upstream = _FakeBridgeUpstreamWebSocket("resp_store_context_recovered")
+    upstreams = [stale_upstream, recovered_upstream]
+    connect_count = 0
+
+    async def fake_select_account_with_budget(self, deadline, **kwargs):
+        del self, deadline, kwargs
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        nonlocal connect_count
+        del headers, access_token, account_id_header, base_url, session
+        upstream = upstreams[connect_count]
+        connect_count += 1
+        return upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    session_id = "store-context-stale-anchor"
+    session_headers = {"x-codex-session-id": session_id}
+    historical_input = [{"role": "user", "content": "hello"}]
+    first = await async_client.post(
+        "/v1/responses",
+        headers=session_headers,
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": historical_input,
+            "prompt_cache_key": session_id,
+        },
+    )
+    assert first.status_code == 200, first.text
+    first_body = first.json()
+    assert first_body["id"] == "resp_store_context_1"
+
+    # Reproduce the production shape: the live bridge still owns the stored
+    # prefix, but durable full-resend evidence is unavailable for this exact
+    # request.  The bridge itself must bind the complete request before it
+    # trims that prefix and injects the response anchor.
+    service = get_proxy_service_for_app(app_instance)
+    async with service._http_bridge_lock:
+        live_session = next(iter(service._http_bridge_sessions.values()))
+        live_session.codex_session = True
+    monkeypatch.setattr(
+        service._durable_bridge,
+        "lookup_request_targets",
+        AsyncMock(return_value=None),
+    )
+    complete_follow_up = [
+        *historical_input,
+        *first_body["output"],
+        {"role": "user", "content": "continue from the complete context"},
+    ]
+    second = await async_client.post(
+        "/v1/responses",
+        headers=session_headers,
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": complete_follow_up,
+            "prompt_cache_key": session_id,
+        },
+    )
+
+    assert second.status_code == 200, second.text
+    assert second.json()["id"] == "resp_store_context_recovered_1"
+    assert connect_count == 2
+    assert len(stale_upstream.sent_text) == 2
+    anchored_payload = json.loads(stale_upstream.sent_text[1])
+    assert anchored_payload["previous_response_id"] == first_body["id"]
+    assert anchored_payload["input"] == complete_follow_up[len(historical_input) :]
+    assert len(recovered_upstream.sent_text) == 1
+    recovered_payload = json.loads(recovered_upstream.sent_text[0])
+    assert "previous_response_id" not in recovered_payload
+    assert recovered_payload["input"] == complete_follow_up
 
 
 @pytest.mark.asyncio

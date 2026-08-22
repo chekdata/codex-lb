@@ -9715,6 +9715,73 @@ def test_verified_durable_full_resend_accepts_response_bound_pending_tool_calls(
     )
 
 
+def test_verified_store_context_full_resend_proof_is_sealed_and_live_session_bound() -> None:
+    stored_input_items: list[proxy_service.JsonValue] = [
+        {"role": "user", "content": "hello"},
+    ]
+    full_input: list[proxy_service.JsonValue] = [
+        *stored_input_items,
+        {"role": "assistant", "content": "hello back"},
+        {"role": "user", "content": "follow up"},
+    ]
+    payload = proxy_service.ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.4",
+            "instructions": "hi",
+            "input": full_input,
+        }
+    )
+    session = _make_bridge_session(key_value="store-context-proof")
+    session.last_completed_response_id = "resp-store-context"
+    session.last_completed_response_account_id = session.account.id
+    session.last_completed_input_count = len(stored_input_items)
+    session.last_completed_input_prefix_fingerprint = proxy_service._fingerprint_input_items(stored_input_items)
+
+    with pytest.raises(TypeError, match="created only by the verifier"):
+        http_bridge_streaming_module._VerifiedStoreContextFullResend(
+            _token=object(),
+            affinity_kind=session.key.affinity_kind,
+            affinity_key=session.key.affinity_key,
+            api_key_id=session.key.api_key_id,
+            owner_account_id=session.account.id,
+            latest_response_id=cast(str, session.last_completed_response_id),
+            stored_input_item_count=len(stored_input_items),
+            stored_input_fingerprint=session.last_completed_input_prefix_fingerprint,
+            full_input_fingerprint=proxy_service._fingerprint_input_items(full_input),
+            pending_tool_calls=None,
+        )
+
+    proof = http_bridge_streaming_module._verify_store_context_full_resend(payload, session)
+
+    assert proof is not None
+    assert proof.matches(payload, session) is True
+    assert copy.copy(proof) is proof
+    assert copy.deepcopy(proof) is proof
+    with pytest.raises(AttributeError, match="immutable"):
+        proof._owner_account_id = "acc-forged"  # type: ignore[misc]
+    with pytest.raises(TypeError, match="cannot be serialized"):
+        pickle.dumps(proof)
+
+    incomplete_payload = payload.model_copy(
+        update={"input": [*stored_input_items, {"role": "user", "content": "follow up"}]}
+    )
+    assert http_bridge_streaming_module._verify_store_context_full_resend(incomplete_payload, session) is None
+
+    changed_payload = payload.model_copy(
+        update={
+            "input": [
+                *stored_input_items,
+                {"role": "assistant", "content": "different output"},
+                {"role": "user", "content": "follow up"},
+            ]
+        }
+    )
+    assert proof.matches(changed_payload, session) is False
+
+    session.last_completed_response_id = "resp-replaced"
+    assert proof.matches(payload, session) is False
+
+
 @pytest.mark.asyncio
 async def test_stream_via_http_bridge_does_not_inject_durable_previous_response_anchor_for_explicit_prompt_cache_key(
     monkeypatch: pytest.MonkeyPatch,
