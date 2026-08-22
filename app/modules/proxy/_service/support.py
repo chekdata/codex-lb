@@ -873,6 +873,11 @@ class _WebSocketRequestState:
     # on, and dropping the anchor there would silently turn a continuation into
     # a context-free fresh turn.
     fresh_upstream_request_is_retry_safe: bool = False
+    # True only when the retained fresh body is also proven free of
+    # account-scoped identifiers (for example conversation, prompt, hosted
+    # input items, or uploaded files). Replay safety proves context
+    # completeness; it does not by itself authorize changing accounts.
+    fresh_upstream_request_is_account_neutral: bool = False
     # Stable fingerprint used by the durable recovery-attempt journal. It is
     # populated only for a proof-gated fresh replay candidate.
     recovery_attempt_fingerprint: str | None = None

@@ -1764,6 +1764,9 @@ class _HTTPBridgeStreamingMixin:
             del _fresh_state
             request_state.fresh_upstream_request_text = client_full_resend_fresh_upstream_request_text
             request_state.fresh_upstream_request_is_retry_safe = True
+            request_state.fresh_upstream_request_is_account_neutral = (
+                _http_bridge_payload_is_account_neutral_fresh_replay(client_full_resend_payload)
+            )
         settings = _service_get_settings()
         request_deadline = request_state.started_at + _http_bridge_request_budget_seconds(settings)
         session_creation_headers = (
@@ -2714,9 +2717,19 @@ class _HTTPBridgeStreamingMixin:
                     if store_context_trim_applied
                     else previous_request_state.fresh_upstream_request_is_retry_safe
                 )
+                if request_state.fresh_upstream_request_is_retry_safe:
+                    fresh_replay_payload = _http_bridge_payload_without_previous_response_id(
+                        untrimmed_effective_payload
+                    )
+                    request_state.fresh_upstream_request_is_account_neutral = (
+                        _http_bridge_payload_is_account_neutral_fresh_replay(fresh_replay_payload)
+                    )
             elif client_full_resend_fresh_upstream_request_text is not None:
                 request_state.fresh_upstream_request_text = client_full_resend_fresh_upstream_request_text
                 request_state.fresh_upstream_request_is_retry_safe = True
+                request_state.fresh_upstream_request_is_account_neutral = (
+                    previous_request_state.fresh_upstream_request_is_account_neutral
+                )
         initial_handoff_session = session
         initial_handoff_scope_id = ensure_request_scope_id() if original_request_unanchored else None
         if initial_handoff_scope_id is not None:

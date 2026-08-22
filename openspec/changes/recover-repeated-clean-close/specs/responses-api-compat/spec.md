@@ -39,6 +39,14 @@ being considered stale. When the watchdog skips a candidate, it MUST emit a
 low-cardinality diagnostic containing the session-closed state, candidate
 count, and pending-state verdicts.
 
+#### Scenario: clean close before response.created is not retried
+
+- **GIVEN** an HTTP bridge request is not eligible under the pre-visible replay guards
+- **WHEN** upstream closes the bridge with `close_code = 1000` before any
+  `response.*` event for the pending request
+- **THEN** the proxy returns HTTP 502 through the existing rejected-input path
+- **AND** does not transparently replay the request
+
 #### Scenario: clean close before response output receives one bounded additional replay
 
 - **GIVEN** an HTTP bridge request has no surfaced `response.*` events
@@ -225,6 +233,13 @@ replay contract before its anchor can be removed or its account can change. The
 replacement attempt MUST consume the request's single fresh-upstream retry
 allowance.
 
+A complete fresh-body replay proof and an account-neutral replay proof are
+independent. If the retained fresh body still contains any account-scoped
+identifier, the replacement MUST remain on the owning account even after the
+continuity anchor is safely removed. Cross-account replacement is permitted
+only when the retained body separately satisfies the account-neutral replay
+contract.
+
 Any error raised after the underlying send primitive is invoked MUST remain an
 ambiguous send failure. The proxy MUST NOT reconnect and resend from that path,
 even when the exception reports a clean WebSocket close, because the complete
@@ -245,6 +260,22 @@ frame may already have crossed the kernel boundary.
 - **WHEN** the replacement socket is also already closed before send
 - **THEN** the proxy does not open a third socket
 - **AND** the request fails through the existing terminal transport path
+
+#### Scenario: complete but account-scoped fresh body stays on its owner
+
+- **GIVEN** a continuity-bound request has a complete fresh-body replay proof
+- **AND** that fresh body still contains an account-scoped conversation,
+  prompt, hosted input item, or file identifier
+- **WHEN** the original socket is proven closed before send
+- **THEN** the bridge may remove the continuity anchor for the one-shot retry
+- **AND** the replacement remains bound to the original owning account
+
+#### Scenario: only an account-neutral fresh body may change accounts
+
+- **GIVEN** a continuity-bound request has both a complete fresh-body replay
+  proof and a separate account-neutral replay proof
+- **WHEN** the original socket is proven closed before send
+- **THEN** the one-shot replacement may select another eligible account
 
 #### Scenario: post-dispatch close remains non-replayable
 
@@ -317,6 +348,37 @@ and retry-circuit handling above. A classified process-wide network failure
 MUST remain account neutral and use its network error code. For other closes,
 the proxy MUST surface
 `stream_incomplete` to affected pending requests.
+
+#### Scenario: websocket closes before pending responses complete
+
+- **GIVEN** a streamed response request is pending on an upstream websocket
+- **AND** the direct downstream response has not emitted a numeric sequence,
+  or the request uses another transport
+- **WHEN** the websocket closes before a terminal response event is observed
+- **AND** the close is not an account-neutral clean pre-response close,
+  process-wide network failure, or upstream WebSocket liveness timeout
+- **THEN** the pending request fails with `stream_incomplete`
+- **AND** the account receives a transient upstream failure signal for routing
+
+#### Scenario: sequenced direct websocket closes before completion
+
+- **GIVEN** a direct Responses WebSocket request has successfully emitted a
+  finite integer `sequence_number`
+- **WHEN** the upstream websocket closes before a terminal response event is observed
+- **AND** the close is not an account-neutral clean pre-response close,
+  process-wide network failure, or upstream WebSocket liveness timeout
+- **THEN** the request is recorded as failed with `stream_incomplete`
+- **AND** no synthetic terminal frame is emitted under the active response id
+- **AND** the downstream WebSocket closes with code 1011
+- **AND** the account receives a transient upstream failure signal for routing
+
+#### Scenario: websocket liveness timeout remains account neutral
+
+- **GIVEN** a streamed response request is pending on an upstream websocket
+- **WHEN** its transport reports `upstream_websocket_liveness_timeout`
+- **THEN** the pending request fails with that classified error code
+- **AND** the account receives no failure-health signal
+- **AND** the request is not transparently replayed
 
 #### Scenario: clean pre-response close does not penalize the account
 

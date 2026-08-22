@@ -9542,6 +9542,7 @@ async def test_stream_via_http_bridge_preserves_only_safe_trimmable_full_resend_
     if not preserves_full_resend:
         assert request_state.proxy_injected_previous_response_id is True
         assert request_state.fresh_upstream_request_is_retry_safe is False
+        assert request_state.fresh_upstream_request_is_account_neutral is False
     if preserves_full_resend:
         account_neutral_classifier.assert_called_once()
     else:
@@ -18962,6 +18963,78 @@ async def test_submit_http_bridge_request_keeps_uploaded_file_recovery_on_owner_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("account_neutral", "expected_require_same_account"),
+    [(False, True), (True, False)],
+)
+async def test_submit_http_bridge_request_changes_accounts_only_for_account_neutral_fresh_body(
+    monkeypatch: pytest.MonkeyPatch,
+    account_neutral: bool,
+    expected_require_same_account: bool,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    closed_send = AsyncMock(
+        side_effect=UpstreamWebSocketTransportError(
+            "already closed",
+            error_code=UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE,
+        )
+    )
+    fresh_body = (
+        '{"type":"response.create","model":"gpt-5.5","input":"full resend"}'
+        if account_neutral
+        else '{"type":"response.create","model":"gpt-5.5","conversation":"conv_owner","input":"full resend"}'
+    )
+    request_state = proxy_service._WebSocketRequestState(
+        request_id=f"req-account-neutral-{account_neutral}",
+        model="gpt-5.5",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        awaiting_response_created=True,
+        event_queue=asyncio.Queue(),
+        previous_response_id="resp_owner",
+        request_text=(
+            '{"type":"response.create","model":"gpt-5.5","previous_response_id":"resp_owner","input":"delta"}'
+        ),
+        fresh_upstream_request_text=fresh_body,
+        fresh_upstream_request_is_retry_safe=True,
+        fresh_upstream_request_is_account_neutral=account_neutral,
+        transport="http",
+        skip_request_log=True,
+    )
+    session = _make_bridge_session(key_value=f"fresh-body-account-neutral-{account_neutral}")
+    session.upstream = cast(
+        UpstreamWebSocket,
+        SimpleNamespace(send_text=closed_send, close=AsyncMock()),
+    )
+    service._http_bridge_sessions[session.key] = session
+    monkeypatch.setattr(
+        service,
+        "_http_bridge_precreated_retry_decision",
+        AsyncMock(return_value=http_bridge_retry_circuit_module._HTTPBridgeRetryCircuitDecision(allowed=True)),
+    )
+    retry = AsyncMock(return_value=True)
+    monkeypatch.setattr(service, "_retry_http_bridge_request_on_fresh_upstream", retry)
+
+    await service._submit_http_bridge_request(
+        session,
+        request_state=request_state,
+        text_data=request_state.request_text or "{}",
+        queue_limit=8,
+    )
+
+    retry.assert_awaited_once_with(
+        session,
+        request_state=request_state,
+        text_data=request_state.request_text,
+        send_request=True,
+        require_same_account=expected_require_same_account,
+    )
+    await service._detach_http_bridge_request(session, request_state=request_state)
+
+
+@pytest.mark.asyncio
 async def test_submit_http_bridge_request_does_not_loop_after_replacement_is_also_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -19942,11 +20015,15 @@ async def test_retry_http_bridge_request_on_fresh_upstream_replays_retry_safe_in
             '"client_metadata":{"x-codex-installation-id":"installation-a"}}'
         ),
         fresh_upstream_request_is_retry_safe=True,
+        fresh_upstream_request_is_account_neutral=True,
         transport="http",
     )
 
     async def reconnect(*args: object, **kwargs: object) -> None:
-        del args, kwargs
+        assert args == (session,)
+        assert kwargs["request_state"] is request_state
+        assert kwargs["restart_reader"] is True
+        assert kwargs["require_same_account"] is False
         session.account = cast(
             Any,
             SimpleNamespace(
