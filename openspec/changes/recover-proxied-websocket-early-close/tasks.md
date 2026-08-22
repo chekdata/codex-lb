@@ -1,6 +1,6 @@
 - [x] Define the proxied WebSocket pre-dispatch close contract.
 - [x] Add adapter coverage for a close before and after `connection_made()`.
-- [x] Add a public HTTP Responses regression proving safe account failover.
+- [x] Add a public HTTP Responses regression proving shared-proxy failures stay account-neutral.
 - [x] Implement the narrow proxied `ClientConnection` adapter.
 - [x] Run strict OpenSpec, formatting, lint, type, unit, and integration gates.
 - [ ] Merge through repository gates, publish the exact image, and deploy through immutable GitOps.

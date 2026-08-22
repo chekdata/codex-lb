@@ -1703,7 +1703,7 @@ def _make_api_key_data(
 
 
 @pytest.mark.asyncio
-async def test_v1_responses_http_bridge_fails_over_proxy_tls_early_close_before_dispatch(
+async def test_v1_responses_http_bridge_fails_over_account_routed_proxy_before_dispatch(
     async_client,
     monkeypatch,
 ):
@@ -1752,7 +1752,7 @@ async def test_v1_responses_http_bridge_fails_over_proxy_tls_early_close_before_
                 failure_phase="connect",
                 retryable_same_contract=True,
                 failure_detail="proxy_connect_pre_dispatch",
-                failure_exception_type="ConnectionResetError",
+                failure_exception_type="ClientProxyConnectionError",
             )
         return upstream
 
@@ -1784,6 +1784,70 @@ async def test_v1_responses_http_bridge_fails_over_proxy_tls_early_close_before_
     assert backed_off_accounts == [first_account.id]
     assert len(upstream.sent_text) == 1
     handle_stream_error.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_shared_proxy_exhaustion_does_not_penalize_account(
+    async_client,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_shared_proxy",
+        "http-bridge-shared-proxy@example.com",
+    )
+    account = await _get_account(account_id)
+    selection_exclusions: list[set[str]] = []
+    connect_calls: list[str | None] = []
+    backed_off_accounts: list[str] = []
+
+    async def fake_select_account_with_budget(self, deadline, *, exclude_account_ids=None, **kwargs):
+        del self, deadline, kwargs
+        selection_exclusions.append(set(exclude_account_ids or set()))
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(headers, access_token, account_id_header, **kwargs):
+        del headers, access_token, kwargs
+        connect_calls.append(account_id_header)
+        raise proxy_module.ProxyResponseError(
+            502,
+            proxy_module.openai_error("upstream_unavailable", "shared proxy setup failed"),
+            failure_phase="connect",
+            retryable_same_contract=False,
+            failure_detail="shared_proxy_connect_pre_dispatch_exhausted",
+            failure_exception_type="ConnectionResetError",
+        )
+
+    async def fake_record_error_backoff(self, selected_account):
+        del self
+        backed_off_accounts.append(selected_account.id)
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module.LoadBalancer, "record_error_backoff", fake_record_error_backoff)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    response = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.4",
+            "instructions": "Return exactly OK.",
+            "input": "hello",
+            "prompt_cache_key": "http-bridge-shared-proxy-exhaustion-key",
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "upstream_unavailable"
+    assert len(connect_calls) == 1
+    assert selection_exclusions == [set()]
+    assert backed_off_accounts == []
 
 
 @pytest.mark.asyncio

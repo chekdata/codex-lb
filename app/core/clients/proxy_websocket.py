@@ -189,6 +189,32 @@ def _consume_connection_lost_exception(done: asyncio.Future[Any]) -> None:
         return
 
 
+async def _connect_websockets_transport(
+    url: str,
+    *,
+    proxy_url: str | None,
+    connect_kwargs: Mapping[str, Any],
+) -> ClientConnection:
+    """Open once, or retry one fresh tunnel for a shared-proxy setup close.
+
+    Awaiting ``websocket_connect`` proves no application frame was dispatched
+    when a timeout or transport error escapes. A fresh tunnel on the same
+    account is therefore safe. The process-wide environment proxy isn't an
+    account-owned route, so exhaustion must not penalize or rotate accounts.
+    """
+
+    try:
+        return await websocket_connect(url, **connect_kwargs)
+    except (asyncio.TimeoutError, OSError) as exc:
+        if proxy_url is None or isinstance(exc, ssl.SSLCertVerificationError):
+            raise
+        logger.warning(
+            "Retrying upstream websocket after shared proxy setup failure exception_type=%s",
+            type(exc).__name__,
+        )
+        return await websocket_connect(url, **connect_kwargs)
+
+
 @dataclass(slots=True)
 class UpstreamWebSocketMessage:
     kind: str
@@ -975,26 +1001,27 @@ async def _connect_upstream_websocket(
         proxy_connection_kwargs = (
             {"create_connection": _ProxySetupSafeClientConnection} if proxy_url is not None else {}
         )
-        response = await websocket_connect(
+        response = await _connect_websockets_transport(
             url,
-            origin=origin,
-            additional_headers=upstream_headers or None,
-            user_agent_header=user_agent,
-            open_timeout=settings.upstream_connect_timeout_seconds,
-            ping_timeout=ping_timeout,
-            max_size=settings.max_sse_event_bytes,
-            proxy=proxy_url,
-            **proxy_connection_kwargs,
-            **subprotocol_kwargs,
+            proxy_url=proxy_url,
+            connect_kwargs={
+                "origin": origin,
+                "additional_headers": upstream_headers or None,
+                "user_agent_header": user_agent,
+                "open_timeout": settings.upstream_connect_timeout_seconds,
+                "ping_timeout": ping_timeout,
+                "max_size": settings.max_sse_event_bytes,
+                "proxy": proxy_url,
+                **proxy_connection_kwargs,
+                **subprotocol_kwargs,
+            },
         )
     except asyncio.TimeoutError as exc:
-        retryable_proxy_setup = proxy_url is not None
         raise ProxyResponseError(
             502,
             openai_error("upstream_unavailable", "Request to upstream timed out"),
             failure_phase="connect",
-            retryable_same_contract=retryable_proxy_setup,
-            failure_detail="proxy_connect_pre_dispatch" if retryable_proxy_setup else None,
+            failure_detail="shared_proxy_connect_pre_dispatch_exhausted" if proxy_url is not None else None,
             failure_exception_type=type(exc).__name__,
         ) from exc
     except InvalidStatus as exc:
@@ -1042,13 +1069,16 @@ async def _connect_upstream_websocket(
             include_permanent_dns=proxy_url is None,
         )
         message = "Upstream websocket connection failed" if policy.credential_safe_connect_errors else str(exc)
-        retryable_proxy_setup = proxy_url is not None and not isinstance(exc, ssl.SSLCertVerificationError)
         raise ProxyResponseError(
             502,
             openai_error(error_code, message),
             failure_phase="connect",
-            retryable_same_contract=(error_code == PROCESS_NETWORK_UNAVAILABLE_CODE or retryable_proxy_setup),
-            failure_detail="proxy_connect_pre_dispatch" if retryable_proxy_setup else None,
+            retryable_same_contract=error_code == PROCESS_NETWORK_UNAVAILABLE_CODE,
+            failure_detail=(
+                "shared_proxy_connect_pre_dispatch_exhausted"
+                if proxy_url is not None and not isinstance(exc, ssl.SSLCertVerificationError)
+                else None
+            ),
             failure_exception_type=type(exc).__name__,
         ) from exc
 

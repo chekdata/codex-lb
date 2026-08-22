@@ -12,12 +12,11 @@ request was already broken.
 
 - Use a narrowly scoped `ClientConnection` adapter for proxied upstream
   WebSockets.
-- Treat a close before `connection_made()` as a pre-dispatch transport failure
-  while completing the dependency's connection-lost waiter without touching
-  uninitialized receive or transport state.
+- Treat a close before `connection_made()` as a pre-dispatch transport failure,
+  complete the dependency's waiter without touching uninitialized state, and
+  retry one fresh tunnel on the same account.
 - Keep established connections on the dependency's normal close path.
-- Preserve the existing typed, retryable pre-dispatch failure contract so an
-  HTTP bridge may select another eligible account before any
-  `response.create` can be dispatched.
+- Keep shared environment-proxy failures account-neutral: an exhausted retry
+  returns a typed connection error without backing off or rotating accounts.
 - Add adapter-level and public HTTP Responses regressions for the exact
   pre-`connection_made()` close shape.

@@ -507,10 +507,17 @@ async def test_proxied_websocket_uses_safe_connection_adapter(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_proxied_websocket_early_close_is_confirmed_pre_dispatch(monkeypatch):
+async def test_proxied_websocket_early_close_retries_fresh_tunnel_on_same_account(monkeypatch):
+    fake_connection = _FakeConnection()
+    attempts = 0
+
     async def failing_websocket_connect(url: str, **kwargs):
+        nonlocal attempts
         del url, kwargs
-        raise ConnectionResetError("proxy TLS transport closed")
+        attempts += 1
+        if attempts == 1:
+            raise ConnectionResetError("proxy TLS transport closed")
+        return fake_connection
 
     monkeypatch.setattr(proxy_websocket_module, "websocket_connect", failing_websocket_connect)
     monkeypatch.setattr(
@@ -531,23 +538,25 @@ async def test_proxied_websocket_early_close_is_confirmed_pre_dispatch(monkeypat
         ),
     )
 
-    with pytest.raises(ProxyResponseError) as exc_info:
-        await connect_responses_websocket(
-            {"openai-beta": "responses_websockets=2026-02-06"},
-            "access-token",
-            "account-123",
-            allow_direct_egress=True,
-        )
+    websocket = await connect_responses_websocket(
+        {"openai-beta": "responses_websockets=2026-02-06"},
+        "access-token",
+        "account-123",
+        allow_direct_egress=True,
+    )
+    await websocket.send_text("hello")
 
-    assert exc_info.value.failure_phase == "connect"
-    assert exc_info.value.failure_detail == "proxy_connect_pre_dispatch"
-    assert exc_info.value.failure_exception_type == "ConnectionResetError"
-    assert is_confirmed_pre_dispatch_transport_error(exc_info.value) is True
+    assert attempts == 2
+    assert fake_connection.sent == ["hello"]
 
 
 @pytest.mark.asyncio
 async def test_real_proxy_tunnel_close_before_tls_has_no_event_loop_callback_failure(monkeypatch):
+    proxy_connections = 0
+
     async def closing_proxy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        nonlocal proxy_connections
+        proxy_connections += 1
         await reader.readuntil(b"\r\n\r\n")
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
@@ -593,9 +602,11 @@ async def test_real_proxy_tunnel_close_before_tls_has_no_event_loop_callback_fai
         loop.set_exception_handler(previous_exception_handler)
 
     assert exc_info.value.failure_phase == "connect"
-    assert exc_info.value.failure_detail == "proxy_connect_pre_dispatch"
+    assert exc_info.value.failure_detail == "shared_proxy_connect_pre_dispatch_exhausted"
     assert exc_info.value.failure_exception_type == "ConnectionResetError"
-    assert is_confirmed_pre_dispatch_transport_error(exc_info.value) is True
+    assert exc_info.value.retryable_same_contract is False
+    assert is_confirmed_pre_dispatch_transport_error(exc_info.value) is False
+    assert proxy_connections == 2
     assert callback_failures == []
 
 
