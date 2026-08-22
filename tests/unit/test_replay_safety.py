@@ -1839,6 +1839,10 @@ def test_full_resend_exact_prefix_accepts_canonical_agent_message_before_user_re
         pytest.param(lambda item: item.__setitem__("id", "msg_not_agent_owned"), id="wrong-id-prefix"),
         pytest.param(lambda item: item.__setitem__("id", "amsg_not-a-uuid"), id="invalid-id-uuid"),
         pytest.param(lambda item: item.__setitem__("author", "root/no-leading-slash"), id="invalid-author"),
+        pytest.param(lambda item: item.__setitem__("author", "/foo"), id="non-root-author"),
+        pytest.param(lambda item: item.__setitem__("author", "/root/.."), id="path-traversal-author"),
+        pytest.param(lambda item: item.__setitem__("author", "/root/UPPER"), id="uppercase-author"),
+        pytest.param(lambda item: item.__setitem__("recipient", "/root/with-hyphen"), id="invalid-recipient-segment"),
         pytest.param(lambda item: item.__setitem__("recipient", item["author"]), id="self-delivery"),
         pytest.param(
             lambda item: item["internal_chat_message_metadata_passthrough"].__setitem__("extra", True),

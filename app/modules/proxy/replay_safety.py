@@ -41,7 +41,11 @@ _RESPONSE_OWNED_AGENT_MESSAGE_FIELDS = frozenset(
     {"author", "content", "id", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD, "recipient", "type"}
 )
 _RESPONSE_OWNED_AGENT_MESSAGE_METADATA_FIELDS = frozenset({"create_time", "turn_id"})
-_AGENT_PATH_PATTERN = re.compile(r"^/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*$")
+# Agent paths are produced by the collaboration runtime, whose root is
+# literally ``/root`` and whose task-name segments are restricted to lowercase
+# letters, digits, and underscores.  This is replay authority, so accepting a
+# merely path-shaped client string would be too broad.
+_AGENT_PATH_PATTERN = re.compile(r"^/root(?:/[a-z0-9_]+)*$")
 _ACCOUNT_NEUTRAL_INPUT_ITEM_TYPES = frozenset(
     {
         "additional_tools",

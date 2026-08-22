@@ -13668,30 +13668,56 @@ async def test_v1_responses_http_bridge_recovers_store_context_trim_after_proxy_
 
 
 @pytest.mark.parametrize(
-    "malformed_suffix_item",
+    "malformed_suffix",
     [
         pytest.param(
-            {"type": ["unhashable", "type"], "content": "not replay authority"},
+            [{"type": ["unhashable", "type"], "content": "not replay authority"}],
             id="unhashable-type",
         ),
         pytest.param(
-            {"type": "message", "role": {"unhashable": "role"}, "content": "not replay authority"},
+            [{"type": "message", "role": {"unhashable": "role"}, "content": "not replay authority"}],
             id="unhashable-role",
         ),
         pytest.param(
-            {
-                "type": "agent_message",
-                "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea0",
-                "author": "/root/episode_identity_final_audit",
-                "recipient": "/root",
-                "internal_chat_message_metadata_passthrough": {
-                    "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
-                    "create_time": 10**400,
+            [
+                {
+                    "type": "agent_message",
+                    "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea0",
+                    "author": "/root/episode_identity_final_audit",
+                    "recipient": "/root",
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+                        "create_time": 10**400,
+                    },
+                    "content": [{"type": "input_text", "text": "not replay authority"}],
                 },
-                "content": [{"type": "input_text", "text": "not replay authority"}],
-            },
+            ],
             id="oversized-agent-message-create-time",
         ),
+        *[
+            pytest.param(
+                [
+                    {
+                        "type": "agent_message",
+                        "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea0",
+                        "author": author,
+                        "recipient": "/root",
+                        "internal_chat_message_metadata_passthrough": {
+                            "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+                            "create_time": 1787431172.912141,
+                        },
+                        "content": [{"type": "input_text", "text": "not replay authority"}],
+                    },
+                    {"role": "user", "content": "fresh retry"},
+                ],
+                id=test_id,
+            )
+            for test_id, author in (
+                ("agent-message-non-root-path", "/foo"),
+                ("agent-message-path-traversal", "/root/.."),
+                ("agent-message-uppercase-task", "/root/UPPER"),
+            )
+        ],
     ],
 )
 @pytest.mark.asyncio
@@ -13699,7 +13725,7 @@ async def test_v1_responses_http_bridge_malformed_full_resend_diagnostic_stays_f
     async_client,
     app_instance,
     monkeypatch,
-    malformed_suffix_item,
+    malformed_suffix,
 ):
     """Malformed diagnostics must not turn an anchored rejection into HTTP 500."""
     _install_bridge_settings(monkeypatch, enabled=True)
@@ -13764,7 +13790,7 @@ async def test_v1_responses_http_bridge_malformed_full_resend_diagnostic_stays_f
         json={
             "model": "gpt-5.1",
             "instructions": "Return exactly OK.",
-            "input": [*stored_input, malformed_suffix_item],
+            "input": [*stored_input, *malformed_suffix],
             "prompt_cache_key": "malformed-full-resend",
         },
     )
@@ -13773,7 +13799,7 @@ async def test_v1_responses_http_bridge_malformed_full_resend_diagnostic_stays_f
     assert len(upstream.sent_text) == 1
     forwarded = json.loads(upstream.sent_text[0])
     assert "previous_response_id" not in forwarded
-    assert forwarded["input"] == [*stored_input, malformed_suffix_item]
+    assert forwarded["input"] == [*stored_input, *malformed_suffix]
 
 
 @pytest.mark.parametrize(
