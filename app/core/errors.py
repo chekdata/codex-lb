@@ -46,7 +46,7 @@ PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE = "Upstream websocket closed before 
 PREVIOUS_RESPONSE_NOT_FOUND_CODE = "previous_response_not_found"
 PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE = "Previous response was not found; retry without previous_response_id."
 _INVALID_PREVIOUS_RESPONSE_ID_MESSAGE_RE = re.compile(
-    r"^invalid\s+[`'\"]?previous_response_id[`'\"]?\.?$",
+    r"^invalid\s+(?:previous_response_id|'previous_response_id'|\"previous_response_id\"|`previous_response_id`)\.?$",
     re.IGNORECASE,
 )
 

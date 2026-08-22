@@ -1524,6 +1524,19 @@ class _HTTPBridgeMixin(
                         if optional_kwarg not in create_signature.parameters:
                             create_kwargs.pop(optional_kwarg, None)
                 created_session = await create_session(key, **create_kwargs)
+                # A reader-failure retirement removes the local session before
+                # its bounded close has necessarily released the durable row.
+                # If a replacement for that same canonical key is created in
+                # the overlap window, advance the epoch so the old close is
+                # fenced out instead of releasing the replacement owner.
+                same_instance_orphan = bool(
+                    durable_lookup is not None
+                    and durable_lookup.canonical_kind == key.affinity_kind
+                    and durable_lookup.canonical_key == key.affinity_key
+                    and _durable_bridge_lookup_active_owner(durable_lookup)
+                    == settings.http_responses_session_bridge_instance_id
+                )
+                force_durable_takeover = force_durable_takeover or same_instance_orphan
                 await self._claim_durable_http_bridge_session(
                     created_session,
                     allow_takeover=force_durable_takeover or _http_bridge_allow_durable_takeover(durable_lookup),

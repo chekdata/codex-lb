@@ -10,6 +10,7 @@ Production upstream now emits a stale Responses anchor as `code=invalid_request_
 - Route that shape through the existing proof-gated recovery, quarantine, masking, and settlement behavior.
 - Keep unrelated `invalid_request_error` shapes request-owned and non-replayable.
 - Add unit and public HTTP bridge regressions for the exact production event.
+- Close the already-specified durable-owner fencing gap exposed by the cloud regression: a replacement for a reader-retired local session advances the owner epoch before the old bounded close can release it.
 
 ## Non-Goals
 

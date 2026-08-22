@@ -77,6 +77,16 @@ def test_previous_response_not_found_classifier_covers_openai_shapes():
         param=None,
         message="Invalid previous_response_id because another field is malformed.",
     )
+    assert not is_previous_response_not_found_error(
+        code="invalid_request_error",
+        param=None,
+        message="Invalid 'previous_response_id.",
+    )
+    assert not is_previous_response_not_found_error(
+        code="invalid_request_error",
+        param=None,
+        message='Invalid `previous_response_id".',
+    )
 
 
 def test_previous_response_id_from_not_found_message_extracts_anchor():
