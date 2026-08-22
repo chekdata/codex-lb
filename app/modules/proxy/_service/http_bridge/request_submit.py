@@ -1226,11 +1226,61 @@ class _HTTPBridgeRequestSubmitMixin:
                                 # consumed. Any other replacement-send failure
                                 # is ambiguous and must retain the original
                                 # send-side settlement ownership semantics.
-                                if retry_exc.error_code != UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE:
+                                second_pre_dispatch_close = (
+                                    retry_exc.error_code == UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE
+                                )
+                                if not second_pre_dispatch_close:
                                     request_state.recovery_attempt_dispatched = True
                                 session.closed = True
                                 session.upstream_control.reconnect_requested = True
                                 session.upstream_control.retire_after_drain = True
+                                if second_pre_dispatch_close and recovery_receipt is not None:
+                                    # Both physical sockets rejected the send
+                                    # before any bytes were dispatched. The
+                                    # reversible turn-state alias therefore
+                                    # still belongs to the predecessor and
+                                    # must be restored before surfacing the
+                                    # one-shot recovery failure. Leaving the
+                                    # alias on this retiring session would
+                                    # fence the next safe retry onto a request
+                                    # that upstream never observed.
+                                    rollback_cancellation: asyncio.CancelledError | None = None
+                                    async with session.recovery_alias_lock:
+                                        try:
+                                            (
+                                                rolled_back,
+                                                rollback_cancellation,
+                                            ) = await _rollback_http_bridge_recovery_turn_state_registration(
+                                                self,
+                                                recovery_receipt,
+                                            )
+                                        except Exception:
+                                            rolled_back = False
+                                            logger.warning(
+                                                "Failed to roll back unsent HTTP bridge recovery alias",
+                                                exc_info=True,
+                                            )
+                                    recovery_receipt = None
+                                    if not rolled_back:
+                                        _record_continuity_fail_closed(
+                                            surface="http_bridge",
+                                            reason="recovery_alias_rollback_failed",
+                                            previous_response_id=request_state.previous_response_id,
+                                            session_id=request_state.session_id,
+                                            upstream_error_code="bridge_continuity_persistence_failed",
+                                        )
+                                        raise ProxyResponseError(
+                                            502,
+                                            openai_error(
+                                                "bridge_continuity_persistence_failed",
+                                                (
+                                                    "The unsent recovery alias could not be restored safely; "
+                                                    "retry the request."
+                                                ),
+                                            ),
+                                        ) from retry_exc
+                                    if rollback_cancellation is not None:
+                                        raise rollback_cancellation
                                 if retry_exc.error_code == UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE:
                                     session.claim_liveness_settlement()
                                 raise

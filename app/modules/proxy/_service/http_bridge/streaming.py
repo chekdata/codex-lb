@@ -139,9 +139,6 @@ from app.modules.proxy._service.http_bridge.service_stubs import (
     _websocket_event_error_param,
     _websocket_event_error_type,
 )
-from app.modules.proxy._service.http_bridge.upstream_events import (
-    _clear_durable_http_bridge_response_anchor,
-)
 from app.modules.proxy._service.observability import (
     _hash_identifier as _hash_identifier,
 )
@@ -1511,13 +1508,19 @@ class _HTTPBridgeStreamingMixin:
                 and durable_lookup.latest_response_id is not None
                 and (not payload_looks_like_full_resend or durable_anchor_trimmable)
             )
-            if payload_looks_like_full_resend and _http_bridge_session_key_quarantined(self, bridge_session_key):
+            verified_quarantine_full_resend = bool(
+                durable_full_resend_proof is not None and durable_full_resend_proof.matches(payload, durable_lookup)
+            )
+            if verified_quarantine_full_resend and _http_bridge_session_key_quarantined(
+                self,
+                bridge_session_key,
+            ):
                 # The previous attach on this key proved silent/wedged
-                # (#1534). The client's own payload already carries the full
-                # conversation, so send it unanchored on the fresh path
-                # instead of rebuilding the same reattach. Delta-only
-                # payloads keep the anchor: it is their only way to convey
-                # prior context (same boundary as the fenced anchor clear).
+                # (#1534). Only a durable-owner-bound proof that the client's
+                # payload carries the complete conversation may suppress the
+                # anchor. A merely multi-item/full-resend-shaped payload can
+                # still omit completed assistant or tool output and must keep
+                # the anchor so it fails closed instead of losing history.
                 # Evaluated independently of the fresh-reattach eligibility
                 # above: even when that gate is already false (for example a
                 # conversation-scoped payload, a live alias session, or an
@@ -3157,16 +3160,19 @@ class _HTTPBridgeStreamingMixin:
                 )
                 raise
             elif proof_gated_stale_anchor_replay:
-                cleared_lookup = await _clear_durable_http_bridge_response_anchor(self, session)
-                if cleared_lookup is None:
-                    raise ProxyResponseError(
-                        502,
-                        openai_error(
-                            "bridge_continuity_persistence_failed",
-                            "The stale previous response anchor could not be invalidated safely; retry the request.",
-                        ),
-                    ) from exc
-                durable_lookup = cleared_lookup
+                # Keep the durable response anchor until the replacement
+                # request reaches response.completed and atomically publishes
+                # its new anchor. Quarantine plus the sealed full-resend proof
+                # below is the only authority to bypass the rejected anchor.
+                # If replacement creation, reservation, or pre-dispatch send
+                # fails, the old durable row remains intact: delta requests
+                # stay anchored/fail closed and a later verified full resend
+                # can retry safely.
+                _quarantine_http_bridge_session(
+                    self,
+                    session,
+                    reason=_HTTP_BRIDGE_QUARANTINE_REJECTED_STALE_ANCHOR_REASON,
+                )
                 if PROMETHEUS_AVAILABLE and bridge_durable_recover_total is not None:
                     bridge_durable_recover_total.labels(path="stale_anchor_full_resend").inc()
                 _log_http_bridge_event(
@@ -3197,9 +3203,9 @@ class _HTTPBridgeStreamingMixin:
                 # verified complete full-resend payload it would be unsafe to
                 # drop that anchor in-place: doing so could silently lose
                 # conversation history. Quarantine the logical session key so
-                # the next full-resend-shaped client request takes the already
-                # defined unanchored fresh path; delta-only requests retain the
-                # anchor and fail closed.
+                # only the next owner-bound verified complete resend takes the
+                # unanchored fresh path; merely full-resend-shaped and
+                # delta-only requests retain the anchor and fail closed.
                 _quarantine_http_bridge_session(
                     self,
                     session,

@@ -18,8 +18,10 @@ logger = logging.getLogger("app.modules.proxy.service")
 
 # Quarantine is a bounded, in-memory, session-scoped (never account-scoped)
 # marker for HTTP bridge session keys that have proven silent/wedged: a later
-# request must not re-attach to them and must take the existing fresh
-# session/no-anchor path instead (#1534). It complements — and never replaces
+# request must not re-attach to them. Only a durable-owner-bound complete
+# resend proof may take the existing fresh session/no-anchor path (#1534);
+# merely full-resend-shaped or delta payloads retain the anchor and fail
+# closed. It complements — and never replaces
 # — the in-flight recovery machinery: the eventless watchdog and bounded
 # replay (#1394) recover the request that is currently stuck, the fenced
 # durable-anchor clear (#1563) stops a *fully eventless* full-resend anchor

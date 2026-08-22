@@ -18890,12 +18890,39 @@ async def test_submit_http_bridge_request_does_not_loop_after_replacement_is_als
         transport="http",
         skip_request_log=True,
     )
-    session = _make_bridge_session(key_value="pre-dispatch-recovery-closed-twice")
+    key = _make_account_neutral_replay_session_key("pre-dispatch-recovery-closed-twice")
+    session = _make_bridge_session(key=key)
     session.upstream = cast(
         UpstreamWebSocket,
         SimpleNamespace(send_text=closed_send, close=AsyncMock()),
     )
+    session.durable_session_id = "durable-pre-dispatch-recovery-closed-twice"
+    session.durable_owner_epoch = 7
     service._http_bridge_sessions[session.key] = session
+    receipt = DurableBridgeAliasRegistrationReceipt(
+        status=DurableBridgeAliasRegistration.REGISTERED,
+        session_id=session.durable_session_id,
+        api_key_scope="__anonymous__",
+        alias_kind="turn_state",
+        alias_value="turn-pre-dispatch-recovery-closed-twice",
+        instance_id="test-instance",
+        owner_epoch=session.durable_owner_epoch,
+        previous_alias_session_id="durable-predecessor",
+        previous_alias_owner_epoch=3,
+        previous_alias_account_id="acc-predecessor",
+        previous_latest_turn_state=None,
+    )
+    register_recovery_turn_state = AsyncMock(return_value=receipt)
+    rollback_registration = AsyncMock(return_value=True)
+    release_live_session = AsyncMock(return_value=None)
+    service._durable_bridge = cast(
+        Any,
+        SimpleNamespace(
+            register_recovery_turn_state=register_recovery_turn_state,
+            rollback_recovery_turn_state_registration=rollback_registration,
+            release_live_session=release_live_session,
+        ),
+    )
     monkeypatch.setattr(
         service,
         "_http_bridge_precreated_retry_decision",
@@ -18923,12 +18950,15 @@ async def test_submit_http_bridge_request_does_not_loop_after_replacement_is_als
             request_state=request_state,
             text_data=request_state.request_text or "{}",
             queue_limit=8,
+            recovery_turn_state="turn-pre-dispatch-recovery-closed-twice",
         )
 
     assert exc_info.value.status_code == 502
     assert exc_info.value.payload["error"]["code"] == UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE
     closed_send.assert_awaited_once()
     retry.assert_awaited_once()
+    register_recovery_turn_state.assert_awaited_once()
+    rollback_registration.assert_awaited_once_with(receipt=receipt)
     assert request_state.replay_count == 1
     assert request_state.recovery_attempt_dispatched is False
     assert session.closed is True
@@ -25437,14 +25467,15 @@ async def test_retire_stale_pending_http_bridge_session_quarantines_wedged_reatt
 
 
 @pytest.mark.asyncio
-async def test_stream_http_bridge_quarantined_full_resend_stays_unanchored_when_reattach_gate_already_false(
+async def test_stream_http_bridge_quarantined_unproved_full_resend_keeps_anchor_when_reattach_gate_already_false(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The quarantine suppression must be evaluated independently of the
-    fresh-reattach eligibility gate: when that gate is already false (here a
-    live alias session), a quarantined full-resend must still dispatch
-    unanchored instead of restoring the wedged durable anchor through session
-    hydration and session-level injection."""
+    """A live alias never turns quarantine into an unanchored replay grant.
+
+    This payload is multi-item/full-resend-shaped but omits the prior output,
+    so it cannot satisfy the durable completeness proof. Even when the normal
+    fresh-reattach eligibility gate is already false, the anchor must remain.
+    """
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     historical_input = [
         {"role": "user", "content": [{"type": "input_text", "text": "leading question"}]},
@@ -25599,12 +25630,14 @@ async def test_stream_http_bridge_quarantined_full_resend_stays_unanchored_when_
     assert chunks == ['data: {"type":"response.completed"}\n\n']
     assert len(dispatched_text) == 1
     dispatched_payload = json.loads(dispatched_text[0])
-    # Genuinely unanchored: the suppressed durable anchor did not come back
-    # through session hydration or session-level injection, and the client's
-    # payload was not prefix-trimmed against the durable stored context.
-    assert "previous_response_id" not in dispatched_payload
-    assert len(dispatched_payload["input"]) == len(historical_input) + 1
-    assert fresh_session.last_completed_response_id is None
+    # The durable prefix is trimmed only because the exact anchor remains.
+    # A stale upstream anchor therefore fails closed instead of executing the
+    # incomplete suffix as an unanchored fresh conversation.
+    assert dispatched_payload["previous_response_id"] == "resp_wedged_anchor"
+    assert dispatched_payload["input"] == [
+        {"role": "user", "content": [{"type": "input_text", "text": "follow-up without prior output"}]}
+    ]
+    assert fresh_session.last_completed_response_id == "resp_wedged_anchor"
 
 
 @pytest.mark.asyncio
