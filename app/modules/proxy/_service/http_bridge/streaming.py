@@ -366,6 +366,12 @@ class _VerifiedDurableFullResend:
             replay_projection.input_items,
             stored_count=replay_projection.stored_prefix_count,
             canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+            # The prefix fingerprint matched the exact context previously
+            # completed by this same-account session, and an empty pending
+            # manifest proves no tool call is left unsettled. Historical
+            # developer interleaves inside that sealed prefix are therefore
+            # not new replay authority and must not strand long Codex tasks.
+            exact_stored_prefix_without_pending_manifest=not pending_tool_calls,
         ) or (
             pending_tool_calls is not None
             and responses_input_suffix_matches_pending_tool_calls(
@@ -531,6 +537,7 @@ class _VerifiedStoreContextFullResend:
             replay_projection.input_items,
             stored_count=replay_projection.stored_prefix_count,
             canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+            exact_stored_prefix_without_pending_manifest=not pending_tool_calls,
         ) or (
             pending_tool_calls is not None
             and responses_input_suffix_matches_pending_tool_calls(

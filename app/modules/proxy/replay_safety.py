@@ -312,15 +312,31 @@ def responses_input_suffix_retains_prior_output(
     *,
     stored_count: int,
     canonical_lite_developer_index: int | None = None,
+    exact_stored_prefix_without_pending_manifest: bool = False,
 ) -> bool:
     """Prove that a stored input prefix is followed by prior output and new input."""
 
     if stored_count <= 0 or len(input_items) <= stored_count:
         return False
-    prefix_state = _direct_tool_call_prefix_state(
-        input_items[:stored_count],
-        canonical_lite_developer_index=canonical_lite_developer_index,
-    )
+    stored_prefix = input_items[:stored_count]
+    if exact_stored_prefix_without_pending_manifest:
+        # A store-context proof binds this prefix byte-for-byte to the input
+        # already completed by the same live/durable session and separately
+        # identifies the exact historical input boundary. It therefore need
+        # not reinterpret valid account-neutral developer items inside that
+        # sealed prefix as new cross-account authority. Still parse every
+        # direct call/output pair so an output crossing the stored boundary is
+        # retained and appended call-id reuse remains fail-closed.
+        prefix_state = _direct_tool_call_prefix_state(
+            stored_prefix,
+            allow_exact_stored_developer_items=True,
+            canonical_lite_developer_index=canonical_lite_developer_index,
+        )
+    else:
+        prefix_state = _direct_tool_call_prefix_state(
+            stored_prefix,
+            canonical_lite_developer_index=canonical_lite_developer_index,
+        )
     if prefix_state is None:
         return False
     pending_suffix_calls, seen_suffix_call_ids = prefix_state
@@ -448,6 +464,7 @@ def _direct_tool_call_prefix_state(
     input_items: list[JsonValue],
     *,
     allow_historical_developer_interleave: bool = False,
+    allow_exact_stored_developer_items: bool = False,
     canonical_lite_developer_index: int | None = None,
 ) -> tuple[deque[tuple[str, str]], set[str]] | None:
     pending_calls: deque[tuple[str, str]] = deque()
@@ -475,6 +492,8 @@ def _direct_tool_call_prefix_state(
                 canonical_lite_developer_index is not None and index == canonical_lite_developer_index
             )
             if developer_message_is_transparent and occupies_canonical_lite_position:
+                continue
+            if developer_message_is_transparent and allow_exact_stored_developer_items:
                 continue
             historical_interleave_is_bounded = (
                 allow_historical_developer_interleave
