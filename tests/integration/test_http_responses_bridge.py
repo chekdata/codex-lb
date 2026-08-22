@@ -7635,6 +7635,118 @@ async def test_v1_responses_http_bridge_classifies_responses_lite_developer_inte
 
 
 @pytest.mark.asyncio
+async def test_http_bridge_replacement_does_not_steal_replica_claim_during_upstream_connect(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    service = get_proxy_service_for_app(app_instance)
+    service._http_bridge_sessions.clear()
+    service._http_bridge_inflight_sessions.clear()
+    service._http_bridge_turn_state_index.clear()
+
+    settings = _make_app_settings(
+        enabled=True,
+        max_sessions=8,
+        admission_wait_timeout_seconds=1.0,
+        codex_idle_ttl_seconds=120.0,
+        instance_id="instance-a",
+        instance_ring=[],
+    )
+    _install_proxy_settings(
+        monkeypatch,
+        app_settings=settings,
+        dashboard_settings=_make_dashboard_settings(),
+    )
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_cross_replica_claim",
+        "http-bridge-cross-replica-claim@example.com",
+    )
+    session_header = "cross-replica-claim-during-connect"
+    key = proxy_module._HTTPBridgeSessionKey("session_header", session_header, None)
+    predecessor = await service._durable_bridge.claim_live_session(
+        session_key_kind=key.affinity_kind,
+        session_key_value=key.affinity_key,
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_process_epoch="process-a",
+        lease_ttl_seconds=60.0,
+        account_id=account_id,
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id=None,
+        allow_takeover=False,
+    )
+    connect_started = asyncio.Event()
+    allow_connect = asyncio.Event()
+
+    async def fake_create_http_bridge_session(self, target_key, **kwargs):
+        del self, kwargs
+        connect_started.set()
+        await _wait_for_event(allow_connect)
+        session = _make_dummy_bridge_session(target_key)
+        cast(Any, session).account = SimpleNamespace(id=account_id, status=AccountStatus.ACTIVE)
+        return session
+
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_create_http_bridge_session",
+        fake_create_http_bridge_session,
+    )
+
+    replacement = asyncio.create_task(
+        service._get_or_create_http_bridge_session(
+            key,
+            headers={"session_id": session_header},
+            affinity=proxy_module._AffinityPolicy(
+                key=session_header,
+                kind=proxy_module.StickySessionKind.CODEX_SESSION,
+            ),
+            api_key=None,
+            request_model="gpt-5.4",
+            idle_ttl_seconds=120.0,
+            max_sessions=8,
+            durable_lookup=predecessor,
+        )
+    )
+    await _wait_for_event(connect_started)
+    released = await service._durable_bridge.release_live_session(
+        session_id=predecessor.session_id,
+        instance_id="instance-a",
+        owner_epoch=predecessor.owner_epoch,
+        draining=False,
+    )
+    assert released is not None
+    competing_owner = await service._durable_bridge.claim_live_session(
+        session_key_kind=key.affinity_kind,
+        session_key_value=key.affinity_key,
+        api_key_id=None,
+        instance_id="instance-b",
+        owner_process_epoch="process-b",
+        lease_ttl_seconds=60.0,
+        account_id=account_id,
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id=None,
+        allow_takeover=False,
+    )
+    allow_connect.set()
+
+    with pytest.raises(proxy_module.ProxyResponseError) as exc_info:
+        await replacement
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.payload["error"]["code"] == "bridge_instance_mismatch"
+
+    snapshots = await service._durable_bridge.lookup_sessions(session_ids=[predecessor.session_id])
+    assert len(snapshots) == 1
+    assert snapshots[0].owner_instance_id == "instance-b"
+    assert snapshots[0].owner_epoch == competing_owner.owner_epoch
+
+
+@pytest.mark.asyncio
 async def test_v1_responses_http_bridge_reports_unavailable_required_owner_when_other_account_exists(
     async_client, monkeypatch
 ):

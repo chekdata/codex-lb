@@ -36,3 +36,15 @@ Public Responses endpoints MUST NOT return an OpenAI-shaped previous-response co
 - **WHEN** a public Responses handler receives `code=invalid_request_error` with an absent or matching `param` and the exact canonical message `Invalid previous_response_id.`
 - **THEN** the raw invalid-request response is not exposed
 - **AND** the request uses the existing proof-gated recovery or retryable continuity failure path
+
+## ADDED Requirements
+
+### Requirement: Reader-retired replacements preserve cross-replica ownership
+When a local reader-retired HTTP bridge session is replaced before its bounded close releases the durable row, the replacement MUST advance the durable owner epoch if this replica still owns the row. A stale pre-connect ownership lookup MUST NOT grant takeover permission if another replica claims an active lease while the replacement opens its upstream connection.
+
+#### Scenario: another replica claims during replacement connect
+- **GIVEN** the pre-connect durable lookup identifies the current replica as owner
+- **AND** the old bounded close releases that owner while a replacement upstream connection is opening
+- **WHEN** another replica claims an active lease before the replacement commits its durable claim
+- **THEN** the replacement fails closed with an owner mismatch
+- **AND** the other replica remains the durable owner at the same fencing epoch

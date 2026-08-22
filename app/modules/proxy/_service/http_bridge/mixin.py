@@ -1536,11 +1536,16 @@ class _HTTPBridgeMixin(
                     and _durable_bridge_lookup_active_owner(durable_lookup)
                     == settings.http_responses_session_bridge_instance_id
                 )
-                force_durable_takeover = force_durable_takeover or same_instance_orphan
+                force_owner_epoch_advance = force_durable_takeover or same_instance_orphan
                 await self._claim_durable_http_bridge_session(
                     created_session,
                     allow_takeover=force_durable_takeover or _http_bridge_allow_durable_takeover(durable_lookup),
-                    force_owner_epoch_advance=force_durable_takeover,
+                    # A same-instance orphan needs a new fencing epoch only
+                    # while this replica still owns the durable row. Do not
+                    # turn a stale pre-connect lookup into permission to steal
+                    # an active lease that another replica claimed while the
+                    # upstream connection was being created.
+                    force_owner_epoch_advance=force_owner_epoch_advance,
                 )
                 async with self._http_bridge_lock:
                     current_future = self._http_bridge_inflight_sessions.get(key)
