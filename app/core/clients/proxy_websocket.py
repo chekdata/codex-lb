@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import ssl
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Mapping, NoReturn, Protocol, Sequence, cast
@@ -134,6 +135,31 @@ _LIVE_SIDEBAND_WEBSOCKET_POLICY = _UpstreamWebSocketPolicy(
 logger = logging.getLogger(__name__)
 
 
+class _ProxySetupSafeClientConnection(ClientConnection):
+    """Close a proxied connection safely before ``connection_made``.
+
+    ``websockets`` transfers the proxy transport to this protocol before a
+    TLS upgrade, but initializes ``recv_messages`` only after that upgrade
+    succeeds. If the transport closes during the upgrade, asyncio calls
+    ``connection_lost`` first and the dependency dereferences the missing
+    receive assembler. Complete only the state that exists at this point;
+    established connections continue through the dependency's full close
+    path unchanged.
+    """
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        if hasattr(self, "recv_messages"):
+            super().connection_lost(exc)
+            return
+
+        self.protocol.receive_eof()
+        self.set_recv_exc(exc)
+        if self.keepalive_task is not None:
+            self.keepalive_task.cancel()
+        if not self.connection_lost_waiter.done():
+            self.connection_lost_waiter.set_result(None)
+
+
 def normalize_realtime_call_id(value: str) -> str | None:
     normalized = value.strip()
     if not normalized or len(normalized) > _LIVE_CALL_ID_MAX_LENGTH:
@@ -161,6 +187,32 @@ def _consume_connection_lost_exception(done: asyncio.Future[Any]) -> None:
         done.exception()
     except asyncio.CancelledError:
         return
+
+
+async def _connect_websockets_transport(
+    url: str,
+    *,
+    proxy_url: str | None,
+    connect_kwargs: Mapping[str, Any],
+) -> ClientConnection:
+    """Open once, or retry one fresh tunnel for a shared-proxy setup close.
+
+    Awaiting ``websocket_connect`` proves no application frame was dispatched
+    when a timeout or transport error escapes. A fresh tunnel on the same
+    account is therefore safe. The process-wide environment proxy isn't an
+    account-owned route, so exhaustion must not penalize or rotate accounts.
+    """
+
+    try:
+        return await websocket_connect(url, **connect_kwargs)
+    except (asyncio.TimeoutError, OSError) as exc:
+        if proxy_url is None or isinstance(exc, ssl.SSLCertVerificationError):
+            raise
+        logger.warning(
+            "Retrying upstream websocket after shared proxy setup failure exception_type=%s",
+            type(exc).__name__,
+        )
+        return await websocket_connect(url, **connect_kwargs)
 
 
 @dataclass(slots=True)
@@ -946,21 +998,31 @@ async def _connect_upstream_websocket(
     )
     try:
         subprotocol_kwargs = {"subprotocols": cast(Sequence[Subprotocol], subprotocols)} if subprotocols else {}
-        response = await websocket_connect(
+        proxy_connection_kwargs = (
+            {"create_connection": _ProxySetupSafeClientConnection} if proxy_url is not None else {}
+        )
+        response = await _connect_websockets_transport(
             url,
-            origin=origin,
-            additional_headers=upstream_headers or None,
-            user_agent_header=user_agent,
-            open_timeout=settings.upstream_connect_timeout_seconds,
-            ping_timeout=ping_timeout,
-            max_size=settings.max_sse_event_bytes,
-            proxy=proxy_url,
-            **subprotocol_kwargs,
+            proxy_url=proxy_url,
+            connect_kwargs={
+                "origin": origin,
+                "additional_headers": upstream_headers or None,
+                "user_agent_header": user_agent,
+                "open_timeout": settings.upstream_connect_timeout_seconds,
+                "ping_timeout": ping_timeout,
+                "max_size": settings.max_sse_event_bytes,
+                "proxy": proxy_url,
+                **proxy_connection_kwargs,
+                **subprotocol_kwargs,
+            },
         )
     except asyncio.TimeoutError as exc:
         raise ProxyResponseError(
             502,
             openai_error("upstream_unavailable", "Request to upstream timed out"),
+            failure_phase="connect",
+            failure_detail="shared_proxy_connect_pre_dispatch_exhausted" if proxy_url is not None else None,
+            failure_exception_type=type(exc).__name__,
         ) from exc
     except InvalidStatus as exc:
         response = exc.response
@@ -1012,6 +1074,12 @@ async def _connect_upstream_websocket(
             openai_error(error_code, message),
             failure_phase="connect",
             retryable_same_contract=error_code == PROCESS_NETWORK_UNAVAILABLE_CODE,
+            failure_detail=(
+                "shared_proxy_connect_pre_dispatch_exhausted"
+                if proxy_url is not None and not isinstance(exc, ssl.SSLCertVerificationError)
+                else None
+            ),
+            failure_exception_type=type(exc).__name__,
         ) from exc
 
     return ArchivingUpstreamWebSocket(

@@ -46,6 +46,43 @@ Explicit configuration MUST still override auto-detection.
 - **AND** standard outbound proxy environment variables are set
 - **THEN** upstream websocket handshakes connect directly without using those proxies
 
+### Requirement: Proxied WebSocket setup closes fail as pre-dispatch transport errors
+
+When an upstream WebSocket uses an HTTP proxy and the transport closes while
+TLS setup is transferring the transport to the WebSocket protocol, before the
+protocol's `connection_made()` initializes receive state, the service MUST
+complete connection-lost bookkeeping without dereferencing uninitialized
+receive or transport attributes. The service MUST retry exactly one fresh
+tunnel on the same account because no application frame was dispatched. If
+that retry also fails, it MUST return a typed pre-dispatch transport error
+without penalizing or rotating accounts and MUST NOT leave an HTTP Responses
+stream pending without a terminal event. Once `connection_made()` has run,
+the dependency's established-connection close semantics MUST remain unchanged.
+
+#### Scenario: proxy transport closes before connection setup completes
+
+- **GIVEN** a secure upstream Responses WebSocket is routed through an HTTP proxy
+- **AND** the proxy transport closes before `connection_made()` initializes the receive assembler
+- **WHEN** the WebSocket dependency reports `connection_lost()`
+- **THEN** the service completes the connection-lost waiter without raising an event-loop callback exception
+- **AND** retries one fresh proxy tunnel on the same account
+- **AND** no request is treated as having reached upstream
+
+#### Scenario: shared proxy setup retry is exhausted
+
+- **GIVEN** the fresh same-account proxy tunnel also closes before setup completes
+- **WHEN** the service returns the connection failure
+- **THEN** the failure identifies exhausted shared-proxy setup
+- **AND** the selected account is not backed off or excluded
+- **AND** no other account is tried through the same failing shared proxy
+
+#### Scenario: established proxied connection keeps normal close semantics
+
+- **GIVEN** the proxied WebSocket completed `connection_made()` and initialized receive state
+- **WHEN** the established connection closes
+- **THEN** the dependency's normal close path handles pending receives, pings, and drain waiters
+- **AND** the adapter does not weaken or suppress the established-connection failure classification
+
 ### Requirement: Runtime version status checks latest GitHub release
 
 The service SHALL expose a dashboard-auth protected runtime version status API that reports the running codex-lb version, the latest known GitHub release version when available, whether an update is available, and the time of the latest lookup attempt. The lookup MUST be cached in-process to avoid per-request GitHub traffic, and lookup failures MUST NOT cause the API to fail.
