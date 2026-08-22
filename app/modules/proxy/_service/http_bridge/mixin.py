@@ -2028,12 +2028,13 @@ class _HTTPBridgeMixin(
             requested_preferred_account_id = (
                 request_state.preferred_account_id if require_preferred_account or account_neutral_recovery else None
             )
+            close_skips_account = session.last_upstream_close_code in _UPSTREAM_CLOSE_CODES_SKIP_SAME_ACCOUNT_RETRY
+            reconnect_account_bound = require_same_account or (session.key.strength == "hard" and close_skips_account)
             required_preferred_account_id = resolve_required_account_id(
                 ("requested reconnect owner", requested_preferred_account_id),
                 ("account-neutral recovery", session.account.id if account_neutral_recovery else None),
+                ("same-account reconnect", session.account.id if reconnect_account_bound else None),
             )
-            close_skips_account = session.last_upstream_close_code in _UPSTREAM_CLOSE_CODES_SKIP_SAME_ACCOUNT_RETRY
-            hard_close_account_bound = session.key.strength == "hard" and (close_skips_account or require_same_account)
             skip_same_account = (
                 session.key.strength != "hard" and close_skips_account and required_preferred_account_id is None
             )
@@ -2042,7 +2043,7 @@ class _HTTPBridgeMixin(
                 _complete_http_bridge_handoff(session, self._http_bridge_inflight_sessions)
                 raise _http_bridge_previous_response_owner_unavailable_error()
             _require_http_bridge_bound_account_not_excluded(
-                hard_close_account_bound, session.account.id, excluded_account_ids
+                reconnect_account_bound, session.account.id, excluded_account_ids
             )
         except BaseException:
             session.closed = True
@@ -2053,7 +2054,7 @@ class _HTTPBridgeMixin(
         retry_same_account_once = not skip_same_account and session.account.id not in excluded_account_ids
         if skip_same_account:
             preferred_candidate_id: str | None = None
-        elif hard_close_account_bound and session.account.id not in excluded_account_ids:
+        elif reconnect_account_bound and session.account.id not in excluded_account_ids:
             preferred_candidate_id = session.account.id
         elif required_preferred_account_id is not None:
             preferred_candidate_id = required_preferred_account_id
@@ -2093,7 +2094,7 @@ class _HTTPBridgeMixin(
 
         async def abandon_selected_account_retry(selected_account: Any) -> None:
             nonlocal preferred_candidate_id
-            if hard_close_account_bound or selected_account_model_replacement:
+            if reconnect_account_bound or selected_account_model_replacement:
                 await release_selected_account_lease()
                 complete_failed_handoff()
                 raise
@@ -2121,7 +2122,7 @@ class _HTTPBridgeMixin(
         def require_bound_account() -> None:
             try:
                 _require_http_bridge_bound_account_not_excluded(
-                    hard_close_account_bound, session.account.id, excluded_account_ids
+                    reconnect_account_bound, session.account.id, excluded_account_ids
                 )
             except BaseException:
                 complete_failed_handoff()
@@ -2152,7 +2153,7 @@ class _HTTPBridgeMixin(
                     ),
                     fallback_on_preferred_account_unavailable=(
                         not reuse_current_account_lease
-                        and not hard_close_account_bound
+                        and not reconnect_account_bound
                         and required_preferred_account_id is None
                     ),
                 )
@@ -2171,14 +2172,14 @@ class _HTTPBridgeMixin(
                     raise _http_bridge_previous_response_owner_unavailable_error()
                 if (
                     reuse_current_account_lease
-                    and not hard_close_account_bound
+                    and not reconnect_account_bound
                     and required_preferred_account_id is None
                     and _remaining_budget_seconds(deadline) > 0
                 ):
                     preferred_candidate_id = None
                     continue
                 if selection.error_code == USAGE_LIMIT_REACHED and (
-                    required_preferred_account_id is not None or hard_close_account_bound
+                    required_preferred_account_id is not None or reconnect_account_bound
                 ):
                     complete_failed_handoff()
                     raise _http_bridge_previous_response_owner_unavailable_error()
@@ -2211,7 +2212,7 @@ class _HTTPBridgeMixin(
                     retry_same_account_once = not skip_same_account and session.account.id not in excluded_account_ids
                     if skip_same_account:
                         preferred_candidate_id = None
-                    elif hard_close_account_bound and session.account.id not in excluded_account_ids:
+                    elif reconnect_account_bound and session.account.id not in excluded_account_ids:
                         preferred_candidate_id = session.account.id
                     elif required_preferred_account_id is not None:
                         preferred_candidate_id = required_preferred_account_id
