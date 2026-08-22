@@ -7109,7 +7109,19 @@ async def test_v1_responses_http_bridge_does_not_register_turn_state_alias_befor
 
 @pytest.mark.asyncio
 async def test_v1_responses_http_bridge_reconnects_after_clean_upstream_close(async_client, monkeypatch):
-    _install_bridge_settings(monkeypatch, enabled=True)
+    # Keep this reconnect contract on the instance that the application
+    # lifespan registered in the durable ring. Using the helper's synthetic
+    # ``instance-a`` default here creates an unrelated race: the clean-close
+    # reader can remove the local session just before its durable lease is
+    # released, and the next request then observes that lease as a foreign
+    # owner. Owner-mismatch behavior has dedicated tests; this one verifies
+    # that a clean upstream close reconnects transparently on one replica.
+    runtime_instance_id = proxy_module.get_settings().http_responses_session_bridge_instance_id
+    _install_bridge_settings_with_limits(
+        monkeypatch,
+        enabled=True,
+        instance_id=runtime_instance_id,
+    )
     account_id = await _import_account(async_client, "acc_http_bridge_reconnect", "http-bridge-reconnect@example.com")
     account = await _get_account(account_id)
     first_upstream = _ClosingBridgeUpstreamWebSocket()
