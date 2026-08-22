@@ -29,5 +29,6 @@
 - [x] Preserve `agent_message` identifiers during proof classification while keeping the replay ineligible for account-neutral reallocation.
 - [x] Add negative shape tests and an end-to-end stale-anchor regression matching reasoning + agent message + repeated user follow-ups.
 - [x] Emit content-free proof-rejection shape diagnostics for future long-session incidents.
+- [x] Require an explicitly empty persisted tool manifest for inter-agent output boundaries and keep malformed diagnostic fields fail-closed.
 - [x] Validate the amended OpenSpec and rerun focused, unit, integration, lint, type, architecture, and diff gates.
 - [ ] Build and deploy the exact merged source image, then verify the previously failing long task and both operator windows remain healthy.

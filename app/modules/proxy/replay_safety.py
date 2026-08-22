@@ -326,6 +326,7 @@ def responses_input_suffix_retains_prior_output(
     stored_count: int,
     canonical_lite_developer_index: int | None = None,
     exact_stored_prefix_without_pending_manifest: bool = False,
+    allow_response_owned_agent_message: bool = True,
 ) -> bool:
     """Prove that a stored input prefix is followed by prior output and new input."""
 
@@ -405,7 +406,8 @@ def responses_input_suffix_retains_prior_output(
             continue
         if item_type == "agent_message":
             if (
-                pending_suffix_calls
+                not allow_response_owned_agent_message
+                or pending_suffix_calls
                 or retained_output_seen
                 or fresh_followup_seen
                 or not _is_retained_agent_message(item)

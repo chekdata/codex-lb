@@ -259,9 +259,19 @@ author and recipient, exact `turn_id` plus finite `create_time` metadata, and
 one self-contained `input_text` content part. The proof MUST reject missing,
 extra, malformed, reordered, or client-shaped fields. This shape MUST remain
 owner-bound and MUST NOT by itself make a request eligible for account-neutral
-reallocation. A matching request MAY remove only the proxy-injected stale
-`previous_response_id`, replay the complete context once on the same account,
-and publish a replacement anchor only after `response.completed`.
+reallocation. The proof MUST additionally bind a persisted tool-call manifest
+that is present and exactly empty; a missing manifest or any unsettled call
+MUST reject the inter-agent boundary. A matching request MAY remove only the
+proxy-injected stale `previous_response_id`, replay the complete context once
+on the same account, and publish a replacement anchor only after
+`response.completed`.
+
+Rejected-proof observability MUST classify only known string-valued `type` and
+`role` fields. Non-string or otherwise malformed values MUST be labeled as an
+opaque `other` shape without logging their content and MUST NOT turn the
+fail-closed bridge response into an internal server error. Pre-bridge request
+inspection, including file-reference extraction, MUST apply the same typed
+classification and MUST NOT fail on non-string item types.
 
 #### Scenario: socket already closed before send recovers once
 
@@ -301,6 +311,24 @@ and publish a replacement anchor only after `response.completed`.
 - **THEN** the inter-agent item does not satisfy retained-output proof
 - **AND** the proxy keeps the continuity request owner-bound and fail-closed
 - **AND** it does not dispatch an unanchored replay
+
+#### Scenario: pending or unknown tool state rejects an inter-agent boundary
+
+- **GIVEN** a full resend suffix contains a canonical completed `agent_message`
+- **AND** the durable or live owner has a nonempty or unavailable persisted
+  tool-call manifest
+- **WHEN** stale-anchor recovery is evaluated
+- **THEN** the inter-agent item does not satisfy retained-output proof
+- **AND** the existing continuity anchor remains attached
+
+#### Scenario: malformed diagnostic fields remain fail-closed
+
+- **GIVEN** a rejected full-resend suffix contains a non-string `type` or
+  `role` value
+- **WHEN** the bridge emits its bounded suffix-shape diagnostic
+- **THEN** it records only the `other` classification
+- **AND** does not expose the malformed value
+- **AND** does not return HTTP 500 from the diagnostic path
 
 #### Scenario: complete but account-scoped fresh body stays on its owner
 

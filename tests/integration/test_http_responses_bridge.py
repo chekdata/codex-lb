@@ -13668,6 +13668,101 @@ async def test_v1_responses_http_bridge_recovers_store_context_trim_after_proxy_
 
 
 @pytest.mark.parametrize(
+    "malformed_suffix_item",
+    [
+        pytest.param(
+            {"type": ["unhashable", "type"], "content": "not replay authority"},
+            id="unhashable-type",
+        ),
+        pytest.param(
+            {"type": "message", "role": {"unhashable": "role"}, "content": "not replay authority"},
+            id="unhashable-role",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_malformed_full_resend_diagnostic_stays_fail_closed(
+    async_client,
+    app_instance,
+    monkeypatch,
+    malformed_suffix_item,
+):
+    """Malformed diagnostics must not turn an anchored rejection into HTTP 500."""
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_malformed_full_resend",
+        "http-bridge-malformed-full-resend@example.com",
+    )
+    account = await _get_account(account_id)
+    upstream = _FakeBridgeUpstreamWebSocket("resp_malformed_full_resend")
+
+    async def fake_select_account_with_budget(self, deadline, **kwargs):
+        del self, deadline, kwargs
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del headers, access_token, account_id_header, base_url, session
+        return upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    stored_input: list[proxy_module.JsonValue] = [{"role": "user", "content": "stored question"}]
+    durable_lookup = proxy_module.DurableBridgeLookup(
+        session_id="durable-malformed-full-resend",
+        canonical_kind="prompt_cache",
+        canonical_key="malformed-full-resend",
+        api_key_scope="__anonymous__",
+        account_id=account.id,
+        owner_instance_id=None,
+        owner_epoch=1,
+        lease_expires_at=None,
+        state=HttpBridgeSessionState.ACTIVE,
+        latest_turn_state=None,
+        latest_response_id="resp_malformed_anchor",
+        latest_input_item_count=len(stored_input),
+        latest_input_full_fingerprint=proxy_module._fingerprint_input_items(stored_input),
+        latest_pending_tool_calls={},
+        model="gpt-5.1",
+    )
+    service = get_proxy_service_for_app(app_instance)
+    monkeypatch.setattr(
+        service._durable_bridge,
+        "lookup_request_targets",
+        AsyncMock(return_value=durable_lookup),
+    )
+
+    response = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": [*stored_input, malformed_suffix_item],
+            "prompt_cache_key": "malformed-full-resend",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(upstream.sent_text) == 1
+    forwarded = json.loads(upstream.sent_text[0])
+    assert "previous_response_id" not in forwarded
+    assert forwarded["input"] == [*stored_input, malformed_suffix_item]
+
+
+@pytest.mark.parametrize(
     "canonical_invalid_shape",
     [False, True],
     ids=["previous-response-not-found", "canonical-invalid-previous-response-id"],

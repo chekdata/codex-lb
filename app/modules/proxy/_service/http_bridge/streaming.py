@@ -266,11 +266,15 @@ def _full_resend_suffix_shape_for_observability(
             continue
         item_type = item.get("type")
         role = item.get("role")
-        if item_type in (None, "message") and role in {"assistant", "developer", "system", "user"}:
+        if (
+            item_type in (None, "message")
+            and isinstance(role, str)
+            and role in {"assistant", "developer", "system", "user"}
+        ):
             labels.append(str(role))
-        elif item_type in _OBSERVABLE_REPLAY_SUFFIX_ITEM_TYPES:
-            labels.append(str(item_type))
-        elif item_type in {"input_file", "input_image", "input_text"}:
+        elif isinstance(item_type, str) and item_type in _OBSERVABLE_REPLAY_SUFFIX_ITEM_TYPES:
+            labels.append(item_type)
+        elif isinstance(item_type, str) and item_type in {"input_file", "input_image", "input_text"}:
             labels.append("input_part")
         else:
             labels.append("other")
@@ -407,11 +411,10 @@ class _VerifiedDurableFullResend:
             stored_count=replay_projection.stored_prefix_count,
             canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
             # The prefix fingerprint matched the exact context previously
-            # completed by this same-account session, and an empty pending
-            # manifest proves no tool call is left unsettled. Historical
-            # developer interleaves inside that sealed prefix are therefore
-            # not new replay authority and must not strand long Codex tasks.
+            # completed by this same-account session. Only the new inter-agent
+            # boundary additionally requires an explicitly empty manifest.
             exact_stored_prefix_without_pending_manifest=not pending_tool_calls,
+            allow_response_owned_agent_message=pending_tool_calls == {},
         ) or (
             pending_tool_calls is not None
             and responses_input_suffix_matches_pending_tool_calls(
@@ -534,7 +537,7 @@ class _VerifiedStoreContextFullResend:
             and session.last_completed_response_id == self._latest_response_id
             and session.last_completed_input_count == self._stored_input_item_count
             and session.last_completed_input_prefix_fingerprint == self._stored_input_fingerprint
-            and _pending_tool_calls_identity(session.last_pending_tool_calls or None) == self._pending_tool_calls
+            and _pending_tool_calls_identity(session.last_pending_tool_calls) == self._pending_tool_calls
             and _fingerprint_input_items(cast(list[JsonValue], input_items)) == self._full_input_fingerprint
         )
 
@@ -571,7 +574,7 @@ class _VerifiedStoreContextFullResend:
             preserve_developer_message_ids=True,
             preserve_response_owned_agent_message_ids=True,
         )
-        pending_tool_calls = session.last_pending_tool_calls or None
+        pending_tool_calls = session.last_pending_tool_calls
         if replay_projection is None:
             return None
         safe_fresh_context = responses_input_suffix_retains_prior_output(
@@ -579,6 +582,7 @@ class _VerifiedStoreContextFullResend:
             stored_count=replay_projection.stored_prefix_count,
             canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
             exact_stored_prefix_without_pending_manifest=not pending_tool_calls,
+            allow_response_owned_agent_message=pending_tool_calls == {},
         ) or (
             pending_tool_calls is not None
             and responses_input_suffix_matches_pending_tool_calls(
@@ -1529,6 +1533,7 @@ class _HTTPBridgeStreamingMixin:
                     stored_count=replay_projection.stored_prefix_count,
                     canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
                     exact_stored_prefix_without_pending_manifest=not lookup.latest_pending_tool_calls,
+                    allow_response_owned_agent_message=lookup.latest_pending_tool_calls == {},
                 ) or (
                     lookup.latest_pending_tool_calls is not None
                     and responses_input_suffix_matches_pending_tool_calls(
@@ -1573,13 +1578,15 @@ class _HTTPBridgeStreamingMixin:
                 stored_count=durable_full_resend_anchor_count,
             )
             if replay_projection is not None:
-                durable_full_resend_retains_prior_output = responses_input_suffix_retains_prior_output(
-                    replay_projection.input_items,
-                    stored_count=replay_projection.stored_prefix_count,
-                    canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
-                    exact_stored_prefix_without_pending_manifest=(
-                        durable_lookup is not None and not durable_lookup.latest_pending_tool_calls
-                    ),
+                durable_full_resend_retains_prior_output = (
+                    durable_lookup is not None
+                    and responses_input_suffix_retains_prior_output(
+                        replay_projection.input_items,
+                        stored_count=replay_projection.stored_prefix_count,
+                        canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+                        exact_stored_prefix_without_pending_manifest=not durable_lookup.latest_pending_tool_calls,
+                        allow_response_owned_agent_message=durable_lookup.latest_pending_tool_calls == {},
+                    )
                 )
                 durable_full_resend_fresh_payload = _http_bridge_payload_without_previous_response_id(
                     payload
@@ -2029,13 +2036,15 @@ class _HTTPBridgeStreamingMixin:
                 )
                 if eligibility_projection is None:
                     return False
-                durable_full_resend_retains_prior_output = responses_input_suffix_retains_prior_output(
-                    eligibility_projection.input_items,
-                    stored_count=eligibility_projection.stored_prefix_count,
-                    canonical_lite_developer_index=eligibility_projection.canonical_lite_developer_index,
-                    exact_stored_prefix_without_pending_manifest=(
-                        durable_lookup is not None and not durable_lookup.latest_pending_tool_calls
-                    ),
+                durable_full_resend_retains_prior_output = (
+                    durable_lookup is not None
+                    and responses_input_suffix_retains_prior_output(
+                        eligibility_projection.input_items,
+                        stored_count=eligibility_projection.stored_prefix_count,
+                        canonical_lite_developer_index=eligibility_projection.canonical_lite_developer_index,
+                        exact_stored_prefix_without_pending_manifest=not durable_lookup.latest_pending_tool_calls,
+                        allow_response_owned_agent_message=durable_lookup.latest_pending_tool_calls == {},
+                    )
                 )
                 if not durable_full_resend_retains_prior_output:
                     return False
