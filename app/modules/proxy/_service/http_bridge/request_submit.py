@@ -1321,7 +1321,10 @@ class _HTTPBridgeRequestSubmitMixin:
                     request_state.recovery_attempt_dispatched = True
                     session.last_used_at = _service_time().monotonic()
                 except asyncio.CancelledError:
-                    if recovery_receipt is not None and not upstream_send_started:
+                    recovery_alias_is_proven_unsent = not upstream_send_started or (
+                        request_state.replay_count > 0 and not request_state.fresh_upstream_send_primitive_reached
+                    )
+                    if recovery_receipt is not None and recovery_alias_is_proven_unsent:
                         session.closed = True
                         session.upstream_control.reconnect_requested = True
                         session.upstream_control.retire_after_drain = True
@@ -2069,6 +2072,7 @@ class _HTTPBridgeRequestSubmitMixin:
         if request_state.response_event_count > 0:
             return False
         request_state.replay_count += 1
+        request_state.fresh_upstream_send_primitive_reached = False
         _log_http_bridge_event(
             "retry_fresh_upstream",
             session.key,
@@ -2095,6 +2099,7 @@ class _HTTPBridgeRequestSubmitMixin:
                     request_state.previous_response_id = None
                     request_state.proxy_injected_previous_response_id = False
                     request_state.request_text = retry_text_data
+                request_state.fresh_upstream_send_primitive_reached = True
                 await _send_http_bridge_request_text_with_archive_id(session, request_state, retry_text_data)
             _clear_websocket_request_error_overrides(request_state)
             session.last_used_at = _service_time().monotonic()

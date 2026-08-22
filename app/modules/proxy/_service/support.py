@@ -791,6 +791,11 @@ class _WebSocketRequestState:
     # send. Retries replace this value so admission wait and prior attempts do
     # not age a fresh send into the eventless owner deadline.
     response_create_sent_at: float | None = None
+    # Set immediately before the one-shot replacement path invokes its send
+    # primitive. A cancellation while reconnecting is still proven unsent and
+    # may roll back a reversible recovery alias; cancellation after this point
+    # is ambiguous and must retain the alias/fail closed.
+    fresh_upstream_send_primitive_reached: bool = False
     bridge_queue_wait_started_at: float | None = None
     # Monotonic deadline of the original bridge request budget. Retry and
     # recovery paths re-prepare request states with a fresh started_at, so

@@ -2,10 +2,8 @@
 
 ### Requirement: Clean upstream close before any response event fails fast
 
-When the HTTP Responses bridge observes an upstream WebSocket close with
-`close_code = 1000` before any `response.*` event has been surfaced for the
-pending request, the proxy MUST preserve its existing pre-visible replay
-guards. If the request has already used exactly one eligible pre-visible
+When the HTTP Responses bridge observes an upstream WebSocket close with `close_code = 1000` before any `response.*` event has been surfaced for the pending request, the proxy MUST preserve its existing pre-visible replay guards.
+If the request has already used exactly one eligible pre-visible
 replay and the replacement upstream WebSocket also closes cleanly before any
 response event, the proxy MAY perform exactly one additional replay. The
 additional replay MUST be hard-capped at one per request, and the configured
@@ -257,19 +255,23 @@ frame may already have crossed the kernel boundary.
 
 ### Requirement: Rejected proxy continuity anchors recover without context loss
 
-When the upstream explicitly rejects a `previous_response_id` that the proxy
-injected, before any response event is observed, the bridge MUST NOT inject the
+When the upstream explicitly rejects a proxy-injected `previous_response_id` before any response event is observed, the bridge MUST NOT inject the
 same rejected identifier into another physical WebSocket. A request that has a
 request-bound immutable durable proof covering its complete unanchored input
-MAY clear the durable anchor with the existing owner-epoch fence and replay
-exactly once, without the rejected anchor, on the same account.
+MAY bypass the rejected anchor and replay exactly once, without that anchor, on
+the same account. The bridge MUST retain the previous durable anchor until the
+replacement reaches terminal completion and atomically publishes its new
+checkpoint.
 
 When that proof is absent, the bridge MUST quarantine the logical session key,
 retire the rejected physical bridge while preserving the durable lease, and
 return a stable non-retryable-same-contract error. A later full-resend-shaped
-client request MUST take a fresh unanchored path. A delta-only request MUST keep
-the durable anchor and fail closed; the bridge MUST NOT silently discard prior
-conversation context. A completed response MUST clear the bounded quarantine.
+client request MUST take a fresh unanchored path only when its request-bound
+durable proof exactly matches the current durable owner and proves complete
+conversation context. A merely full-resend-shaped request and a delta-only
+request MUST keep the durable anchor and fail closed; the bridge MUST NOT
+silently discard prior conversation context. A completed response MUST clear
+the bounded quarantine.
 
 Client-supplied `previous_response_id` values MUST NOT be cleared or replayed
 unanchored by this recovery path.
@@ -279,32 +281,32 @@ unanchored by this recovery path.
 - **GIVEN** the upstream rejects a proxy-injected durable response anchor before any response event
 - **AND** immutable durable evidence proves the untrimmed request contains the complete conversation context
 - **WHEN** the bridge performs local recovery
-- **THEN** it clears the anchor with an owner-epoch fence
+- **THEN** it retains the previous durable anchor until replacement completion
 - **AND** replays the complete request exactly once without an anchor on the same account
-- **AND** it never sends the rejected identifier again
+- **AND** terminal completion atomically replaces the durable anchor
+- **AND** a failed replacement leaves the previous durable anchor available for a later verified retry
 
-#### Scenario: unproved request quarantines and later full resend recovers
+#### Scenario: unproved request quarantines and only a durably proved full resend recovers
 
 - **GIVEN** the upstream rejects a proxy-injected durable response anchor before any response event
 - **AND** the current request lacks complete-context proof
 - **WHEN** the bridge handles the rejection
 - **THEN** it returns `previous_response_anchor_unrecoverable` without another upstream dispatch
 - **AND** quarantines the logical key without clearing its durable anchor
-- **WHEN** the client subsequently supplies a full-resend-shaped request
+- **WHEN** the client subsequently supplies a full-resend-shaped request whose immutable proof exactly matches the durable owner and complete context
 - **THEN** the fresh bridge sends that request without the rejected anchor
 - **AND** a terminal completion clears quarantine
 
 #### Scenario: delta-only and client-owned anchors remain fail-closed
 
-- **GIVEN** a quarantined key receives only a delta payload, or the rejected anchor was client supplied
+- **GIVEN** a quarantined key receives a delta payload or a full-resend-shaped payload without exact durable completeness proof, or the rejected anchor was client supplied
 - **WHEN** recovery is evaluated
 - **THEN** the proxy does not remove the anchor
 - **AND** it does not issue an unanchored replay that could omit prior context
 
 ### Requirement: Upstream websocket drops penalize affected accounts
 
-When an upstream websocket closes while one or more streamed response requests
-are pending and have not reached a terminal event, the proxy MUST record a
+When an upstream websocket closes while one or more streamed response requests are pending and have not reached a terminal event, the proxy MUST record a
 transient upstream error for the account before signaling failure for those
 pending requests, except when the close carries a classified process-wide
 network failure, is a clean close (`close_code = 1000`) before any

@@ -18967,6 +18967,120 @@ async def test_submit_http_bridge_request_does_not_loop_after_replacement_is_als
 
 
 @pytest.mark.asyncio
+async def test_submit_http_bridge_request_cancellation_during_replacement_setup_rolls_back_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    closed_send = AsyncMock(
+        side_effect=UpstreamWebSocketTransportError(
+            "already closed",
+            error_code=UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE,
+        )
+    )
+    replacement_setup_started = asyncio.Event()
+    replacement_setup_release = asyncio.Event()
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-pre-dispatch-recovery-cancelled-setup",
+        model="gpt-5.5",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        awaiting_response_created=True,
+        event_queue=asyncio.Queue(),
+        request_text='{"type":"response.create","model":"gpt-5.5","input":"new"}',
+        transport="http",
+        skip_request_log=True,
+    )
+    key = _make_account_neutral_replay_session_key("pre-dispatch-recovery-cancelled-setup")
+    close = AsyncMock()
+    session = _make_bridge_session(key=key)
+    session.upstream = cast(
+        UpstreamWebSocket,
+        SimpleNamespace(send_text=closed_send, close=close),
+    )
+    session.durable_session_id = "durable-pre-dispatch-recovery-cancelled-setup"
+    session.durable_owner_epoch = 11
+    service._http_bridge_sessions[session.key] = session
+    receipt = DurableBridgeAliasRegistrationReceipt(
+        status=DurableBridgeAliasRegistration.REGISTERED,
+        session_id=session.durable_session_id,
+        api_key_scope="__anonymous__",
+        alias_kind="turn_state",
+        alias_value="turn-pre-dispatch-recovery-cancelled-setup",
+        instance_id="test-instance",
+        owner_epoch=session.durable_owner_epoch,
+        previous_alias_session_id="durable-predecessor",
+        previous_alias_owner_epoch=4,
+        previous_alias_account_id="acc-predecessor",
+        previous_latest_turn_state=None,
+    )
+    register_recovery_turn_state = AsyncMock(return_value=receipt)
+    rollback_registration = AsyncMock(return_value=True)
+    release_live_session = AsyncMock(return_value=None)
+    service._durable_bridge = cast(
+        Any,
+        SimpleNamespace(
+            register_recovery_turn_state=register_recovery_turn_state,
+            rollback_recovery_turn_state_registration=rollback_registration,
+            release_live_session=release_live_session,
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "_http_bridge_precreated_retry_decision",
+        AsyncMock(return_value=http_bridge_retry_circuit_module._HTTPBridgeRetryCircuitDecision(allowed=True)),
+    )
+
+    async def wait_during_replacement_setup(
+        _session: proxy_service._HTTPBridgeSession,
+        *,
+        request_state: proxy_service._WebSocketRequestState,
+        restart_reader: bool,
+        require_same_account: bool,
+    ) -> None:
+        del _session, request_state, restart_reader, require_same_account
+        replacement_setup_started.set()
+        await replacement_setup_release.wait()
+
+    reconnect = AsyncMock(side_effect=wait_during_replacement_setup)
+    monkeypatch.setattr(service, "_reconnect_http_bridge_session", reconnect)
+
+    submit = asyncio.create_task(
+        service._submit_http_bridge_request(
+            session,
+            request_state=request_state,
+            text_data=request_state.request_text or "{}",
+            queue_limit=8,
+            recovery_turn_state="turn-pre-dispatch-recovery-cancelled-setup",
+        )
+    )
+    try:
+        await asyncio.wait_for(replacement_setup_started.wait(), timeout=1.0)
+        submit.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(submit, timeout=1.0)
+    finally:
+        replacement_setup_release.set()
+        if not submit.done():
+            submit.cancel()
+        await asyncio.gather(submit, return_exceptions=True)
+
+    closed_send.assert_awaited_once()
+    reconnect.assert_awaited_once()
+    register_recovery_turn_state.assert_awaited_once()
+    rollback_registration.assert_awaited_once_with(receipt=receipt)
+    assert request_state.replay_count == 1
+    assert request_state.fresh_upstream_send_primitive_reached is False
+    assert request_state.recovery_attempt_dispatched is False
+    assert session.closed is True
+    assert session.upstream_control.reconnect_requested is True
+    assert session.upstream_control.retire_after_drain is True
+    assert session.queued_request_count == 0
+    assert session.pending_requests == deque()
+
+
+@pytest.mark.asyncio
 async def test_retry_http_bridge_request_on_fresh_upstream_reconnects_without_resending_previous_response_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -19015,6 +19129,7 @@ async def test_retry_http_bridge_request_on_fresh_upstream_reconnects_without_re
 
     assert recovered is True
     assert request_state.replay_count == 1
+    assert request_state.fresh_upstream_send_primitive_reached is False
     assert request_state.error_code_override is None
     assert request_state.error_message_override is None
     assert request_state.error_http_status_override is None
@@ -19672,6 +19787,7 @@ async def test_retry_http_bridge_request_on_fresh_upstream_replays_retry_safe_in
 
     assert recovered is True
     assert request_state.replay_count == 1
+    assert request_state.fresh_upstream_send_primitive_reached is True
     # Replaying should have dropped the anchor metadata so the request
     # executes as a fresh turn using the captured unanchored payload.
     assert request_state.previous_response_id is None
