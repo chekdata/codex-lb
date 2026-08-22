@@ -1735,6 +1735,90 @@ def test_full_resend_retained_output_rejects_unverified_stored_developer_without
     )
 
 
+def test_full_resend_retained_output_accepts_exact_settled_same_session_prefix() -> None:
+    stored_input: list[JsonValue] = [
+        {"role": "user", "content": "first question"},
+        {
+            "type": "custom_tool_call",
+            "call_id": "call_historical",
+            "name": "shell",
+            "input": "pwd",
+        },
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call_historical",
+            "output": "/workspace",
+        },
+        {"type": "message", "role": "developer", "content": "later stored control"},
+    ]
+    suffix: list[JsonValue] = [
+        {
+            "type": "message",
+            "role": "assistant",
+            "phase": "final_answer",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "prior answer"}],
+        },
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "next question"}]},
+    ]
+    projection = project_responses_input_for_account_neutral_fresh_replay(
+        [*stored_input, *suffix],
+        stored_count=len(stored_input),
+        preserve_developer_message_ids=True,
+    )
+
+    assert projection is not None
+    assert not responses_input_suffix_retains_prior_output(
+        projection.input_items,
+        stored_count=projection.stored_prefix_count,
+    )
+    assert responses_input_suffix_retains_prior_output(
+        projection.input_items,
+        stored_count=projection.stored_prefix_count,
+        exact_stored_prefix_without_pending_manifest=True,
+    )
+
+
+def test_full_resend_exact_settled_prefix_rejects_historical_call_id_reuse() -> None:
+    input_items: list[JsonValue] = [
+        {
+            "type": "custom_tool_call",
+            "call_id": "call_historical",
+            "name": "shell",
+            "input": "pwd",
+        },
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call_historical",
+            "output": "/workspace",
+        },
+        {
+            "type": "custom_tool_call",
+            "call_id": "call_historical",
+            "name": "shell",
+            "input": "git status --short",
+        },
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call_historical",
+            "output": "",
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "phase": "final_answer",
+            "content": [{"type": "output_text", "text": "prior answer"}],
+        },
+        {"type": "message", "role": "user", "content": "next question"},
+    ]
+
+    assert not responses_input_suffix_retains_prior_output(
+        input_items,
+        stored_count=2,
+        exact_stored_prefix_without_pending_manifest=True,
+    )
+
+
 def test_full_resend_retained_output_rejects_response_owned_fresh_developer() -> None:
     stored_input: list[JsonValue] = [{"role": "user", "content": "first question"}]
     suffix: list[JsonValue] = [

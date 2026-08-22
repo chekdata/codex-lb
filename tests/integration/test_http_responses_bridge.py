@@ -12999,6 +12999,40 @@ async def test_v1_responses_http_bridge_idle_recovery_hands_reader_to_replacemen
 
 
 @pytest.mark.asyncio
+async def test_retire_empty_terminal_session_does_not_double_count_retry_circuit(app_instance, monkeypatch):
+    service = get_proxy_service_for_app(app_instance)
+    session = proxy_module._HTTPBridgeSession(
+        key=proxy_module._HTTPBridgeSessionKey("session_header", "terminal-close-key", None),
+        headers={},
+        affinity=proxy_module._AffinityPolicy(
+            key="terminal-close-key",
+            kind=proxy_module.StickySessionKind.CODEX_SESSION,
+            max_age_seconds=300,
+        ),
+        request_model="gpt-5.1",
+        account=cast(Account, SimpleNamespace(id="acct-terminal-close", status=AccountStatus.ACTIVE)),
+        upstream=cast(proxy_module.UpstreamWebSocket, _FakeBridgeUpstreamWebSocket()),
+        upstream_control=proxy_module._WebSocketUpstreamControl(),
+        pending_requests=deque(),
+        pending_lock=anyio.Lock(),
+        response_create_gate=asyncio.Semaphore(1),
+        queued_request_count=0,
+        last_used_at=time.monotonic(),
+        idle_ttl_seconds=120.0,
+    )
+    record_retry_circuit_failure = AsyncMock(wraps=service._record_http_bridge_retry_circuit_failure)
+    monkeypatch.setattr(service, "_record_http_bridge_retry_circuit_failure", record_retry_circuit_failure)
+
+    await service._retire_stale_pending_http_bridge_session(
+        session,
+        detail="stream_incomplete",
+        response_events_seen=0,
+    )
+
+    record_retry_circuit_failure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_retry_http_bridge_precreated_request_releases_pending_lock_before_reconnect(app_instance, monkeypatch):
     service = get_proxy_service_for_app(app_instance)
     session = proxy_module._HTTPBridgeSession(
@@ -13526,7 +13560,13 @@ async def test_v1_responses_http_bridge_recovers_store_context_trim_after_proxy_
 
     session_id = "store-context-stale-anchor"
     session_headers = {"x-codex-session-id": session_id}
-    historical_input = [{"role": "user", "content": "hello"}]
+    historical_input = [
+        {"role": "user", "content": "hello"},
+        # Long-running Codex sessions contain later per-turn developer
+        # controls inside the exact stored prefix. The same-session prefix
+        # fingerprint, not cross-account replay classification, owns them.
+        {"type": "message", "role": "developer", "content": "stored per-turn control"},
+    ]
     first = await async_client.post(
         "/v1/responses",
         headers=session_headers,
@@ -13580,7 +13620,12 @@ async def test_v1_responses_http_bridge_recovers_store_context_trim_after_proxy_
     assert len(recovered_upstream.sent_text) == 1
     recovered_payload = json.loads(recovered_upstream.sent_text[0])
     assert "previous_response_id" not in recovered_payload
-    assert recovered_payload["input"] == complete_follow_up
+    assert recovered_payload["input"] == [
+        historical_input[0],
+        *first_body["output"],
+        complete_follow_up[-1],
+    ]
+    assert recovered_payload["instructions"].endswith("stored per-turn control")
 
 
 @pytest.mark.parametrize(

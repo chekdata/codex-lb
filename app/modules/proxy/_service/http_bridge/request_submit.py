@@ -2055,7 +2055,12 @@ class _HTTPBridgeRequestSubmitMixin:
         # the reader-failure funnel, so evaluate the wedge shape (#1534) here
         # too; recording is idempotent for callers that already quarantined.
         _record_http_bridge_quarantine_wedged_pending(self, session, retired_request_states)
-        if response_events_seen is None or response_events_seen == 0:
+        # A terminal upstream error removes its request from pending ownership
+        # before the websocket's normal close arrives. That trailing close is
+        # transport cleanup, not another failed request. Recording it with an
+        # empty retired set double-counts one semantic failure and can open the
+        # durable retry circuit before the verified recovery turn is admitted.
+        if retired_request_states and (response_events_seen is None or response_events_seen == 0):
             await self._record_http_bridge_retry_circuit_failure(
                 session,
                 detail=retry_circuit_detail or detail,
