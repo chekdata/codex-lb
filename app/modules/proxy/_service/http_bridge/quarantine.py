@@ -35,6 +35,7 @@ _HTTP_BRIDGE_QUARANTINE_MAX_ENTRIES = 1024
 
 _HTTP_BRIDGE_QUARANTINE_WEDGED_REATTACH_REASON = "reattach_missing_response_created"
 _HTTP_BRIDGE_QUARANTINE_REPEATED_EVENTLESS_REASON = "repeated_eventless_timeout"
+_HTTP_BRIDGE_QUARANTINE_REJECTED_STALE_ANCHOR_REASON = "proxy_injected_previous_response_rejected"
 
 
 @dataclass(slots=True)

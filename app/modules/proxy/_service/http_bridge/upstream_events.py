@@ -182,6 +182,7 @@ from app.modules.proxy.affinity import (
     _extract_model_class,
 )
 from app.modules.proxy.continuity import is_http_bridge_account_neutral_replay
+from app.modules.proxy.durable_bridge_coordinator import DurableBridgeLookup
 from app.modules.proxy.helpers import (
     _normalize_error_code,
     is_upstream_model_capacity_error,
@@ -625,15 +626,15 @@ async def _cancel_http_bridge_reader_child(
 async def _clear_durable_http_bridge_response_anchor(
     service: Any,
     session: "_HTTPBridgeSession",
-) -> None:
-    """Invalidate a durable proxy-injected anchor that proved eventless.
+) -> DurableBridgeLookup | None:
+    """Invalidate and return the durable row for an anchor proved unusable.
 
     Runs while ``session`` still owns the durable row (before retirement
     releases the lease), so the fenced write lands under the session's own
     owner epoch instead of silently losing the fence to a released owner.
     """
     if session.durable_session_id is None or session.durable_owner_epoch is None:
-        return
+        return None
     try:
         lookup = await service._durable_bridge.clear_live_session_response_anchor(
             session_id=session.durable_session_id,
@@ -642,14 +643,14 @@ async def _clear_durable_http_bridge_response_anchor(
         )
     except Exception:
         logger.warning("Failed to clear durable HTTP bridge response anchor after stuck timeout", exc_info=True)
-        return
+        return None
     if lookup is None or lookup.owner_epoch != session.durable_owner_epoch or lookup.latest_response_id is not None:
         # None means the durable row is gone entirely (e.g. purged); an
         # epoch or anchor mismatch means a newer owner already claimed the
         # session before this fenced write executed. Either way, the anchor
         # was never actually cleared, so do not report an invalidation that
         # did not happen.
-        return
+        return None
     _log_http_bridge_event(
         "durable_anchor_invalidated",
         session.key,
@@ -659,6 +660,7 @@ async def _clear_durable_http_bridge_response_anchor(
         cache_key_family=session.key.affinity_kind,
         model_class=_extract_model_class(session.request_model) if session.request_model else None,
     )
+    return lookup
 
 
 async def _abandon_durable_http_bridge_continuity(

@@ -31,6 +31,21 @@ loop and require the Codex client to be restarted.
   response creation, rather than admission flags alone. Give requests with a
   prior continuity anchor a bounded two-threshold grace period, and emit
   diagnostic state when the watchdog skips a candidate.
+- Detect a socket that is already closed before the transport adapter invokes
+  its send primitive, reconnect once, and dispatch the request exactly once on
+  the replacement socket. Preserve fail-closed handling for every exception
+  raised after the send primitive is invoked because delivery is then
+  ambiguous.
+- Return one atomic retry-circuit decision containing the failure class and
+  remaining cooldown. Use it for both the HTTP `Retry-After` header and an
+  accurate operator-facing message instead of describing every WebSocket
+  failure as a timeout.
+- Treat an upstream rejection of a proxy-injected `previous_response_id` as a
+  stale continuity anchor, not as a reason to inject the same identifier into
+  another physical WebSocket. Replay immediately only when the immutable
+  durable proof covers the complete client context; otherwise quarantine the
+  logical key and recover on the next complete client resend while keeping
+  delta-only requests fail-closed.
 
 ## Impact
 
@@ -45,3 +60,8 @@ loop and require the Codex client to be restarted.
 - Adds a forward-only request-usage rollup repair migration for deployments
   already stamped at the previous merge head, so changing migration ancestry
   cannot leave startup schema-drift checks failing.
+- Clients receive a consistent integer cooldown hint and failure-class copy;
+  clients remain responsible for honoring `Retry-After` rather than exhausting
+  their local retry budget inside the advertised cooldown.
+- A stale durable response anchor can no longer strand a long-lived desktop
+  task in an `Invalid previous_response_id` / reconnect / cooldown loop.

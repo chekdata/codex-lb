@@ -139,6 +139,21 @@ record the failure for observability. Rows older than one hour MUST be treated
 as expired and removed. A successful terminal response MUST clear the local
 and durable circuit state.
 
+When a request is suppressed, the proxy MUST obtain the retry decision from one
+atomic process-local snapshot after refreshing durable state. The decision MUST
+include the normalized last failure class and remaining suppression interval.
+State below the configured failure threshold MUST NOT suppress a request or
+enter half-open mode, even if a stale durable read carries an older cooldown
+timestamp. Once one half-open probe is admitted, its own streaming path MUST
+NOT treat that probe lease as an active cooldown; the lease only fences later
+submissions.
+The HTTP response MUST expose the ceiling of that interval as `Retry-After`, and
+the error message MUST name the recorded class (`stream_incomplete`,
+`clean_close`, or `stream_idle_timeout`) accurately rather than calling every
+failure a timeout. The same integer interval MUST be used in the message and
+the response metadata. A client MAY retry after that interval; retrying earlier
+MUST remain suppressed without dispatching another upstream request.
+
 #### Scenario: the second hard-key failure opens a durable circuit
 
 - **GIVEN** a hard-affinity key has one recorded pre-response failure
@@ -167,6 +182,124 @@ and durable circuit state.
 - **WHEN** the proxy evaluates or records a retry-circuit event
 - **THEN** the request continues using any available local circuit state
 - **AND** the failure is logged and exposed through retry-circuit observability
+
+#### Scenario: incomplete streams produce an accurate cooldown response
+
+- **GIVEN** a hard-affinity circuit is open with `last_detail = stream_incomplete`
+- **WHEN** a new HTTP request is suppressed
+- **THEN** the proxy returns HTTP 503 without dispatching upstream
+- **AND** the message identifies repeated incomplete WebSocket streams
+- **AND** `Retry-After` equals the ceiling of the same remaining interval named in the message
+
+#### Scenario: terminal success clears the circuit
+
+- **GIVEN** a hard-affinity circuit has recorded prior failures
+- **WHEN** a request on that bridge reaches `response.completed`
+- **THEN** local and durable circuit state are cleared
+- **AND** the next request is not suppressed by the settled failures
+
+#### Scenario: stale sub-threshold state is not an open circuit
+
+- **GIVEN** a local or durable retry state has fewer failures than the open threshold
+- **AND** it carries a stale cooldown timestamp
+- **WHEN** the proxy evaluates admission and streaming startup
+- **THEN** both paths admit the request without a cooldown response
+- **AND** the state does not enter half-open mode
+
+#### Scenario: admitted half-open probe does not suppress itself
+
+- **GIVEN** an open circuit cooldown expires
+- **WHEN** one half-open probe is admitted
+- **THEN** later submissions remain fenced by the half-open lease
+- **AND** the admitted probe's own stream startup proceeds without a synthetic 503
+
+### Requirement: Proven pre-dispatch closes recover without duplicate turns
+
+The upstream WebSocket adapter MUST distinguish a transport that is already in
+a terminal closed state before the adapter invokes its underlying send
+primitive. That condition MUST use a dedicated account-neutral error class and
+MUST prove that the application send primitive was not called.
+
+For an HTTP Responses request with no upstream response event, the bridge MAY
+replace the closed socket once and dispatch the request on the replacement. A
+continuity-bound request MUST still satisfy the existing proof-gated fresh-body
+replay contract before its anchor can be removed or its account can change. The
+replacement attempt MUST consume the request's single fresh-upstream retry
+allowance.
+
+Any error raised after the underlying send primitive is invoked MUST remain an
+ambiguous send failure. The proxy MUST NOT reconnect and resend from that path,
+even when the exception reports a clean WebSocket close, because the complete
+frame may already have crossed the kernel boundary.
+
+#### Scenario: socket already closed before send recovers once
+
+- **GIVEN** an HTTP bridge socket is already closed before `response.create` dispatch
+- **AND** the request is eligible for fresh-upstream recovery
+- **WHEN** the adapter is asked to send the request
+- **THEN** the adapter does not invoke the closed socket's send primitive
+- **AND** the bridge opens one replacement socket
+- **AND** the request is dispatched exactly once on that replacement
+
+#### Scenario: a second pre-dispatch close does not loop
+
+- **GIVEN** the request consumed its one fresh-upstream recovery allowance
+- **WHEN** the replacement socket is also already closed before send
+- **THEN** the proxy does not open a third socket
+- **AND** the request fails through the existing terminal transport path
+
+#### Scenario: post-dispatch close remains non-replayable
+
+- **GIVEN** the adapter invoked the underlying send primitive
+- **WHEN** that primitive raises a clean-close or transport exception
+- **THEN** delivery is treated as ambiguous
+- **AND** the proxy does not dispatch the request on another socket
+
+### Requirement: Rejected proxy continuity anchors recover without context loss
+
+When the upstream explicitly rejects a `previous_response_id` that the proxy
+injected, before any response event is observed, the bridge MUST NOT inject the
+same rejected identifier into another physical WebSocket. A request that has a
+request-bound immutable durable proof covering its complete unanchored input
+MAY clear the durable anchor with the existing owner-epoch fence and replay
+exactly once, without the rejected anchor, on the same account.
+
+When that proof is absent, the bridge MUST quarantine the logical session key,
+retire the rejected physical bridge while preserving the durable lease, and
+return a stable non-retryable-same-contract error. A later full-resend-shaped
+client request MUST take a fresh unanchored path. A delta-only request MUST keep
+the durable anchor and fail closed; the bridge MUST NOT silently discard prior
+conversation context. A completed response MUST clear the bounded quarantine.
+
+Client-supplied `previous_response_id` values MUST NOT be cleared or replayed
+unanchored by this recovery path.
+
+#### Scenario: proved complete request recovers in the same turn
+
+- **GIVEN** the upstream rejects a proxy-injected durable response anchor before any response event
+- **AND** immutable durable evidence proves the untrimmed request contains the complete conversation context
+- **WHEN** the bridge performs local recovery
+- **THEN** it clears the anchor with an owner-epoch fence
+- **AND** replays the complete request exactly once without an anchor on the same account
+- **AND** it never sends the rejected identifier again
+
+#### Scenario: unproved request quarantines and later full resend recovers
+
+- **GIVEN** the upstream rejects a proxy-injected durable response anchor before any response event
+- **AND** the current request lacks complete-context proof
+- **WHEN** the bridge handles the rejection
+- **THEN** it returns `previous_response_anchor_unrecoverable` without another upstream dispatch
+- **AND** quarantines the logical key without clearing its durable anchor
+- **WHEN** the client subsequently supplies a full-resend-shaped request
+- **THEN** the fresh bridge sends that request without the rejected anchor
+- **AND** a terminal completion clears quarantine
+
+#### Scenario: delta-only and client-owned anchors remain fail-closed
+
+- **GIVEN** a quarantined key receives only a delta payload, or the rejected anchor was client supplied
+- **WHEN** recovery is evaluated
+- **THEN** the proxy does not remove the anchor
+- **AND** it does not issue an unanchored replay that could omit prior context
 
 ### Requirement: Upstream websocket drops penalize affected accounts
 

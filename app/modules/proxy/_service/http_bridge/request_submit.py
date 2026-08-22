@@ -39,6 +39,7 @@ from app.core.clients.proxy import codex_control_request as core_codex_control_r
 from app.core.clients.proxy import compact_responses as core_compact_responses  # noqa: F401
 from app.core.clients.proxy import transcribe_audio as core_transcribe_audio  # noqa: F401
 from app.core.clients.proxy_websocket import (
+    UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE,
     UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE,
     UpstreamWebSocketTransportError,
     is_account_neutral_websocket_error_code,
@@ -90,6 +91,9 @@ from app.modules.proxy._service.http_bridge.helpers import (
 )
 from app.modules.proxy._service.http_bridge.quarantine import (
     _record_http_bridge_quarantine_wedged_pending,
+)
+from app.modules.proxy._service.http_bridge.retry_circuit import (
+    _http_bridge_retry_circuit_error_message,
 )
 from app.modules.proxy._service.http_bridge.service_stubs import (
     _call_with_supported_optional_kwargs,
@@ -642,20 +646,21 @@ class _HTTPBridgeRequestSubmitMixin:
             and request_state.response_event_count == 0
             and request_state.replay_count == 0
         )
-        if not await self._http_bridge_precreated_retry_allowed(
+        retry_decision = await self._http_bridge_precreated_retry_decision(
             session,
             allow_proof_gated_continuity_replay=allow_proof_gated_continuity_replay,
-        ):
+        )
+        if not retry_decision.allowed:
             retry_after_seconds = max(
                 1,
-                math.ceil(await self._http_bridge_precreated_retry_cooldown_seconds(session)),
+                math.ceil(retry_decision.retry_after_seconds),
             )
             _log_http_bridge_event(
                 "submit_retry_circuit_suppressed",
                 session.key,
                 account_id=session.account.id,
                 model=session.request_model,
-                detail="hard_key_cooldown",
+                detail=retry_decision.last_detail or "hard_key_cooldown",
                 cache_key_family=session.key.affinity_kind,
                 model_class=_extract_model_class(session.request_model) if session.request_model else None,
             )
@@ -663,7 +668,10 @@ class _HTTPBridgeRequestSubmitMixin:
                 503,
                 openai_error(
                     "upstream_request_timeout",
-                    "HTTP responses session bridge is cooling down after repeated upstream timeouts; retry shortly.",
+                    _http_bridge_retry_circuit_error_message(
+                        retry_decision.last_detail,
+                        retry_after_seconds=retry_after_seconds,
+                    ),
                 ),
                 retry_after_seconds=retry_after_seconds,
             )
@@ -1184,6 +1192,64 @@ class _HTTPBridgeRequestSubmitMixin:
                     upstream_send_started = True
                     try:
                         await _send_http_bridge_request_text_with_archive_id(session, request_state, text_data)
+                    except UpstreamWebSocketTransportError as exc:
+                        if exc.error_code == UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE:
+                            _log_http_bridge_event(
+                                "retry_pre_dispatch_closed",
+                                session.key,
+                                account_id=session.account.id,
+                                model=session.request_model,
+                                detail="closed_before_send",
+                                cache_key_family=session.key.affinity_kind,
+                                model_class=(
+                                    _extract_model_class(session.request_model) if session.request_model else None
+                                ),
+                            )
+                            proof_gated_fresh_body = bool(
+                                request_state.previous_response_id is not None
+                                and request_state.fresh_upstream_request_is_retry_safe
+                                and request_state.fresh_upstream_request_text
+                            )
+                            try:
+                                recovered = await self._retry_http_bridge_request_on_fresh_upstream(
+                                    session,
+                                    request_state=request_state,
+                                    text_data=text_data,
+                                    send_request=True,
+                                    require_same_account=(
+                                        _http_bridge_key_strength(session.key) == "hard" and not proof_gated_fresh_body
+                                    ),
+                                )
+                            except UpstreamWebSocketTransportError as retry_exc:
+                                # A second pre-dispatch close is still proven
+                                # unsent, but the one-shot recovery has been
+                                # consumed. Any other replacement-send failure
+                                # is ambiguous and must retain the original
+                                # send-side settlement ownership semantics.
+                                if retry_exc.error_code != UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE:
+                                    request_state.recovery_attempt_dispatched = True
+                                session.closed = True
+                                session.upstream_control.reconnect_requested = True
+                                session.upstream_control.retire_after_drain = True
+                                if retry_exc.error_code == UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE:
+                                    session.claim_liveness_settlement()
+                                raise
+                            if recovered:
+                                request_state.recovery_attempt_dispatched = True
+                                session.last_used_at = _service_time().monotonic()
+                            else:
+                                session.closed = True
+                                session.upstream_control.reconnect_requested = True
+                                session.upstream_control.retire_after_drain = True
+                                raise
+                        else:
+                            request_state.recovery_attempt_dispatched = True
+                            session.closed = True
+                            session.upstream_control.reconnect_requested = True
+                            session.upstream_control.retire_after_drain = True
+                            if exc.error_code == UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE:
+                                session.claim_liveness_settlement()
+                            raise
                     except BaseException as exc:
                         request_state.recovery_attempt_dispatched = True
                         # Publish retirement while lifecycle ownership is still

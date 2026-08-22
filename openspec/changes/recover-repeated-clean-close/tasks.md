@@ -12,3 +12,14 @@
 - [x] Add a forward-only repair for databases stamped before request-usage rollups were connected to the merge head.
 - [x] Validate the OpenSpec change and run the focused and full test suites.
 - [x] Build and deploy the validated image, then verify production health and logs.
+- [x] Classify an already-closed transport before invoking its send primitive.
+- [x] Reconnect once and send exactly once after a proven pre-dispatch close.
+- [x] Keep post-dispatch send failures ambiguous and non-replayable.
+- [x] Return an atomic retry-circuit decision with failure detail and remaining cooldown.
+- [x] Render accurate cooldown copy and one matching integer `Retry-After` value on every HTTP 503 cooldown path.
+- [x] Keep sub-threshold state out of half-open mode and prevent an admitted probe from suppressing its own stream.
+- [x] Add regressions for pre-dispatch recovery, duplicate prevention, circuit opening/reset, and cooldown rendering.
+- [x] Quarantine an explicitly rejected proxy-injected anchor and recover the next complete full resend unanchored.
+- [x] Keep incomplete/delta-only and client-owned continuity fail-closed.
+- [x] Validate the amended OpenSpec and run formatting, lint, type, focused, unit, and bridge regression gates.
+- [ ] Build and deploy the exact merged source image, then verify production rollout, health, and recovery observability.
