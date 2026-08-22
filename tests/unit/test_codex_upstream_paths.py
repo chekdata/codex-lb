@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import socket
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
 
@@ -22,7 +23,12 @@ from app.core.clients.proxy import (
     thread_goal_request,
     transcribe_audio,
 )
-from app.core.clients.proxy_websocket import UpstreamWebSocketTransportError, connect_responses_websocket
+from app.core.clients.proxy_websocket import (
+    UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE,
+    UpstreamWebSocketTransportError,
+    WebsocketsUpstreamWebSocket,
+    connect_responses_websocket,
+)
 from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest
 from app.core.upstream_proxy import ResolvedProxyEndpoint, ResolvedUpstreamRoute
 from tests.unit._proxy_test_helpers import runtime_basic_auth_url
@@ -953,6 +959,45 @@ async def test_responses_websocket_send_errors_do_not_expose_proxy_credentials(
     assert "OSError" in message
     assert "user:pass" not in message
     assert "proxy.test:8080" not in message
+
+
+@pytest.mark.asyncio
+async def test_routed_responses_websocket_proves_closed_before_send_without_invoking_transport(
+    route: ResolvedUpstreamRoute,
+) -> None:
+    client = _WsCodexClient()
+    client.websocket.closed = True
+
+    websocket = await connect_responses_websocket(
+        {"user-agent": "codex"},
+        "access",
+        "chatgpt_account",
+        base_url="https://chatgpt.test/backend-api",
+        route=route,
+        codex_client=cast(Any, client),
+    )
+
+    with pytest.raises(UpstreamWebSocketTransportError) as exc_info:
+        await websocket.send_text('{"type":"response.create"}')
+
+    assert exc_info.value.error_code == UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE
+    assert client.websocket.sent == []
+
+
+@pytest.mark.asyncio
+async def test_direct_responses_websocket_proves_closed_before_send_without_invoking_transport() -> None:
+    transport_send = AsyncMock()
+    connection = SimpleNamespace(
+        state=SimpleNamespace(name="CLOSED"),
+        send=transport_send,
+    )
+    websocket = WebsocketsUpstreamWebSocket(cast(Any, connection))
+
+    with pytest.raises(UpstreamWebSocketTransportError) as exc_info:
+        await websocket.send_text('{"type":"response.create"}')
+
+    assert exc_info.value.error_code == UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE
+    transport_send.assert_not_awaited()
 
 
 @pytest.mark.asyncio

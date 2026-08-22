@@ -2,10 +2,8 @@
 
 ### Requirement: Clean upstream close before any response event fails fast
 
-When the HTTP Responses bridge observes an upstream WebSocket close with
-`close_code = 1000` before any `response.*` event has been surfaced for the
-pending request, the proxy MUST preserve its existing pre-visible replay
-guards. If the request has already used exactly one eligible pre-visible
+When the HTTP Responses bridge observes an upstream WebSocket close with `close_code = 1000` before any `response.*` event has been surfaced for the pending request, the proxy MUST preserve its existing pre-visible replay guards.
+If the request has already used exactly one eligible pre-visible
 replay and the replacement upstream WebSocket also closes cleanly before any
 response event, the proxy MAY perform exactly one additional replay. The
 additional replay MUST be hard-capped at one per request, and the configured
@@ -40,6 +38,14 @@ continuity anchor MUST receive at most two retire-thresholds of grace before
 being considered stale. When the watchdog skips a candidate, it MUST emit a
 low-cardinality diagnostic containing the session-closed state, candidate
 count, and pending-state verdicts.
+
+#### Scenario: clean close before response.created is not retried
+
+- **GIVEN** an HTTP bridge request is not eligible under the pre-visible replay guards
+- **WHEN** upstream closes the bridge with `close_code = 1000` before any
+  `response.*` event for the pending request
+- **THEN** the proxy returns HTTP 502 through the existing rejected-input path
+- **AND** does not transparently replay the request
 
 #### Scenario: clean close before response output receives one bounded additional replay
 
@@ -139,6 +145,21 @@ record the failure for observability. Rows older than one hour MUST be treated
 as expired and removed. A successful terminal response MUST clear the local
 and durable circuit state.
 
+When a request is suppressed, the proxy MUST obtain the retry decision from one
+atomic process-local snapshot after refreshing durable state. The decision MUST
+include the normalized last failure class and remaining suppression interval.
+State below the configured failure threshold MUST NOT suppress a request or
+enter half-open mode, even if a stale durable read carries an older cooldown
+timestamp. Once one half-open probe is admitted, its own streaming path MUST
+NOT treat that probe lease as an active cooldown; the lease only fences later
+submissions.
+The HTTP response MUST expose the ceiling of that interval as `Retry-After`, and
+the error message MUST name the recorded class (`stream_incomplete`,
+`clean_close`, or `stream_idle_timeout`) accurately rather than calling every
+failure a timeout. The same integer interval MUST be used in the message and
+the response metadata. A client MAY retry after that interval; retrying earlier
+MUST remain suppressed without dispatching another upstream request.
+
 #### Scenario: the second hard-key failure opens a durable circuit
 
 - **GIVEN** a hard-affinity key has one recorded pre-response failure
@@ -168,10 +189,181 @@ and durable circuit state.
 - **THEN** the request continues using any available local circuit state
 - **AND** the failure is logged and exposed through retry-circuit observability
 
+#### Scenario: incomplete streams produce an accurate cooldown response
+
+- **GIVEN** a hard-affinity circuit is open with `last_detail = stream_incomplete`
+- **WHEN** a new HTTP request is suppressed
+- **THEN** the proxy returns HTTP 503 without dispatching upstream
+- **AND** the message identifies repeated incomplete WebSocket streams
+- **AND** `Retry-After` equals the ceiling of the same remaining interval named in the message
+
+#### Scenario: terminal success clears the circuit
+
+- **GIVEN** a hard-affinity circuit has recorded prior failures
+- **WHEN** a request on that bridge reaches `response.completed`
+- **THEN** local and durable circuit state are cleared
+- **AND** the next request is not suppressed by the settled failures
+
+#### Scenario: stale sub-threshold state is not an open circuit
+
+- **GIVEN** a local or durable retry state has fewer failures than the open threshold
+- **AND** it carries a stale cooldown timestamp
+- **WHEN** the proxy evaluates admission and streaming startup
+- **THEN** both paths admit the request without a cooldown response
+- **AND** the state does not enter half-open mode
+
+#### Scenario: admitted half-open probe does not suppress itself
+
+- **GIVEN** an open circuit cooldown expires
+- **WHEN** one half-open probe is admitted
+- **THEN** later submissions remain fenced by the half-open lease
+- **AND** the admitted probe's own stream startup proceeds without a synthetic 503
+
+### Requirement: Proven pre-dispatch closes recover without duplicate turns
+
+The upstream WebSocket adapter MUST distinguish a transport that is already in
+a terminal closed state before the adapter invokes its underlying send
+primitive. That condition MUST use a dedicated account-neutral error class and
+MUST prove that the application send primitive was not called.
+
+For an HTTP Responses request with no upstream response event, the bridge MAY
+replace the closed socket once and dispatch the request on the replacement. A
+continuity-bound request MUST still satisfy the existing proof-gated fresh-body
+replay contract before its anchor can be removed or its account can change. The
+replacement attempt MUST consume the request's single fresh-upstream retry
+allowance.
+
+A complete fresh-body replay proof and an account-neutral replay proof are
+independent. If the retained fresh body still contains any account-scoped
+identifier, the replacement MUST remain on the owning account even after the
+continuity anchor is safely removed. Cross-account replacement is permitted
+only when the retained body separately satisfies the account-neutral replay
+contract and the replacement also uses a new account-neutral logical key with
+all prior session and turn-state affinity headers removed. A hard-affinity
+session that has not performed that explicit fork MUST remain on its owning
+account even when its retained body is account neutral. A physical-socket-only
+replacement that preserves the current logical key and reconnect handshake
+MUST remain on the owning account for soft-affinity keys as well. It MUST NOT
+treat body neutrality alone as proof that old turn state may cross accounts.
+
+Any error raised after the underlying send primitive is invoked MUST remain an
+ambiguous send failure. The proxy MUST NOT reconnect and resend from that path,
+even when the exception reports a clean WebSocket close, because the complete
+frame may already have crossed the kernel boundary.
+
+#### Scenario: socket already closed before send recovers once
+
+- **GIVEN** an HTTP bridge socket is already closed before `response.create` dispatch
+- **AND** the request is eligible for fresh-upstream recovery
+- **WHEN** the adapter is asked to send the request
+- **THEN** the adapter does not invoke the closed socket's send primitive
+- **AND** the bridge opens one replacement socket
+- **AND** the request is dispatched exactly once on that replacement
+
+#### Scenario: a second pre-dispatch close does not loop
+
+- **GIVEN** the request consumed its one fresh-upstream recovery allowance
+- **WHEN** the replacement socket is also already closed before send
+- **THEN** the proxy does not open a third socket
+- **AND** the request fails through the existing terminal transport path
+
+#### Scenario: complete but account-scoped fresh body stays on its owner
+
+- **GIVEN** a continuity-bound request has a complete fresh-body replay proof
+- **AND** that fresh body still contains an account-scoped conversation,
+  prompt, hosted input item, or file identifier
+- **WHEN** the original socket is proven closed before send
+- **THEN** the bridge may remove the continuity anchor for the one-shot retry
+- **AND** the replacement remains bound to the original owning account
+
+#### Scenario: only an account-neutral fresh body may change accounts
+
+- **GIVEN** a continuity-bound request has both a complete fresh-body replay
+  proof and a separate account-neutral replay proof
+- **WHEN** the original socket is proven closed before send
+- **AND** the bridge establishes a new account-neutral logical key and strips
+  all prior session and turn-state affinity headers
+- **THEN** the one-shot replacement may select another eligible account
+
+#### Scenario: hard affinity stays on its owner without an explicit fork
+
+- **GIVEN** a continuity-bound request has an account-neutral fresh-body proof
+- **AND** its current bridge still has a hard session or turn-state affinity key
+- **WHEN** the original socket is proven closed before send
+- **THEN** the replacement remains on the original owning account
+- **AND** no old session or turn-state identifier is sent to another account
+
+#### Scenario: soft affinity stays on its owner without an explicit fork
+
+- **GIVEN** a continuity-bound request has an account-neutral fresh-body proof
+- **AND** its current bridge has a soft prompt-cache or sticky affinity key
+- **WHEN** the original socket is proven closed before send
+- **AND** recovery replaces only the physical socket while retaining the
+  current logical key and reconnect handshake
+- **THEN** the replacement remains on the original owning account
+- **AND** no old session or turn-state identifier is sent to another account
+
+#### Scenario: post-dispatch close remains non-replayable
+
+- **GIVEN** the adapter invoked the underlying send primitive
+- **WHEN** that primitive raises a clean-close or transport exception
+- **THEN** delivery is treated as ambiguous
+- **AND** the proxy does not dispatch the request on another socket
+
+### Requirement: Rejected proxy continuity anchors recover without context loss
+
+When the upstream explicitly rejects a proxy-injected `previous_response_id` before any response event is observed, the bridge MUST NOT inject the
+same rejected identifier into another physical WebSocket. A request that has a
+request-bound immutable durable proof covering its complete unanchored input
+MAY bypass the rejected anchor and replay exactly once, without that anchor, on
+the same account. The bridge MUST retain the previous durable anchor until the
+replacement reaches terminal completion and atomically publishes its new
+checkpoint.
+
+When that proof is absent, the bridge MUST quarantine the logical session key,
+retire the rejected physical bridge while preserving the durable lease, and
+return a stable non-retryable-same-contract error. A later full-resend-shaped
+client request MUST take a fresh unanchored path only when its request-bound
+durable proof exactly matches the current durable owner and proves complete
+conversation context. A merely full-resend-shaped request and a delta-only
+request MUST keep the durable anchor and fail closed; the bridge MUST NOT
+silently discard prior conversation context. A completed response MUST clear
+the bounded quarantine.
+
+Client-supplied `previous_response_id` values MUST NOT be cleared or replayed
+unanchored by this recovery path.
+
+#### Scenario: proved complete request recovers in the same turn
+
+- **GIVEN** the upstream rejects a proxy-injected durable response anchor before any response event
+- **AND** immutable durable evidence proves the untrimmed request contains the complete conversation context
+- **WHEN** the bridge performs local recovery
+- **THEN** it retains the previous durable anchor until replacement completion
+- **AND** replays the complete request exactly once without an anchor on the same account
+- **AND** terminal completion atomically replaces the durable anchor
+- **AND** a failed replacement leaves the previous durable anchor available for a later verified retry
+
+#### Scenario: unproved request quarantines and only a durably proved full resend recovers
+
+- **GIVEN** the upstream rejects a proxy-injected durable response anchor before any response event
+- **AND** the current request lacks complete-context proof
+- **WHEN** the bridge handles the rejection
+- **THEN** it returns `previous_response_anchor_unrecoverable` without another upstream dispatch
+- **AND** quarantines the logical key without clearing its durable anchor
+- **WHEN** the client subsequently supplies a full-resend-shaped request whose immutable proof exactly matches the durable owner and complete context
+- **THEN** the fresh bridge sends that request without the rejected anchor
+- **AND** a terminal completion clears quarantine
+
+#### Scenario: delta-only and client-owned anchors remain fail-closed
+
+- **GIVEN** a quarantined key receives a delta payload or a full-resend-shaped payload without exact durable completeness proof, or the rejected anchor was client supplied
+- **WHEN** recovery is evaluated
+- **THEN** the proxy does not remove the anchor
+- **AND** it does not issue an unanchored replay that could omit prior context
+
 ### Requirement: Upstream websocket drops penalize affected accounts
 
-When an upstream websocket closes while one or more streamed response requests
-are pending and have not reached a terminal event, the proxy MUST record a
+When an upstream websocket closes while one or more streamed response requests are pending and have not reached a terminal event, the proxy MUST record a
 transient upstream error for the account before signaling failure for those
 pending requests, except when the close carries a classified process-wide
 network failure, is a clean close (`close_code = 1000`) before any
@@ -182,6 +374,37 @@ and retry-circuit handling above. A classified process-wide network failure
 MUST remain account neutral and use its network error code. For other closes,
 the proxy MUST surface
 `stream_incomplete` to affected pending requests.
+
+#### Scenario: websocket closes before pending responses complete
+
+- **GIVEN** a streamed response request is pending on an upstream websocket
+- **AND** the direct downstream response has not emitted a numeric sequence,
+  or the request uses another transport
+- **WHEN** the websocket closes before a terminal response event is observed
+- **AND** the close is not an account-neutral clean pre-response close,
+  process-wide network failure, or upstream WebSocket liveness timeout
+- **THEN** the pending request fails with `stream_incomplete`
+- **AND** the account receives a transient upstream failure signal for routing
+
+#### Scenario: sequenced direct websocket closes before completion
+
+- **GIVEN** a direct Responses WebSocket request has successfully emitted a
+  finite integer `sequence_number`
+- **WHEN** the upstream websocket closes before a terminal response event is observed
+- **AND** the close is not an account-neutral clean pre-response close,
+  process-wide network failure, or upstream WebSocket liveness timeout
+- **THEN** the request is recorded as failed with `stream_incomplete`
+- **AND** no synthetic terminal frame is emitted under the active response id
+- **AND** the downstream WebSocket closes with code 1011
+- **AND** the account receives a transient upstream failure signal for routing
+
+#### Scenario: websocket liveness timeout remains account neutral
+
+- **GIVEN** a streamed response request is pending on an upstream websocket
+- **WHEN** its transport reports `upstream_websocket_liveness_timeout`
+- **THEN** the pending request fails with that classified error code
+- **AND** the account receives no failure-health signal
+- **AND** the request is not transparently replayed
 
 #### Scenario: clean pre-response close does not penalize the account
 

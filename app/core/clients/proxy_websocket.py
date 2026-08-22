@@ -79,6 +79,7 @@ REALTIME_LIVE_CALL_ID_ROUTE_REGEX = (
 )
 _LIVE_CALL_ID_PATTERN = re.compile(rf"{REALTIME_LIVE_CALL_ID_ROUTE_REGEX}\Z")
 UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE = "upstream_websocket_liveness_timeout"
+UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE = "upstream_websocket_closed_before_send"
 _WEBSOCKETS_KEEPALIVE_TIMEOUT_REASON = "keepalive ping timeout"
 _AIOHTTP_HEARTBEAT_TIMEOUT_PREFIX = "No PONG received after "
 
@@ -200,9 +201,19 @@ def is_account_neutral_websocket_error_code(error_code: str | None) -> bool:
     # the compatibility keepalive code here as long as adapters can emit it.
     return error_code in {
         PROCESS_NETWORK_UNAVAILABLE_CODE,
+        UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE,
         UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE,
         "upstream_keepalive_timeout",
     }
+
+
+def _raise_websocket_closed_before_send() -> NoReturn:
+    """Raise only when the adapter has not invoked the transport send primitive."""
+
+    raise UpstreamWebSocketTransportError(
+        "Upstream websocket was already closed before send",
+        error_code=UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE,
+    )
 
 
 def _is_websocket_liveness_timeout(exc: BaseException) -> bool:
@@ -308,12 +319,18 @@ class WebsocketsUpstreamWebSocket:
             connection_lost_waiter.add_done_callback(_consume_connection_lost_exception)
 
     async def send_text(self, text: str) -> None:
+        state = getattr(self._connection, "state", None)
+        if state is not None and getattr(state, "name", None) != "OPEN":
+            _raise_websocket_closed_before_send()
         try:
             await self._connection.send(text)
         except Exception as exc:
             await _raise_websocket_send_error(exc, uses_proxy=self._uses_proxy)
 
     async def send_bytes(self, data: bytes) -> None:
+        state = getattr(self._connection, "state", None)
+        if state is not None and getattr(state, "name", None) != "OPEN":
+            _raise_websocket_closed_before_send()
         try:
             await self._connection.send(data)
         except Exception as exc:
@@ -408,6 +425,8 @@ class CodexUpstreamWebSocket:
         self._response_headers = _normalize_response_headers(response_headers)
 
     async def send_text(self, text: str) -> None:
+        if bool(getattr(self._websocket, "closed", False)):
+            _raise_websocket_closed_before_send()
         try:
             result = self._websocket.send_str(text)
             if asyncio.iscoroutine(result):
@@ -417,6 +436,8 @@ class CodexUpstreamWebSocket:
             await _raise_websocket_send_error(classification_exc, endpoint_id=self._endpoint_id, uses_proxy=True)
 
     async def send_bytes(self, data: bytes) -> None:
+        if bool(getattr(self._websocket, "closed", False)):
+            _raise_websocket_closed_before_send()
         try:
             result = self._websocket.send_bytes(data)
             if asyncio.iscoroutine(result):

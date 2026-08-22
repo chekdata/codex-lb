@@ -39,6 +39,7 @@ from app.core.clients.proxy import codex_control_request as core_codex_control_r
 from app.core.clients.proxy import compact_responses as core_compact_responses  # noqa: F401
 from app.core.clients.proxy import transcribe_audio as core_transcribe_audio  # noqa: F401
 from app.core.clients.proxy_websocket import (
+    UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE,
     UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE,
     UpstreamWebSocketTransportError,
     is_account_neutral_websocket_error_code,
@@ -90,6 +91,9 @@ from app.modules.proxy._service.http_bridge.helpers import (
 )
 from app.modules.proxy._service.http_bridge.quarantine import (
     _record_http_bridge_quarantine_wedged_pending,
+)
+from app.modules.proxy._service.http_bridge.retry_circuit import (
+    _http_bridge_retry_circuit_error_message,
 )
 from app.modules.proxy._service.http_bridge.service_stubs import (
     _call_with_supported_optional_kwargs,
@@ -642,20 +646,21 @@ class _HTTPBridgeRequestSubmitMixin:
             and request_state.response_event_count == 0
             and request_state.replay_count == 0
         )
-        if not await self._http_bridge_precreated_retry_allowed(
+        retry_decision = await self._http_bridge_precreated_retry_decision(
             session,
             allow_proof_gated_continuity_replay=allow_proof_gated_continuity_replay,
-        ):
+        )
+        if not retry_decision.allowed:
             retry_after_seconds = max(
                 1,
-                math.ceil(await self._http_bridge_precreated_retry_cooldown_seconds(session)),
+                math.ceil(retry_decision.retry_after_seconds),
             )
             _log_http_bridge_event(
                 "submit_retry_circuit_suppressed",
                 session.key,
                 account_id=session.account.id,
                 model=session.request_model,
-                detail="hard_key_cooldown",
+                detail=retry_decision.last_detail or "hard_key_cooldown",
                 cache_key_family=session.key.affinity_kind,
                 model_class=_extract_model_class(session.request_model) if session.request_model else None,
             )
@@ -663,7 +668,10 @@ class _HTTPBridgeRequestSubmitMixin:
                 503,
                 openai_error(
                     "upstream_request_timeout",
-                    "HTTP responses session bridge is cooling down after repeated upstream timeouts; retry shortly.",
+                    _http_bridge_retry_circuit_error_message(
+                        retry_decision.last_detail,
+                        retry_after_seconds=retry_after_seconds,
+                    ),
                 ),
                 retry_after_seconds=retry_after_seconds,
             )
@@ -1184,6 +1192,161 @@ class _HTTPBridgeRequestSubmitMixin:
                     upstream_send_started = True
                     try:
                         await _send_http_bridge_request_text_with_archive_id(session, request_state, text_data)
+                    except UpstreamWebSocketTransportError as exc:
+                        if exc.error_code == UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE:
+                            _log_http_bridge_event(
+                                "retry_pre_dispatch_closed",
+                                session.key,
+                                account_id=session.account.id,
+                                model=session.request_model,
+                                detail="closed_before_send",
+                                cache_key_family=session.key.affinity_kind,
+                                model_class=(
+                                    _extract_model_class(session.request_model) if session.request_model else None
+                                ),
+                            )
+                            try:
+                                recovered = await self._retry_http_bridge_request_on_fresh_upstream(
+                                    session,
+                                    request_state=request_state,
+                                    text_data=text_data,
+                                    send_request=True,
+                                    # Replacing the physical socket preserves
+                                    # the current logical bridge key and its
+                                    # session/turn-state handshake. Until this
+                                    # path performs an explicit account-neutral
+                                    # fork with stripped affinity headers, it
+                                    # must stay on the current owner for both
+                                    # hard and soft keys.
+                                    require_same_account=True,
+                                )
+                            except UpstreamWebSocketTransportError as retry_exc:
+                                # A second pre-dispatch close is still proven
+                                # unsent, but the one-shot recovery has been
+                                # consumed. Any other replacement-send failure
+                                # is ambiguous and must retain the original
+                                # send-side settlement ownership semantics.
+                                second_pre_dispatch_close = (
+                                    retry_exc.error_code == UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE
+                                )
+                                if not second_pre_dispatch_close:
+                                    request_state.recovery_attempt_dispatched = True
+                                session.closed = True
+                                session.upstream_control.reconnect_requested = True
+                                session.upstream_control.retire_after_drain = True
+                                if second_pre_dispatch_close and recovery_receipt is not None:
+                                    # Both physical sockets rejected the send
+                                    # before any bytes were dispatched. The
+                                    # reversible turn-state alias therefore
+                                    # still belongs to the predecessor and
+                                    # must be restored before surfacing the
+                                    # one-shot recovery failure. Leaving the
+                                    # alias on this retiring session would
+                                    # fence the next safe retry onto a request
+                                    # that upstream never observed.
+                                    rollback_cancellation: asyncio.CancelledError | None = None
+                                    async with session.recovery_alias_lock:
+                                        try:
+                                            (
+                                                rolled_back,
+                                                rollback_cancellation,
+                                            ) = await _rollback_http_bridge_recovery_turn_state_registration(
+                                                self,
+                                                recovery_receipt,
+                                            )
+                                        except Exception:
+                                            rolled_back = False
+                                            logger.warning(
+                                                "Failed to roll back unsent HTTP bridge recovery alias",
+                                                exc_info=True,
+                                            )
+                                    recovery_receipt = None
+                                    if not rolled_back:
+                                        _record_continuity_fail_closed(
+                                            surface="http_bridge",
+                                            reason="recovery_alias_rollback_failed",
+                                            previous_response_id=request_state.previous_response_id,
+                                            session_id=request_state.session_id,
+                                            upstream_error_code="bridge_continuity_persistence_failed",
+                                        )
+                                        raise ProxyResponseError(
+                                            502,
+                                            openai_error(
+                                                "bridge_continuity_persistence_failed",
+                                                (
+                                                    "The unsent recovery alias could not be restored safely; "
+                                                    "retry the request."
+                                                ),
+                                            ),
+                                        ) from retry_exc
+                                    if rollback_cancellation is not None:
+                                        raise rollback_cancellation
+                                if retry_exc.error_code == UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE:
+                                    session.claim_liveness_settlement()
+                                raise
+                            if recovered:
+                                request_state.recovery_attempt_dispatched = True
+                                session.last_used_at = _service_time().monotonic()
+                            else:
+                                session.closed = True
+                                session.upstream_control.reconnect_requested = True
+                                session.upstream_control.retire_after_drain = True
+                                if (
+                                    recovery_receipt is not None
+                                    and not request_state.fresh_upstream_send_primitive_reached
+                                ):
+                                    # Reconnect/setup failed before the
+                                    # replacement send primitive was reached.
+                                    # No physical socket observed this turn,
+                                    # so restore the predecessor alias instead
+                                    # of fencing the next retry onto an
+                                    # undispatched request.
+                                    rollback_cancellation: asyncio.CancelledError | None = None
+                                    async with session.recovery_alias_lock:
+                                        try:
+                                            (
+                                                rolled_back,
+                                                rollback_cancellation,
+                                            ) = await _rollback_http_bridge_recovery_turn_state_registration(
+                                                self,
+                                                recovery_receipt,
+                                            )
+                                        except Exception:
+                                            rolled_back = False
+                                            logger.warning(
+                                                "Failed to roll back HTTP bridge recovery alias after setup failure",
+                                                exc_info=True,
+                                            )
+                                    recovery_receipt = None
+                                    if not rolled_back:
+                                        _record_continuity_fail_closed(
+                                            surface="http_bridge",
+                                            reason="recovery_alias_rollback_failed",
+                                            previous_response_id=request_state.previous_response_id,
+                                            session_id=request_state.session_id,
+                                            upstream_error_code="bridge_continuity_persistence_failed",
+                                        )
+                                        raise ProxyResponseError(
+                                            502,
+                                            openai_error(
+                                                "bridge_continuity_persistence_failed",
+                                                (
+                                                    "The unsent recovery alias could not be restored safely; "
+                                                    "retry the request."
+                                                ),
+                                            ),
+                                        ) from exc
+                                    if rollback_cancellation is not None:
+                                        raise rollback_cancellation
+                                raise
+                        else:
+                            request_state.recovery_attempt_dispatched = True
+                            session.closed = True
+                            session.upstream_control.reconnect_requested = True
+                            session.upstream_control.retire_after_drain = True
+                            if exc.error_code == UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE:
+                                session.claim_liveness_settlement()
+                            raise
                     except BaseException as exc:
                         request_state.recovery_attempt_dispatched = True
                         # Publish retirement while lifecycle ownership is still
@@ -1205,7 +1368,10 @@ class _HTTPBridgeRequestSubmitMixin:
                     request_state.recovery_attempt_dispatched = True
                     session.last_used_at = _service_time().monotonic()
                 except asyncio.CancelledError:
-                    if recovery_receipt is not None and not upstream_send_started:
+                    recovery_alias_is_proven_unsent = not upstream_send_started or (
+                        request_state.replay_count > 0 and not request_state.fresh_upstream_send_primitive_reached
+                    )
+                    if recovery_receipt is not None and recovery_alias_is_proven_unsent:
                         session.closed = True
                         session.upstream_control.reconnect_requested = True
                         session.upstream_control.retire_after_drain = True
@@ -1926,10 +2092,12 @@ class _HTTPBridgeRequestSubmitMixin:
         send_request: bool = True,
         require_same_account: bool = False,
     ) -> bool:
-        require_same_account = require_same_account or is_http_bridge_account_neutral_replay(
-            kind=session.key.affinity_kind,
-            key=session.key.affinity_key,
-        )
+        # This helper replaces only the physical WebSocket. It does not create
+        # a new account-neutral logical key or strip the existing session and
+        # turn-state handshake. Consequently every replacement remains pinned
+        # to the current account. Keep the argument for the internal call
+        # contract, but fail closed if any caller attempts to loosen it.
+        require_same_account = True
         retry_text_data = text_data
         using_fresh_replay = False
         if request_state.previous_response_id is not None and send_request:
@@ -1948,11 +2116,17 @@ class _HTTPBridgeRequestSubmitMixin:
                 return False
             retry_text_data = request_state.fresh_upstream_request_text
             using_fresh_replay = True
+            if (
+                _http_bridge_key_strength(session.key) == "hard"
+                or not request_state.fresh_upstream_request_is_account_neutral
+            ):
+                require_same_account = True
         if request_state.replay_count >= 1:
             return False
         if request_state.response_event_count > 0:
             return False
         request_state.replay_count += 1
+        request_state.fresh_upstream_send_primitive_reached = False
         _log_http_bridge_event(
             "retry_fresh_upstream",
             session.key,
@@ -1979,6 +2153,7 @@ class _HTTPBridgeRequestSubmitMixin:
                     request_state.previous_response_id = None
                     request_state.proxy_injected_previous_response_id = False
                     request_state.request_text = retry_text_data
+                request_state.fresh_upstream_send_primitive_reached = True
                 await _send_http_bridge_request_text_with_archive_id(session, request_state, retry_text_data)
             _clear_websocket_request_error_overrides(request_state)
             session.last_used_at = _service_time().monotonic()

@@ -791,6 +791,11 @@ class _WebSocketRequestState:
     # send. Retries replace this value so admission wait and prior attempts do
     # not age a fresh send into the eventless owner deadline.
     response_create_sent_at: float | None = None
+    # Set immediately before the one-shot replacement path invokes its send
+    # primitive. A cancellation while reconnecting is still proven unsent and
+    # may roll back a reversible recovery alias; cancellation after this point
+    # is ambiguous and must retain the alias/fail closed.
+    fresh_upstream_send_primitive_reached: bool = False
     bridge_queue_wait_started_at: float | None = None
     # Monotonic deadline of the original bridge request budget. Retry and
     # recovery paths re-prepare request states with a fresh started_at, so
@@ -868,6 +873,11 @@ class _WebSocketRequestState:
     # on, and dropping the anchor there would silently turn a continuation into
     # a context-free fresh turn.
     fresh_upstream_request_is_retry_safe: bool = False
+    # True only when the retained fresh body is also proven free of
+    # account-scoped identifiers (for example conversation, prompt, hosted
+    # input items, or uploaded files). Replay safety proves context
+    # completeness; it does not by itself authorize changing accounts.
+    fresh_upstream_request_is_account_neutral: bool = False
     # Stable fingerprint used by the durable recovery-attempt journal. It is
     # populated only for a proof-gated fresh replay candidate.
     recovery_attempt_fingerprint: str | None = None

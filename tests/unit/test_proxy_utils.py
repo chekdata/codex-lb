@@ -37518,6 +37518,72 @@ async def test_reconnect_http_bridge_skips_extra_same_account_retry_after_keepal
 
 
 @pytest.mark.asyncio
+async def test_reconnect_http_bridge_soft_key_same_account_requirement_rejects_selector_drift(monkeypatch):
+    settings = _make_proxy_settings()
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    owner_account = _make_account("acc_bridge_soft_owner")
+    foreign_account = _make_account("acc_bridge_soft_foreign")
+    observed_selection: dict[str, object] = {}
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(proxy_service.time, "monotonic", lambda: 10.0)
+
+    async def select_account(_deadline: float, **kwargs: object) -> AccountSelection:
+        observed_selection.update(kwargs)
+        # Deliberately violate the selection contract. The reconnect layer must
+        # independently reject this instead of carrying the soft session and
+        # turn-state handshake to another account.
+        return AccountSelection(account=foreign_account, error_message=None)
+
+    monkeypatch.setattr(service, "_select_account_with_budget_for_stream", select_account)
+    ensure_fresh = AsyncMock(return_value=foreign_account)
+    open_upstream = AsyncMock()
+    monkeypatch.setattr(service, "_ensure_fresh_with_budget", ensure_fresh)
+    monkeypatch.setattr(service, "_open_upstream_websocket_with_budget", open_upstream)
+
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req_bridge_soft_owner",
+        model="gpt-5.5",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=10.0,
+    )
+    session = proxy_service._HTTPBridgeSession(
+        key=proxy_service._HTTPBridgeSessionKey("prompt_cache", "bridge-soft-owner", None),
+        headers={"x-codex-turn-state": "turn-state-soft-owner"},
+        affinity=proxy_service._AffinityPolicy(key="bridge-soft-owner"),
+        request_model="gpt-5.5",
+        account=owner_account,
+        upstream=AsyncMock(),
+        upstream_control=proxy_service._WebSocketUpstreamControl(),
+        pending_requests=deque([request_state]),
+        pending_lock=anyio.Lock(),
+        response_create_gate=asyncio.Semaphore(1),
+        queued_request_count=1,
+        last_used_at=0.0,
+        idle_ttl_seconds=30.0,
+        upstream_turn_state="turn-state-soft-owner",
+        downstream_turn_state="turn-state-soft-owner",
+        last_upstream_close_code=1000,
+    )
+
+    with pytest.raises(proxy_module.ProxyResponseError) as exc_info:
+        await service._reconnect_http_bridge_session(
+            session,
+            request_state=request_state,
+            require_same_account=True,
+        )
+
+    assert _proxy_error_code(exc_info.value) == "previous_response_owner_unavailable"
+    assert observed_selection["preferred_account_id"] == owner_account.id
+    assert observed_selection["fallback_on_preferred_account_unavailable"] is False
+    ensure_fresh.assert_not_awaited()
+    open_upstream.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_reconnect_http_bridge_discards_model_fallback_before_selected_replacement_failure(monkeypatch):
     settings = _make_proxy_settings()
     service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
@@ -40809,7 +40875,7 @@ async def test_retry_http_bridge_request_on_fresh_upstream_uses_archive_request_
         session,
         request_state=request_state,
         restart_reader=True,
-        require_same_account=False,
+        require_same_account=True,
     )
     send_text.assert_awaited_once_with('{"type":"response.create","model":"gpt-5.1","input":"retry"}')
     assert send_request_ids == ["archive_bridge_retry_fresh"]
