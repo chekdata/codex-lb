@@ -1211,10 +1211,14 @@ class _HTTPBridgeRequestSubmitMixin:
                                     request_state=request_state,
                                     text_data=text_data,
                                     send_request=True,
-                                    require_same_account=(
-                                        request_state.file_required_preferred_account
-                                        or _http_bridge_key_strength(session.key) == "hard"
-                                    ),
+                                    # Replacing the physical socket preserves
+                                    # the current logical bridge key and its
+                                    # session/turn-state handshake. Until this
+                                    # path performs an explicit account-neutral
+                                    # fork with stripped affinity headers, it
+                                    # must stay on the current owner for both
+                                    # hard and soft keys.
+                                    require_same_account=True,
                                 )
                             except UpstreamWebSocketTransportError as retry_exc:
                                 # A second pre-dispatch close is still proven
@@ -2088,10 +2092,12 @@ class _HTTPBridgeRequestSubmitMixin:
         send_request: bool = True,
         require_same_account: bool = False,
     ) -> bool:
-        require_same_account = require_same_account or is_http_bridge_account_neutral_replay(
-            kind=session.key.affinity_kind,
-            key=session.key.affinity_key,
-        )
+        # This helper replaces only the physical WebSocket. It does not create
+        # a new account-neutral logical key or strip the existing session and
+        # turn-state handshake. Consequently every replacement remains pinned
+        # to the current account. Keep the argument for the internal call
+        # contract, but fail closed if any caller attempts to loosen it.
+        require_same_account = True
         retry_text_data = text_data
         using_fresh_replay = False
         if request_state.previous_response_id is not None and send_request:

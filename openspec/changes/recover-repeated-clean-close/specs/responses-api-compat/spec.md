@@ -241,7 +241,10 @@ only when the retained body separately satisfies the account-neutral replay
 contract and the replacement also uses a new account-neutral logical key with
 all prior session and turn-state affinity headers removed. A hard-affinity
 session that has not performed that explicit fork MUST remain on its owning
-account even when its retained body is account neutral.
+account even when its retained body is account neutral. A physical-socket-only
+replacement that preserves the current logical key and reconnect handshake
+MUST remain on the owning account for soft-affinity keys as well. It MUST NOT
+treat body neutrality alone as proof that old turn state may cross accounts.
 
 Any error raised after the underlying send primitive is invoked MUST remain an
 ambiguous send failure. The proxy MUST NOT reconnect and resend from that path,
@@ -287,6 +290,16 @@ frame may already have crossed the kernel boundary.
 - **GIVEN** a continuity-bound request has an account-neutral fresh-body proof
 - **AND** its current bridge still has a hard session or turn-state affinity key
 - **WHEN** the original socket is proven closed before send
+- **THEN** the replacement remains on the original owning account
+- **AND** no old session or turn-state identifier is sent to another account
+
+#### Scenario: soft affinity stays on its owner without an explicit fork
+
+- **GIVEN** a continuity-bound request has an account-neutral fresh-body proof
+- **AND** its current bridge has a soft prompt-cache or sticky affinity key
+- **WHEN** the original socket is proven closed before send
+- **AND** recovery replaces only the physical socket while retaining the
+  current logical key and reconnect handshake
 - **THEN** the replacement remains on the original owning account
 - **AND** no old session or turn-state identifier is sent to another account
 

@@ -18964,11 +18964,17 @@ async def test_submit_http_bridge_request_keeps_uploaded_file_recovery_on_owner_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "account_neutral",
-    [False, True],
+    ("key_kind", "account_neutral"),
+    [
+        ("session_header", False),
+        ("session_header", True),
+        ("prompt_cache", False),
+        ("prompt_cache", True),
+    ],
 )
-async def test_submit_http_bridge_request_keeps_hard_affinity_fresh_body_on_owner(
+async def test_submit_http_bridge_request_keeps_current_logical_key_on_owner(
     monkeypatch: pytest.MonkeyPatch,
+    key_kind: str,
     account_neutral: bool,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
@@ -19002,7 +19008,13 @@ async def test_submit_http_bridge_request_keeps_hard_affinity_fresh_body_on_owne
         transport="http",
         skip_request_log=True,
     )
-    session = _make_bridge_session(key_value=f"fresh-body-account-neutral-{account_neutral}")
+    session = _make_bridge_session(
+        key=proxy_service._HTTPBridgeSessionKey(
+            key_kind,
+            f"fresh-body-account-neutral-{account_neutral}",
+            None,
+        )
+    )
     session.upstream = cast(
         UpstreamWebSocket,
         SimpleNamespace(send_text=closed_send, close=AsyncMock()),
@@ -19389,7 +19401,7 @@ async def test_retry_http_bridge_request_on_fresh_upstream_reconnects_without_re
         session,
         request_state=request_state,
         restart_reader=True,
-        require_same_account=False,
+        require_same_account=True,
     )
     send_text.assert_not_awaited()
 
@@ -19973,7 +19985,7 @@ async def test_retry_http_bridge_request_on_fresh_upstream_refuses_to_resend_pre
     ("key_kind", "account_neutral", "expected_require_same_account"),
     [
         ("session_header", True, True),
-        ("prompt_cache", True, False),
+        ("prompt_cache", True, True),
         ("prompt_cache", False, True),
     ],
 )

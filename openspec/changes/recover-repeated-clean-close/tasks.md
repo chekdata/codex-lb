@@ -15,6 +15,7 @@
 - [x] Classify an already-closed transport before invoking its send primitive.
 - [x] Reconnect once and send exactly once after a proven pre-dispatch close.
 - [x] Require a separate account-neutral proof before a fresh-body retry may change accounts.
+- [x] Keep physical-socket-only recovery pinned to the owning account until an explicit account-neutral logical fork strips prior affinity state.
 - [x] Keep post-dispatch send failures ambiguous and non-replayable.
 - [x] Return an atomic retry-circuit decision with failure detail and remaining cooldown.
 - [x] Render accurate cooldown copy and one matching integer `Retry-After` value on every HTTP 503 cooldown path.
