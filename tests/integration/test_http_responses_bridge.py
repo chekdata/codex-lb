@@ -827,9 +827,10 @@ class _InvalidRequestPreviousResponseUpstreamWebSocket(_FakeBridgeUpstreamWebSoc
 class _RejectStalePreviousResponseUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
     """Reject one stale anchor but accept a proved full unanchored resend."""
 
-    def __init__(self, stale_response_id: str) -> None:
+    def __init__(self, stale_response_id: str, *, canonical_invalid_shape: bool = False) -> None:
         super().__init__(response_id_prefix="resp_recovered")
         self._stale_response_id = stale_response_id
+        self._canonical_invalid_shape = canonical_invalid_shape
 
     async def send_text(self, text: str) -> None:
         payload = json.loads(text)
@@ -837,6 +838,18 @@ class _RejectStalePreviousResponseUpstreamWebSocket(_FakeBridgeUpstreamWebSocket
             await super().send_text(text)
             return
         self.sent_text.append(text)
+        error: dict[str, object] = {
+            "type": "invalid_request_error",
+            "code": "invalid_request_error",
+            "message": f"Previous response with id '{self._stale_response_id}' not found.",
+            "param": "previous_response_id",
+        }
+        if self._canonical_invalid_shape:
+            error = {
+                "type": "invalid_request_error",
+                "code": "invalid_request_error",
+                "message": "Invalid `previous_response_id`.",
+            }
         await self._messages.put(
             _FakeUpstreamMessage(
                 "text",
@@ -844,12 +857,7 @@ class _RejectStalePreviousResponseUpstreamWebSocket(_FakeBridgeUpstreamWebSocket
                     {
                         "type": "error",
                         "status": 400,
-                        "error": {
-                            "type": "invalid_request_error",
-                            "code": "invalid_request_error",
-                            "message": (f"Previous response with id '{self._stale_response_id}' not found."),
-                            "param": "previous_response_id",
-                        },
+                        "error": error,
                     },
                     separators=(",", ":"),
                 ),
@@ -7446,6 +7454,7 @@ async def test_v1_responses_http_bridge_opens_fresh_session_for_previous_respons
 @pytest.mark.asyncio
 async def test_v1_responses_http_bridge_classifies_responses_lite_developer_interleaved_full_resend(
     async_client,
+    app_instance,
     monkeypatch,
     developer_message_extra,
     fresh_developer_message,
@@ -7487,6 +7496,37 @@ async def test_v1_responses_http_bridge_classifies_responses_lite_developer_inte
     monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
     monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
     monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    # Hold the old session's durable release across the replacement claim.
+    # Without an epoch advance, the old close can clear the new owner and the
+    # follow-up fails nondeterministically with bridge_instance_mismatch.
+    service = get_proxy_service_for_app(app_instance)
+    release_started = asyncio.Event()
+    allow_old_release = asyncio.Event()
+    old_release_finished = asyncio.Event()
+    replacement_claimed = asyncio.Event()
+    original_release = service._durable_bridge.release_live_session
+    original_claim = service._claim_durable_http_bridge_session
+    durable_claim_count = 0
+
+    async def gated_release_live_session(**kwargs):
+        release_started.set()
+        await _wait_for_event(allow_old_release)
+        try:
+            return await original_release(**kwargs)
+        finally:
+            old_release_finished.set()
+
+    async def observed_claim_durable_http_bridge_session(target_session, **kwargs):
+        nonlocal durable_claim_count
+        await original_claim(target_session, **kwargs)
+        durable_claim_count += 1
+        if durable_claim_count == 2:
+            replacement_claimed.set()
+            await _wait_for_event(old_release_finished)
+
+    monkeypatch.setattr(service._durable_bridge, "release_live_session", gated_release_live_session)
+    monkeypatch.setattr(service, "_claim_durable_http_bridge_session", observed_claim_durable_http_bridge_session)
 
     if developer_message_extra:
         scenario_id = "response-owned-developer-message"
@@ -7563,7 +7603,8 @@ async def test_v1_responses_http_bridge_classifies_responses_lite_developer_inte
             "output": "/workspace",
         },
     ]
-    second = await asyncio.wait_for(
+    await _wait_for_event(release_started)
+    second_task = asyncio.create_task(
         async_client.post(
             "/v1/responses",
             json={
@@ -7572,9 +7613,11 @@ async def test_v1_responses_http_bridge_classifies_responses_lite_developer_inte
                 "input": full_resend,
             },
             headers=session_headers,
-        ),
-        timeout=_TEST_SYNC_TIMEOUT_SECONDS,
+        )
     )
+    await _wait_for_event(replacement_claimed)
+    allow_old_release.set()
+    second = await asyncio.wait_for(second_task, timeout=_TEST_SYNC_TIMEOUT_SECONDS)
 
     assert second.status_code == 200, second.text
     assert second.json()["id"] == "resp_preserve_replay_1"
@@ -7589,6 +7632,118 @@ async def test_v1_responses_http_bridge_classifies_responses_lite_developer_inte
         assert replay_payload["input"] == full_resend
     else:
         assert replay_payload["previous_response_id"] == "resp_bridge_custom_1"
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_replacement_does_not_steal_replica_claim_during_upstream_connect(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    service = get_proxy_service_for_app(app_instance)
+    service._http_bridge_sessions.clear()
+    service._http_bridge_inflight_sessions.clear()
+    service._http_bridge_turn_state_index.clear()
+
+    settings = _make_app_settings(
+        enabled=True,
+        max_sessions=8,
+        admission_wait_timeout_seconds=1.0,
+        codex_idle_ttl_seconds=120.0,
+        instance_id="instance-a",
+        instance_ring=[],
+    )
+    _install_proxy_settings(
+        monkeypatch,
+        app_settings=settings,
+        dashboard_settings=_make_dashboard_settings(),
+    )
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_cross_replica_claim",
+        "http-bridge-cross-replica-claim@example.com",
+    )
+    session_header = "cross-replica-claim-during-connect"
+    key = proxy_module._HTTPBridgeSessionKey("session_header", session_header, None)
+    predecessor = await service._durable_bridge.claim_live_session(
+        session_key_kind=key.affinity_kind,
+        session_key_value=key.affinity_key,
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_process_epoch="process-a",
+        lease_ttl_seconds=60.0,
+        account_id=account_id,
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id=None,
+        allow_takeover=False,
+    )
+    connect_started = asyncio.Event()
+    allow_connect = asyncio.Event()
+
+    async def fake_create_http_bridge_session(self, target_key, **kwargs):
+        del self, kwargs
+        connect_started.set()
+        await _wait_for_event(allow_connect)
+        session = _make_dummy_bridge_session(target_key)
+        cast(Any, session).account = SimpleNamespace(id=account_id, status=AccountStatus.ACTIVE)
+        return session
+
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_create_http_bridge_session",
+        fake_create_http_bridge_session,
+    )
+
+    replacement = asyncio.create_task(
+        service._get_or_create_http_bridge_session(
+            key,
+            headers={"session_id": session_header},
+            affinity=proxy_module._AffinityPolicy(
+                key=session_header,
+                kind=proxy_module.StickySessionKind.CODEX_SESSION,
+            ),
+            api_key=None,
+            request_model="gpt-5.4",
+            idle_ttl_seconds=120.0,
+            max_sessions=8,
+            durable_lookup=predecessor,
+        )
+    )
+    await _wait_for_event(connect_started)
+    released = await service._durable_bridge.release_live_session(
+        session_id=predecessor.session_id,
+        instance_id="instance-a",
+        owner_epoch=predecessor.owner_epoch,
+        draining=False,
+    )
+    assert released is not None
+    competing_owner = await service._durable_bridge.claim_live_session(
+        session_key_kind=key.affinity_kind,
+        session_key_value=key.affinity_key,
+        api_key_id=None,
+        instance_id="instance-b",
+        owner_process_epoch="process-b",
+        lease_ttl_seconds=60.0,
+        account_id=account_id,
+        model="gpt-5.4",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id=None,
+        allow_takeover=False,
+    )
+    allow_connect.set()
+
+    with pytest.raises(proxy_module.ProxyResponseError) as exc_info:
+        await replacement
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.payload["error"]["code"] == "bridge_instance_mismatch"
+
+    snapshots = await service._durable_bridge.lookup_sessions(session_ids=[predecessor.session_id])
+    assert len(snapshots) == 1
+    assert snapshots[0].owner_instance_id == "instance-b"
+    assert snapshots[0].owner_epoch == competing_owner.owner_epoch
 
 
 @pytest.mark.asyncio
@@ -10891,8 +11046,17 @@ async def test_v1_responses_http_bridge_forks_parallel_unanchored_session_reques
         *,
         allow_takeover,
         force_owner_epoch_advance=False,
+        expected_takeover_owner_instance_id=None,
+        expected_takeover_owner_process_epoch=None,
     ):
-        del self, session, allow_takeover, force_owner_epoch_advance
+        del (
+            self,
+            session,
+            allow_takeover,
+            force_owner_epoch_advance,
+            expected_takeover_owner_instance_id,
+            expected_takeover_owner_process_epoch,
+        )
 
     monkeypatch.setattr(proxy_module.ProxyService, "_create_http_bridge_session", fake_create_http_bridge_session)
     monkeypatch.setattr(
@@ -11360,8 +11524,15 @@ async def test_v1_responses_http_bridge_forks_follower_when_account_assignment_c
         *,
         allow_takeover,
         force_owner_epoch_advance=False,
+        expected_takeover_owner_instance_id=None,
+        expected_takeover_owner_process_epoch=None,
     ):
-        del self, allow_takeover
+        del (
+            self,
+            allow_takeover,
+            expected_takeover_owner_instance_id,
+            expected_takeover_owner_process_epoch,
+        )
         durable_claims.append((session.account.id, force_owner_epoch_advance))
         session.durable_session_id = "durable-session"
         session.durable_owner_epoch = 2 if force_owner_epoch_advance else 1
@@ -13412,11 +13583,17 @@ async def test_v1_responses_http_bridge_recovers_store_context_trim_after_proxy_
     assert recovered_payload["input"] == complete_follow_up
 
 
+@pytest.mark.parametrize(
+    "canonical_invalid_shape",
+    [False, True],
+    ids=["previous-response-not-found", "canonical-invalid-previous-response-id"],
+)
 @pytest.mark.asyncio
 async def test_v1_responses_http_bridge_quarantines_persistently_stale_proxy_anchor_then_recovers_full_resend(
     async_client,
     app_instance,
     monkeypatch,
+    canonical_invalid_shape,
 ):
     _install_bridge_settings(monkeypatch, enabled=True)
     account_id = await _import_account(
@@ -13510,8 +13687,14 @@ async def test_v1_responses_http_bridge_quarantines_persistently_stale_proxy_anc
     first_body = first.json()
 
     service = get_proxy_service_for_app(app_instance)
-    stale_upstream = _RejectStalePreviousResponseUpstreamWebSocket(first_body["id"])
-    recovered_upstream = _RejectStalePreviousResponseUpstreamWebSocket(first_body["id"])
+    stale_upstream = _RejectStalePreviousResponseUpstreamWebSocket(
+        first_body["id"],
+        canonical_invalid_shape=canonical_invalid_shape,
+    )
+    recovered_upstream = _RejectStalePreviousResponseUpstreamWebSocket(
+        first_body["id"],
+        canonical_invalid_shape=canonical_invalid_shape,
+    )
     async with service._http_bridge_lock:
         session = next(iter(service._http_bridge_sessions.values()))
     await service._reset_http_bridge_session_after_local_terminal_error(
