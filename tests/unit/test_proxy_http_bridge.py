@@ -23471,6 +23471,162 @@ async def test_http_bridge_reader_maps_ordinary_websocket_receive_failure_to_str
 
 
 @pytest.mark.asyncio
+async def test_http_bridge_idle_generic_receive_error_retires_without_retry_or_circuit_and_cleans_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    session = _make_bridge_session(key_value="bridge-idle-generic-receive-error")
+    session.last_used_at = time.monotonic() - 65.0
+    session.previous_response_ids.add("resp-idle-generic-receive-error")
+    session.downstream_turn_state_aliases.add("turn-idle-generic-receive-error")
+    service._http_bridge_sessions[session.key] = session
+    service._http_bridge_previous_response_index[("resp-idle-generic-receive-error", None)] = session.key
+    service._http_bridge_turn_state_index[("turn-idle-generic-receive-error", None)] = session.key
+    session.upstream = cast(
+        UpstreamWebSocket,
+        SimpleNamespace(
+            receive=AsyncMock(
+                side_effect=[
+                    UpstreamWebSocketMessage(
+                        kind="error",
+                        error="generic receive failure with no stable transport code",
+                        error_code=None,
+                    ),
+                    UpstreamWebSocketMessage(
+                        kind="error",
+                        error="generic receive failure with no stable transport code",
+                        error_code=None,
+                    ),
+                ]
+            ),
+            close=AsyncMock(),
+        ),
+    )
+    retry_precreated = AsyncMock(side_effect=[True, False])
+    record_retry_circuit_failure = AsyncMock()
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", retry_precreated)
+    monkeypatch.setattr(service, "_record_http_bridge_retry_circuit_failure", record_retry_circuit_failure)
+
+    with caplog.at_level(logging.INFO):
+        await service._relay_http_bridge_upstream_messages(session)
+
+    retry_precreated.assert_not_awaited()
+    record_retry_circuit_failure.assert_not_awaited()
+    assert session.closed is True
+    assert session.key not in service._http_bridge_sessions
+    assert ("resp-idle-generic-receive-error", None) not in service._http_bridge_previous_response_index
+    assert ("turn-idle-generic-receive-error", None) not in service._http_bridge_turn_state_index
+    assert "event=idle_transport_retire" in caplog.text
+    assert "pending=0" in caplog.text
+    assert "admission_waiters=0" in caplog.text
+    assert "idle_age_bucket=60s_to_5m" in caplog.text
+    assert "retry_action=not_attempted" in caplog.text
+    assert "circuit_action=not_recorded" in caplog.text
+    assert "event=reader_failure" not in caplog.text
+    assert "detail=stream_incomplete" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_idle_transport_classification_falls_back_when_admission_waiter_arrives(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    session = _make_bridge_session(key_value="bridge-idle-classification-race")
+    session.admission_waiter_count = 1
+    fail_pending = AsyncMock()
+    monkeypatch.setattr(service, "_fail_pending_websocket_requests", fail_pending)
+
+    with caplog.at_level(logging.INFO):
+        retired = await service._fail_http_bridge_reader_and_maybe_retire(
+            session,
+            error_code="stream_incomplete",
+            error_message="Upstream websocket receive failed before response.completed",
+            penalize_account=True,
+            idle_transport_retire=True,
+        )
+
+    assert retired is False
+    fail_pending.assert_awaited_once()
+    assert "event=reader_failure" in caplog.text
+    assert "event=idle_transport_retire" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_active_generic_receive_records_preclear_hard_key_failure_and_second_opens_circuit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    key = proxy_service._HTTPBridgeSessionKey(
+        "session_header",
+        "bridge-active-generic-circuit",
+        None,
+    )
+    monkeypatch.setattr(service, "_load_http_bridge_retry_circuit", AsyncMock(return_value=True))
+    monkeypatch.setattr(service, "_persist_http_bridge_retry_circuit", AsyncMock())
+    record_failure = AsyncMock(wraps=service._record_http_bridge_retry_circuit_failure)
+    monkeypatch.setattr(service, "_record_http_bridge_retry_circuit_failure", record_failure)
+
+    async def clear_pending_requests(**kwargs: Any) -> None:
+        async with kwargs["pending_lock"]:
+            kwargs["pending_requests"].clear()
+
+    monkeypatch.setattr(service, "_fail_pending_websocket_requests", clear_pending_requests)
+    retire = AsyncMock()
+    monkeypatch.setattr(service, "_retire_stale_pending_http_bridge_session", retire)
+
+    sessions: list[proxy_service._HTTPBridgeSession] = []
+    snapshots: list[Any] = []
+    for failure_number in (1, 2):
+        session = _make_bridge_session(
+            key=key,
+            pending_requests=deque(
+                [
+                    _make_eventless_http_bridge_owner(
+                        request_id=f"req-active-generic-circuit-{failure_number}",
+                        sent_at=time.monotonic(),
+                    )
+                ]
+            ),
+            queued_request_count=1,
+        )
+        sessions.append(session)
+
+        retired = await service._fail_http_bridge_reader_and_maybe_retire(
+            session,
+            error_code="stream_incomplete",
+            error_message="Upstream websocket receive failed before response.completed",
+            penalize_account=True,
+            retry_action="suppressed_ambiguous_accept",
+            circuit_action="record_stream_incomplete",
+        )
+
+        assert retired is True
+        snapshots.append(await service._http_bridge_retry_circuit_snapshot(session))
+
+    assert record_failure.await_count == 2
+    for failure_call, session in zip(record_failure.await_args_list, sessions, strict=True):
+        assert failure_call.args == (session,)
+        assert failure_call.kwargs == {"detail": "stream_incomplete"}
+    assert retire.await_count == 2
+    for retire_call, session in zip(retire.await_args_list, sessions, strict=True):
+        assert retire_call.args == (session,)
+        assert retire_call.kwargs == {
+            "detail": "stream_incomplete",
+            "response_events_seen": 0,
+            "retry_circuit_already_recorded": True,
+        }
+    assert snapshots[0].allowed is True
+    assert snapshots[0].consecutive_failures == 1
+    assert snapshots[0].retry_after_seconds == 0
+    assert snapshots[1].allowed is False
+    assert snapshots[1].consecutive_failures == 2
+    assert snapshots[1].retry_after_seconds > 0
+
+
+@pytest.mark.asyncio
 async def test_http_bridge_response_create_gate_timeout_logs_pending_bridge_context(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

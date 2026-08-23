@@ -2617,6 +2617,10 @@ def _log_http_bridge_event(
     upstream_close_code: int | None = None,
     response_events_seen: int | None = None,
     transport_classification: str | None = None,
+    admission_waiter_count: int | None = None,
+    idle_age_bucket: str | None = None,
+    retry_action: str | None = None,
+    circuit_action: str | None = None,
 ) -> None:
     level = logging.INFO
     if event in {
@@ -2643,7 +2647,8 @@ def _log_http_bridge_event(
         "http_bridge_event event=%s bridge_kind=%s bridge_key=%s account_id=%s"
         " model=%s pending=%s detail=%s cache_key_family=%s model_class=%s"
         " key_strength=%s owner_check_applied=%s error_message=%s upstream_close_code=%s"
-        " response_events_seen=%s transport_classification=%s",
+        " response_events_seen=%s transport_classification=%s admission_waiters=%s"
+        " idle_age_bucket=%s retry_action=%s circuit_action=%s",
         event,
         key.affinity_kind,
         _hash_identifier(key.affinity_key),
@@ -2659,6 +2664,10 @@ def _log_http_bridge_event(
         upstream_close_code,
         response_events_seen,
         transport_classification,
+        admission_waiter_count,
+        idle_age_bucket,
+        retry_action,
+        circuit_action,
     )
 
 

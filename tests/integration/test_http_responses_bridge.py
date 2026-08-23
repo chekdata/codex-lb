@@ -495,6 +495,25 @@ class _PrecreatedCloseUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
         await self._messages.put(_FakeUpstreamMessage("close", close_code=1011))
 
 
+class _AmbiguousAcceptedReceiveErrorUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    """Accept response.create, then lose receive provenance before any event."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.irreversible_effect_count = 0
+
+    async def send_text(self, text: str) -> None:
+        self.irreversible_effect_count += 1
+        self.sent_text.append(text)
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "error",
+                error="upstream receive failed after transport accepted the frame",
+                error_code=None,
+            )
+        )
+
+
 class _PrecreatedOverloadUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
     async def send_text(self, text: str) -> None:
         self.sent_text.append(text)
@@ -12892,6 +12911,150 @@ async def test_v1_responses_http_bridge_ambiguous_send_failure_does_not_restart_
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "stream_incomplete"
     assert connect_count == 1
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_ambiguous_receive_after_accept_is_not_replayed_and_next_request_is_fresh(
+    async_client,
+    app_instance,
+    caplog,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_ambiguous_receive",
+        "http-bridge-ambiguous-receive@example.com",
+    )
+    account = await _get_account(account_id)
+    ambiguous_upstream = _AmbiguousAcceptedReceiveErrorUpstreamWebSocket()
+    recovered_upstream = _FakeBridgeUpstreamWebSocket(response_id_prefix="resp_after_ambiguous_receive")
+    upstreams = [ambiguous_upstream, recovered_upstream]
+    connect_count = 0
+
+    async def fake_select_account_with_budget(
+        self,
+        deadline,
+        *,
+        request_id,
+        kind,
+        request_stage="first_turn",
+        sticky_key,
+        sticky_kind,
+        reallocate_sticky,
+        sticky_max_age_seconds,
+        prefer_earlier_reset_accounts,
+        routing_strategy,
+        model,
+        exclude_account_ids=None,
+        additional_limit_name=None,
+        api_key=None,
+        preferred_account_id=None,
+        **_kwargs,
+    ):
+        del (
+            self,
+            deadline,
+            request_id,
+            kind,
+            request_stage,
+            sticky_key,
+            sticky_kind,
+            reallocate_sticky,
+            sticky_max_age_seconds,
+            prefer_earlier_reset_accounts,
+            routing_strategy,
+            model,
+            exclude_account_ids,
+            additional_limit_name,
+            api_key,
+            preferred_account_id,
+        )
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del headers, access_token, account_id_header, base_url, session
+        nonlocal connect_count
+        upstream = upstreams[connect_count]
+        connect_count += 1
+        return upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+    service = get_proxy_service_for_app(app_instance)
+    retry_precreated = AsyncMock(wraps=service._retry_http_bridge_precreated_request)
+    fail_pending = AsyncMock(wraps=service._fail_pending_websocket_requests)
+    record_retry_circuit_failure = AsyncMock(wraps=service._record_http_bridge_retry_circuit_failure)
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", retry_precreated)
+    monkeypatch.setattr(service, "_fail_pending_websocket_requests", fail_pending)
+    monkeypatch.setattr(service, "_record_http_bridge_retry_circuit_failure", record_retry_circuit_failure)
+
+    first = await async_client.post(
+        "/v1/responses",
+        headers={"x-codex-session-id": "ambiguous-receive-hard-key"},
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": "ambiguous-accept",
+            "prompt_cache_key": "ambiguous-receive-key",
+        },
+    )
+
+    assert first.status_code == 502
+    assert first.json()["error"]["code"] == "stream_incomplete"
+    assert len(ambiguous_upstream.sent_text) == 1
+    assert ambiguous_upstream.irreversible_effect_count == 1
+    assert connect_count == 1
+    retry_precreated.assert_not_awaited()
+    fail_pending.assert_awaited_once()
+    fail_pending_call = fail_pending.await_args
+    assert fail_pending_call is not None
+    assert fail_pending_call.kwargs["penalize_account"] is True
+    record_retry_circuit_failure.assert_awaited_once()
+    circuit_call = record_retry_circuit_failure.await_args
+    assert circuit_call is not None
+    assert circuit_call.args[0].key.affinity_kind == "session_header"
+    assert circuit_call.kwargs == {"detail": "stream_incomplete"}
+    assert "admission_waiters=0" in caplog.text
+    assert "retry_action=suppressed_ambiguous_accept" in caplog.text
+    assert "circuit_action=record_stream_incomplete" in caplog.text
+
+    for _ in range(100):
+        async with service._http_bridge_lock:
+            retired = not service._http_bridge_sessions
+        if retired and ambiguous_upstream.closed:
+            break
+        await asyncio.sleep(0.01)
+    assert retired is True
+    assert ambiguous_upstream.closed is True
+
+    second = await async_client.post(
+        "/v1/responses",
+        headers={"x-codex-session-id": "ambiguous-receive-hard-key"},
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": "fresh-after-ambiguous-accept",
+            "prompt_cache_key": "ambiguous-receive-key",
+        },
+    )
+
+    assert second.status_code == 200
+    assert second.json()["output"][0]["content"][0]["text"] == "OK"
+    assert connect_count == 2
+    assert len(recovered_upstream.sent_text) == 1
 
 
 @pytest.mark.asyncio

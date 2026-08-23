@@ -586,6 +586,17 @@ def _archive_http_bridge_upstream_message(
         reset_request_id(token)
 
 
+def _http_bridge_idle_age_bucket(session: "_HTTPBridgeSession") -> str:
+    idle_seconds = max(0.0, _service_time().monotonic() - session.last_used_at)
+    if idle_seconds < 5.0:
+        return "under_5s"
+    if idle_seconds < 60.0:
+        return "5s_to_60s"
+    if idle_seconds < 300.0:
+        return "60s_to_5m"
+    return "5m_or_more"
+
+
 async def _http_bridge_receive_timeout_with_eventless_deadline(
     session: "_HTTPBridgeSession",
     receive_timeout: _WebSocketReceiveTimeout | None,
@@ -748,6 +759,9 @@ class _HTTPBridgeUpstreamEventsMixin:
         upstream_close_code: int | None = None,
         response_events_seen: int | None = None,
         transport_classification: str | None = None,
+        idle_transport_retire: bool = False,
+        retry_action: str | None = None,
+        circuit_action: str | None = None,
     ) -> bool:
         session.closed = True
         async with session.pending_lock:
@@ -779,33 +793,67 @@ class _HTTPBridgeUpstreamEventsMixin:
             if observed_close_code is not None
             else None
         )
-        _log_http_bridge_event(
-            "reader_failure",
-            session.key,
-            account_id=session.account.id,
-            model=session.request_model,
-            pending_count=failed_pending_count,
-            detail=error_code,
-            error_message=_truncate_identifier(error_message),
-            upstream_close_code=observed_close_code,
-            response_events_seen=observed_response_events,
-            transport_classification=transport_classification
-            or (
-                f"websocket_close_{close_classification}"
-                if close_classification is not None
-                else "websocket_transport_error"
-            ),
-            cache_key_family=session.key.affinity_kind,
-            model_class=_extract_model_class(session.request_model) if session.request_model else None,
+        classify_as_idle_transport_retire = bool(
+            idle_transport_retire and failed_pending_count == 0 and session.admission_waiter_count == 0
         )
-        if force_retire and retire_detail:
+        effective_retire_detail = "idle_transport_retire" if classify_as_idle_transport_retire else retire_detail
+        retry_circuit_detail = None
+        if close_classification == "clean":
+            retry_circuit_detail = "clean_close"
+        elif observed_response_events == 0:
+            retry_circuit_detail = next(
+                (
+                    detail
+                    for detail in (effective_retire_detail, error_code)
+                    if detail in {"stream_incomplete", "stream_idle_timeout", "upstream_keepalive_timeout"}
+                ),
+                None,
+            )
+        if classify_as_idle_transport_retire:
             _log_http_bridge_event(
-                retire_detail,
+                "idle_transport_retire",
                 session.key,
                 account_id=session.account.id,
                 model=session.request_model,
                 pending_count=failed_pending_count,
-                detail=retire_detail,
+                admission_waiter_count=session.admission_waiter_count,
+                idle_age_bucket=_http_bridge_idle_age_bucket(session),
+                retry_action="not_attempted",
+                circuit_action="not_recorded",
+                cache_key_family=session.key.affinity_kind,
+                model_class=_extract_model_class(session.request_model) if session.request_model else None,
+            )
+        else:
+            _log_http_bridge_event(
+                "reader_failure",
+                session.key,
+                account_id=session.account.id,
+                model=session.request_model,
+                pending_count=failed_pending_count,
+                detail=error_code,
+                error_message=_truncate_identifier(error_message),
+                upstream_close_code=observed_close_code,
+                response_events_seen=observed_response_events,
+                transport_classification=transport_classification
+                or (
+                    f"websocket_close_{close_classification}"
+                    if close_classification is not None
+                    else "websocket_transport_error"
+                ),
+                admission_waiter_count=session.admission_waiter_count,
+                retry_action=retry_action,
+                circuit_action=circuit_action,
+                cache_key_family=session.key.affinity_kind,
+                model_class=_extract_model_class(session.request_model) if session.request_model else None,
+            )
+        if force_retire and effective_retire_detail:
+            _log_http_bridge_event(
+                effective_retire_detail,
+                session.key,
+                account_id=session.account.id,
+                model=session.request_model,
+                pending_count=failed_pending_count,
+                detail=effective_retire_detail,
                 cache_key_family=session.key.affinity_kind,
                 model_class=_extract_model_class(session.request_model) if session.request_model else None,
             )
@@ -822,32 +870,29 @@ class _HTTPBridgeUpstreamEventsMixin:
                 penalize_account=penalize_account,
             )
         finally:
-            poison_after_deferred_failures = False
-            if session.admission_waiter_count > 0 and not force_retire:
-                retry_circuit_detail = None
-                if close_classification == "clean":
-                    retry_circuit_detail = "clean_close"
-                elif observed_response_events == 0:
-                    retry_circuit_detail = next(
-                        (
-                            detail
-                            for detail in (retire_detail, error_code)
-                            if detail in {"stream_incomplete", "stream_idle_timeout", "upstream_keepalive_timeout"}
-                        ),
-                        None,
-                    )
-                if failed_pending_count > 0 and retry_circuit_detail is not None:
+            consecutive_failures = None
+            retry_circuit_recorded = False
+            if failed_pending_count > 0 and retry_circuit_detail is not None:
+                try:
                     consecutive_failures = await self._record_http_bridge_retry_circuit_failure(
                         session,
                         detail=retry_circuit_detail,
                     )
-                    poison_after_deferred_failures = bool(
-                        retry_circuit_detail == "stream_idle_timeout"
-                        and observed_response_events == 0
-                        and consecutive_failures is not None
-                        and consecutive_failures
-                        >= _service_get_settings().http_responses_session_bridge_anchor_poison_failure_threshold
+                except Exception:
+                    logger.warning(
+                        "Failed to record HTTP bridge retry circuit before retirement",
+                        exc_info=True,
                     )
+                retry_circuit_recorded = consecutive_failures is not None
+            poison_after_deferred_failures = False
+            if session.admission_waiter_count > 0 and not force_retire:
+                poison_after_deferred_failures = bool(
+                    retry_circuit_detail == "stream_idle_timeout"
+                    and observed_response_events == 0
+                    and consecutive_failures is not None
+                    and consecutive_failures
+                    >= _service_get_settings().http_responses_session_bridge_anchor_poison_failure_threshold
+                )
                 if poison_after_deferred_failures:
                     durable_cleared = await _abandon_durable_http_bridge_continuity(self, session)
                     if durable_cleared:
@@ -875,7 +920,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                         account_id=session.account.id,
                         model=session.request_model,
                         pending_count=session.admission_waiter_count,
-                        detail=retire_detail or error_code,
+                        detail=effective_retire_detail or error_code,
                         cache_key_family=session.key.affinity_kind,
                         model_class=_extract_model_class(session.request_model) if session.request_model else None,
                     )
@@ -886,12 +931,14 @@ class _HTTPBridgeUpstreamEventsMixin:
                         detail=error_code,
                         retry_circuit_detail="clean_close",
                         response_events_seen=observed_response_events,
+                        **({"retry_circuit_already_recorded": True} if retry_circuit_recorded else {}),
                     )
                 else:
                     await self._retire_stale_pending_http_bridge_session(
                         session,
-                        detail=retire_detail or error_code,
+                        detail=effective_retire_detail or error_code,
                         response_events_seen=observed_response_events,
+                        **({"retry_circuit_already_recorded": True} if retry_circuit_recorded else {}),
                     )
         return force_retire or session.admission_waiter_count == 0
 
@@ -1133,6 +1180,11 @@ class _HTTPBridgeUpstreamEventsMixin:
 
                 async with session.pending_lock:
                     archive_request_state = session.pending_requests[0] if len(session.pending_requests) == 1 else None
+                    pending_count = sum(
+                        1
+                        for request_state in session.pending_requests
+                        if _http_bridge_request_counts_against_queue(request_state)
+                    )
                     response_events_seen = max(
                         (request_state.response_event_count for request_state in session.pending_requests),
                         default=0,
@@ -1141,16 +1193,23 @@ class _HTTPBridgeUpstreamEventsMixin:
                 session.last_upstream_close_generation += 1
                 session.last_upstream_close_code = message.close_code
                 retried = False
+                ambiguous_receive_failure = message.kind == "error" and message.error_code is None
                 # Account-neutral transport failures do not prove that the
                 # upstream rejected response.create. The request may still be
                 # executing, so replay could duplicate work, billing, or tool
                 # side effects. Clean closes remain eligible for the bounded
-                # pre-created retry circuit maintained by the session.
+                # pre-created retry circuit maintained by the session. An
+                # untyped receive error is also ambiguous: the send primitive
+                # already accepted response.create, so it must never enter the
+                # reconnect/resend path even when no response event arrived.
                 account_neutral = is_account_neutral_websocket_error_code(message.error_code)
-                if not account_neutral:
+                if not account_neutral and not ambiguous_receive_failure:
                     retried = await self._retry_http_bridge_precreated_request(session)
                 if retried:
                     continue
+                idle_transport_retire = bool(
+                    ambiguous_receive_failure and pending_count == 0 and session.admission_waiter_count == 0
+                )
                 close_classification = (
                     _classify_upstream_close(message.close_code, response_events_seen=response_events_seen)
                     if message.close_code is not None
@@ -1169,7 +1228,11 @@ class _HTTPBridgeUpstreamEventsMixin:
                     await self._fail_http_bridge_reader_and_maybe_retire(
                         session,
                         error_code=message.error_code or "stream_incomplete",
-                        error_message=_upstream_websocket_disconnect_message(message),
+                        error_message=(
+                            "Upstream websocket receive failed before response.completed"
+                            if ambiguous_receive_failure
+                            else _upstream_websocket_disconnect_message(message)
+                        ),
                         upstream_close_code=message.close_code,
                         response_events_seen=response_events_seen,
                         transport_classification=(
@@ -1179,6 +1242,15 @@ class _HTTPBridgeUpstreamEventsMixin:
                         ),
                         penalize_account=(
                             not account_neutral and not (message.kind == "close" and close_classification == "clean")
+                        ),
+                        idle_transport_retire=idle_transport_retire,
+                        retry_action=("suppressed_ambiguous_accept" if ambiguous_receive_failure else None),
+                        circuit_action=(
+                            "record_stream_incomplete"
+                            if ambiguous_receive_failure and pending_count > 0 and session.key.strength == "hard"
+                            else "not_recorded"
+                            if ambiguous_receive_failure
+                            else None
                         ),
                         **(
                             # An admission waiter must not inherit a socket whose

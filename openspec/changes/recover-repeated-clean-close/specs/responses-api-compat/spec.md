@@ -420,6 +420,36 @@ classification and MUST NOT fail on non-string item types.
 - **THEN** delivery is treated as ambiguous
 - **AND** the proxy does not dispatch the request on another socket
 
+#### Scenario: unclassified receive error after dispatch remains non-replayable
+
+- **GIVEN** the adapter has successfully invoked the underlying send primitive
+- **AND** the bridge has not observed `response.created` or another response
+  event
+- **WHEN** the WebSocket reader reports a generic transport error without a
+  classified protocol error code
+- **THEN** upstream acceptance is treated as ambiguous
+- **AND** the proxy does not reconnect or resend the request
+- **AND** it terminally settles the affected request and retires the bridge so
+  a later client request can create a fresh session
+
+#### Scenario: explicit clean close keeps its bounded recovery owner
+
+- **GIVEN** a pre-visible request satisfies the existing clean-close replay
+  guards
+- **WHEN** the reader reports an explicitly classified clean close
+- **THEN** the clean-close owner may perform its single bounded recovery
+- **AND** the generic receive-error fail-closed rule does not consume or widen
+  that recovery allowance
+
+#### Scenario: idle generic receive failure is not an active stream failure
+
+- **GIVEN** a bridge has no pending request and no create-admission waiter
+- **WHEN** its reader reports a generic transport error
+- **THEN** the bridge retires its stale aliases without reconnecting or opening
+  a retry circuit
+- **AND** it emits a content-free informational retirement diagnostic rather
+  than an active `stream_incomplete` warning
+
 ### Requirement: Rejected proxy continuity anchors recover without context loss
 
 When the upstream explicitly rejects a proxy-injected `previous_response_id` before any response event is observed, the bridge MUST NOT inject the
