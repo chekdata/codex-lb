@@ -15744,7 +15744,7 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
     app_instance,
     monkeypatch,
 ):
-    """A rejected anchor may discard a call the client provably never accepted."""
+    """A rejected anchor may discard an unaccepted call without losing client continuity."""
 
     _install_bridge_settings(monkeypatch, enabled=True)
     account_id = await _import_account(
@@ -16047,3 +16047,86 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
         },
     ]
     assert all(item.get("call_id") != "call_custom_shell" for item in recovered_payload["input"])
+
+    expected_full_resend_fingerprint = proxy_module._fingerprint_input_items(proof_input)
+    durable_after_recovery = await service._durable_bridge.lookup_request_targets(
+        session_key_kind="turn_state_header",
+        session_key_value=session_headers["x-codex-turn-state"],
+        api_key_id=None,
+        turn_state=session_headers["x-codex-turn-state"],
+        session_header=session_headers["x-codex-session-id"],
+        previous_response_id=recovered.json()["id"],
+    )
+    assert durable_after_recovery is not None
+    assert durable_after_recovery.latest_input_item_count == len(full_resend)
+    assert durable_after_recovery.latest_input_full_fingerprint == expected_full_resend_fingerprint
+    live_session = next(iter(service._http_bridge_sessions.values()))
+    assert live_session.last_completed_input_count == len(full_resend)
+    assert live_session.last_completed_input_prefix_fingerprint == expected_full_resend_fingerprint
+
+    recovered_output = recovered.json()["output"][0]
+    next_developer_followup = {
+        "type": "message",
+        "role": "developer",
+        "content": [{"type": "input_text", "text": "next-turn permissions"}],
+    }
+    next_user = {
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "continue after recovery"}],
+    }
+    next_full_resend = [
+        *full_resend,
+        recovered_output,
+        next_developer_followup,
+        next_user,
+    ]
+    followup = await async_client.post(
+        "/v1/responses",
+        headers=session_headers,
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": next_full_resend,
+        },
+    )
+
+    assert followup.status_code == 200, followup.text
+    assert followup.json()["id"] == "resp_abandoned_pending_recovered_2"
+    assert connect_count == 3
+    assert len(recovered_upstream.sent_text) == 2
+    followup_payload = json.loads(recovered_upstream.sent_text[1])
+    assert followup_payload["previous_response_id"] == recovered.json()["id"]
+    assert followup_payload["input"] == [
+        recovered_output,
+        next_developer_followup,
+        next_user,
+    ]
+    assert not any(item.get("call_id") == "call_custom_shell" for item in followup_payload["input"])
+    assert not any(item == agent_message for item in followup_payload["input"])
+    assert not any(item == developer_followup for item in followup_payload["input"])
+
+    next_payload = proxy_module.ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": next_full_resend,
+        }
+    )
+    assert isinstance(next_payload.input, list)
+    expected_next_fingerprint = proxy_module._fingerprint_input_items(
+        cast(list[proxy_module.JsonValue], next_payload.input)
+    )
+    durable_after_followup = await service._durable_bridge.lookup_request_targets(
+        session_key_kind="turn_state_header",
+        session_key_value=session_headers["x-codex-turn-state"],
+        api_key_id=None,
+        turn_state=session_headers["x-codex-turn-state"],
+        session_header=session_headers["x-codex-session-id"],
+        previous_response_id=followup.json()["id"],
+    )
+    assert durable_after_followup is not None
+    assert durable_after_followup.latest_input_item_count == len(next_full_resend)
+    assert durable_after_followup.latest_input_full_fingerprint == expected_next_fingerprint
+    assert live_session.last_completed_input_count == len(next_full_resend)
+    assert live_session.last_completed_input_prefix_fingerprint == expected_next_fingerprint
