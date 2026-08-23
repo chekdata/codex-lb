@@ -21,6 +21,10 @@ from app.modules.proxy.durable_bridge_repository import (
     missing_durable_bridge_tables,
 )
 from app.modules.proxy.ring_membership import RING_MEMBER_RETENTION_SECONDS, RingMembershipService
+from app.modules.proxy.rowless_recovery_repository import (
+    ROWLESS_RECOVERY_CAPTURED_RETENTION_SECONDS,
+    RowlessRecoveryRepository,
+)
 from app.modules.proxy.sticky_repository import StickySessionsRepository
 from app.modules.settings.repository import SettingsRepository
 
@@ -116,6 +120,7 @@ class StickySessionCleanupScheduler:
                 async with get_background_session() as session:
                     settings_repo = SettingsRepository(session)
                     bridge_repo = DurableBridgeRepository(session)
+                    rowless_repo = RowlessRecoveryRepository(session)
                     sticky_repo = StickySessionsRepository(session)
                     settings = await settings_repo.get_or_create()
 
@@ -155,6 +160,15 @@ class StickySessionCleanupScheduler:
                             logger.info(
                                 "Purged expired HTTP bridge retry circuits deleted_count=%s",
                                 retry_circuit_deleted_count,
+                            )
+                        rowless_deleted = await rowless_repo.purge_expired_audit_rows(
+                            captured_cutoff=cleanup_now
+                            - timedelta(seconds=ROWLESS_RECOVERY_CAPTURED_RETENTION_SECONDS),
+                        )
+                        if any(rowless_deleted.values()):
+                            logger.info(
+                                "Purged expired unapproved rowless recovery captures captured=%s",
+                                rowless_deleted["captured"],
                             )
                 ring_cutoff = utcnow() - timedelta(seconds=RING_MEMBER_RETENTION_SECONDS)
                 ring_deleted_count = await RingMembershipService(SessionLocal).purge_stale_before(ring_cutoff)

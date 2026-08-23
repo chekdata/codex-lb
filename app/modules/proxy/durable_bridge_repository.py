@@ -38,6 +38,7 @@ REQUIRED_DURABLE_BRIDGE_TABLES = (
     "http_bridge_session_aliases",
     "http_bridge_retry_circuits",
     "http_bridge_recovery_attempts",
+    "http_bridge_rowless_recovery_authorities",
 )
 DURABLE_BRIDGE_RETRY_CIRCUIT_STATE_TTL_SECONDS = 3600.0
 _PURGE_CLOSED_BATCH_SIZE = 500
@@ -1901,7 +1902,7 @@ async def missing_durable_bridge_tables(session: AsyncSession) -> tuple[str, ...
                 "SELECT name FROM sqlite_master "
                 "WHERE type = 'table' "
                 "AND name IN ('http_bridge_sessions', 'http_bridge_session_aliases', 'http_bridge_retry_circuits', "
-                "'http_bridge_recovery_attempts')"
+                "'http_bridge_recovery_attempts', 'http_bridge_rowless_recovery_authorities')"
             )
         )
     else:
@@ -1911,7 +1912,7 @@ async def missing_durable_bridge_tables(session: AsyncSession) -> tuple[str, ...
                 "WHERE table_schema = ANY (current_schemas(false)) "
                 "AND table_name IN ("
                 "'http_bridge_sessions', 'http_bridge_session_aliases', 'http_bridge_retry_circuits', "
-                "'http_bridge_recovery_attempts'"
+                "'http_bridge_recovery_attempts', 'http_bridge_rowless_recovery_authorities'"
                 ")"
             )
         )

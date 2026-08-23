@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Literal, cast
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -191,6 +193,56 @@ class AccountNeutralReplayProjection:
     position fail-closed, so projection can never make a non-adjacent
     developer message look canonical.
     """
+
+
+@dataclass(frozen=True, slots=True)
+class DirectCallLedgerSummary:
+    digest: str
+    unresolved_count: int
+
+
+def responses_direct_call_ledger_summary(
+    input_items: list[JsonValue],
+) -> DirectCallLedgerSummary | None:
+    """Hash the ordered direct-call lifecycle without retaining call content.
+
+    The digest includes only call/output identity, type, and status.  Invalid,
+    duplicate, orphaned, or type-mismatched entries are not a settlement
+    ledger and fail closed.
+    """
+
+    pending: dict[str, str] = {}
+    seen: set[str] = set()
+    ledger: list[dict[str, str | None]] = []
+    for item in input_items:
+        if not isinstance(item, dict):
+            continue
+        item_type_value = item.get("type")
+        item_type = item_type_value if isinstance(item_type_value, str) else None
+        if item_type not in _TOOL_CALL_TYPES and item_type not in _TOOL_CALL_TYPE_BY_OUTPUT_TYPE:
+            continue
+        call_id = item.get("call_id")
+        status_value = item.get("status")
+        status = status_value if isinstance(status_value, str) else None
+        if not isinstance(call_id, str) or not call_id or status not in (None, "completed", "failed"):
+            return None
+        if item_type in _TOOL_CALL_TYPES:
+            if call_id in seen:
+                return None
+            seen.add(call_id)
+            pending[call_id] = item_type
+            ledger.append({"call_id": call_id, "kind": "call", "status": status, "type": item_type})
+            continue
+        expected_call_type = _TOOL_CALL_TYPE_BY_OUTPUT_TYPE[item_type]
+        if pending.get(call_id) != expected_call_type:
+            return None
+        pending.pop(call_id)
+        ledger.append({"call_id": call_id, "kind": "output", "status": status, "type": item_type})
+    canonical = json.dumps(ledger, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    return DirectCallLedgerSummary(
+        digest=sha256(canonical.encode("utf-8")).hexdigest(),
+        unresolved_count=len(pending),
+    )
 
 
 def project_responses_input_for_account_neutral_fresh_replay(
@@ -492,6 +544,73 @@ def responses_input_items_are_self_contained_fresh_replay(input_items: list[Json
             unsettled_call_ids_by_type[call_item_type].remove(call_id)
             settled_call_ids.add(call_id)
     return all(not call_ids for call_ids in unsettled_call_ids_by_type.values())
+
+
+def responses_input_items_are_self_contained_rowless_replay(
+    original_items: list[JsonValue],
+    projected_items: list[JsonValue],
+) -> bool:
+    """Admit only canonical, settled Codex agent deliveries for rowless replay."""
+
+    pending_calls: set[str] = set()
+    agent_indexes: list[int] = []
+    for index, item in enumerate(original_items):
+        if not isinstance(item, dict):
+            return False
+        item_type = item.get("type")
+        call_id = item.get("call_id")
+        if item_type in _TOOL_CALL_TYPES and isinstance(call_id, str):
+            pending_calls.add(call_id)
+        elif item_type in _TOOL_CALL_TYPE_BY_OUTPUT_TYPE and isinstance(call_id, str):
+            pending_calls.discard(call_id)
+        if item_type != "agent_message":
+            continue
+        if pending_calls or not _is_retained_agent_message(item):
+            return False
+        agent_indexes.append(index)
+        if not any(isinstance(later, dict) and later.get("role") == "user" for later in original_items[index + 1 :]):
+            return False
+    if not agent_indexes:
+        return responses_input_items_are_self_contained_fresh_replay(projected_items)
+
+    projected_without_agents: list[JsonValue] = []
+    for item in projected_items:
+        if not isinstance(item, dict) or item.get("type") != "agent_message":
+            projected_without_agents.append(item)
+            continue
+        metadata = item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
+        content = item.get("content")
+        if (
+            set(item)
+            not in {
+                frozenset({"author", "content", "recipient", "type"}),
+                frozenset(
+                    {
+                        "author",
+                        "content",
+                        _INTERNAL_CHAT_MESSAGE_METADATA_FIELD,
+                        "recipient",
+                        "type",
+                    }
+                ),
+            }
+            or not isinstance(item.get("author"), str)
+            or not _AGENT_PATH_PATTERN.fullmatch(cast(str, item["author"]))
+            or not isinstance(item.get("recipient"), str)
+            or not _AGENT_PATH_PATTERN.fullmatch(cast(str, item["recipient"]))
+            or item["author"] == item["recipient"]
+            or not _internal_chat_message_metadata_is_account_neutral(metadata)
+            or not isinstance(content, list)
+            or len(content) != 1
+            or not isinstance(content[0], dict)
+            or content[0].get("type") != "input_text"
+            or not _input_content_part_is_self_contained(
+                cast(dict[str, JsonValue], content[0]),
+                allow_output=False,
+            )
+        ):
+            return False
+    return responses_input_items_are_self_contained_fresh_replay(projected_without_agents)
 
 
 def _internal_chat_message_metadata_is_account_neutral(value: JsonValue | None) -> bool:

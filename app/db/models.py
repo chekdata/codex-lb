@@ -1804,6 +1804,13 @@ class HttpBridgeRecoveryAttemptState(str, Enum):
     REPLAYED = "replayed"
 
 
+class HttpBridgeRowlessRecoveryState(str, Enum):
+    CAPTURED = "captured"
+    APPROVED = "approved"
+    UNKNOWN = "unknown"
+    CONSUMED = "consumed"
+
+
 class HttpBridgeSessionRecord(Base):
     __tablename__ = "http_bridge_sessions"
 
@@ -1918,6 +1925,88 @@ class HttpBridgeRecoveryAttemptRecord(Base):
             name="uq_http_bridge_recovery_attempts_session_fingerprint",
         ),
         Index("idx_http_bridge_recovery_attempts_state", "state", "updated_at"),
+    )
+
+
+class HttpBridgeRowlessRecoveryAuthority(Base):
+    """Content-free operator authority that outlives bridge-session cleanup."""
+
+    __tablename__ = "http_bridge_rowless_recovery_authorities"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    api_key_scope: Mapped[str] = mapped_column(String(255), nullable=False)
+    session_key_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    strong_session_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    stale_anchor_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
+    generation_nonce: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[HttpBridgeRowlessRecoveryState] = mapped_column(
+        SqlEnum(
+            HttpBridgeRowlessRecoveryState,
+            name="http_bridge_rowless_recovery_state",
+            validate_strings=True,
+            values_callable=_enum_values,
+        ),
+        default=HttpBridgeRowlessRecoveryState.CAPTURED,
+        server_default=text("'captured'"),
+        nullable=False,
+    )
+    captured_input_item_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    captured_input_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    non_input_contract_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    settled_direct_call_ledger_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    projected_payload_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    actual_wire_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    settled_direct_call_unresolved_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    selected_account_intent: Mapped[str] = mapped_column(String, nullable=False)
+    captured_task_identity_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    captured_session_identity_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    captured_task_authority_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_self_contained: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    request_account_neutral: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    challenge_nonce_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    challenge_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    checkpoint_receipt_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    checkpoint_jsonl_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    checkpoint_jsonl_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    checkpoint_jsonl_last_offset: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    checkpoint_task_identity_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    checkpoint_session_identity_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    checkpoint_strong_session_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    checkpoint_task_authority_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    checkpoint_tool_ledger_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    approved_by_actor: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    wire_request_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    replacement_session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    dispatch_request_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    dispatch_send_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    consumed_response_id_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=func.now(), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=func.now(), server_default=func.now(), onupdate=func.now()
+    )
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "api_key_scope",
+            "strong_session_hash",
+            "stale_anchor_hash",
+            name="uq_http_bridge_rowless_recovery_authority",
+        ),
+        UniqueConstraint(
+            "api_key_scope",
+            "strong_session_hash",
+            "captured_input_fingerprint",
+            "non_input_contract_fingerprint",
+            "settled_direct_call_ledger_digest",
+            "projected_payload_fingerprint",
+            name="uq_http_bridge_rowless_recovery_task_contract",
+        ),
+        Index("idx_http_bridge_rowless_recovery_state", "state", "updated_at"),
     )
 
 

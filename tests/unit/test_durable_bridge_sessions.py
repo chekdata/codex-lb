@@ -470,6 +470,7 @@ async def test_missing_durable_bridge_tables_checks_current_postgres_schemas() -
     missing = await missing_durable_bridge_tables(cast(AsyncSession, _PostgresSession()))
 
     assert "http_bridge_session_aliases" in missing
+    assert "http_bridge_rowless_recovery_authorities" in missing
     assert any("current_schemas(false)" in sql for sql in captured_sql)
     assert all("table_schema = 'public'" not in sql for sql in captured_sql)
 

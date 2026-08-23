@@ -61,6 +61,7 @@ from app.core.utils.request_id import (
     set_request_id,
 )
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
+from app.db.session import SessionLocal
 from app.modules.api_keys.service import (
     ApiKeyData,
     ApiKeyUsageReservationData,
@@ -207,6 +208,8 @@ from app.modules.proxy.helpers import (
     _parse_openai_error,
 )
 from app.modules.proxy.load_balancer import effective_account_concurrency_caps
+from app.modules.proxy.rowless_recovery import rowless_actual_wire_fingerprint
+from app.modules.proxy.rowless_recovery_repository import RowlessRecoveryRepository
 from app.modules.proxy.tool_call_dedupe import (
     dedupe_replayed_side_effect_input_items,
 )
@@ -942,6 +945,35 @@ class _HTTPBridgeRequestSubmitMixin:
         try:
             text_data = await self._inline_http_bridge_image_urls(text_data, request_state)
             text_data = self._http_bridge_text_with_account_installation_id(session, request_state, text_data)
+            if (
+                request_state.rowless_recovery_authority_id is not None
+                and request_state.rowless_recovery_generation is not None
+                and request_state.rowless_recovery_wire_fingerprint is not None
+                and rowless_actual_wire_fingerprint(text_data) != request_state.rowless_recovery_wire_fingerprint
+            ):
+                async with SessionLocal() as rowless_session:
+                    restored = await RowlessRecoveryRepository(rowless_session).rollback_preflight_setup_failure(
+                        authority_id=request_state.rowless_recovery_authority_id,
+                        generation=request_state.rowless_recovery_generation,
+                        request_id=request_state.request_id,
+                        wire_request_fingerprint=request_state.rowless_recovery_wire_fingerprint,
+                    )
+                if not restored:
+                    raise ProxyResponseError(
+                        502,
+                        openai_error(
+                            "bridge_continuity_persistence_failed",
+                            "The changed semantic-rebase wire could not be restored safely.",
+                        ),
+                    )
+                raise ProxyResponseError(
+                    400,
+                    openai_error(
+                        "rowless_recovery_actual_wire_changed",
+                        "The exact upstream wire changed before dispatch; the semantic rebase remains unsent.",
+                        error_type="invalid_request_error",
+                    ),
+                )
             self._start_request_state_api_key_reservation_heartbeat(
                 request_state,
                 api_key=request_state.api_key,
@@ -1191,6 +1223,46 @@ class _HTTPBridgeRequestSubmitMixin:
                                     "The recovery checkpoint was consumed before dispatch; retry the request.",
                                 ),
                             )
+                    if request_state.rowless_recovery_authority_id is not None:
+                        if (
+                            request_state.rowless_recovery_generation is None
+                            or session.durable_session_id is None
+                            or request_state.rowless_recovery_task_authority_digest is None
+                            or request_state.rowless_recovery_wire_fingerprint is None
+                        ):
+                            raise ProxyResponseError(
+                                502,
+                                openai_error(
+                                    "bridge_continuity_persistence_failed",
+                                    "The semantic-rebase replacement session is not durable.",
+                                ),
+                            )
+                        rowless_wire_fingerprint = request_state.rowless_recovery_wire_fingerprint
+                        async with SessionLocal() as rowless_session:
+                            rowless_repository = RowlessRecoveryRepository(rowless_session)
+                            await rowless_repository.claim_dispatch(
+                                authority_id=request_state.rowless_recovery_authority_id,
+                                generation=request_state.rowless_recovery_generation,
+                                replacement_session_id=session.durable_session_id,
+                                request_id=request_state.request_id,
+                                wire_request_fingerprint=rowless_wire_fingerprint,
+                                model=request_state.model,
+                                task_authority_digest=request_state.rowless_recovery_task_authority_digest,
+                            )
+                            send_started = await rowless_repository.mark_dispatch_send_started(
+                                authority_id=request_state.rowless_recovery_authority_id,
+                                generation=request_state.rowless_recovery_generation,
+                                request_id=request_state.request_id,
+                                wire_request_fingerprint=rowless_wire_fingerprint,
+                            )
+                        if not send_started:
+                            raise ProxyResponseError(
+                                502,
+                                openai_error(
+                                    "bridge_continuity_persistence_failed",
+                                    "The semantic-rebase send fence could not be persisted.",
+                                ),
+                            )
                     async with session.pending_lock:
                         session.pending_requests.append(request_state)
                         session.admission_waiter_count = max(0, session.admission_waiter_count - 1)
@@ -1241,6 +1313,30 @@ class _HTTPBridgeRequestSubmitMixin:
                                 session.closed = True
                                 session.upstream_control.reconnect_requested = True
                                 session.upstream_control.retire_after_drain = True
+                                if (
+                                    second_pre_dispatch_close
+                                    and request_state.rowless_recovery_authority_id is not None
+                                    and request_state.rowless_recovery_generation is not None
+                                    and request_state.rowless_recovery_wire_fingerprint is not None
+                                ):
+                                    async with SessionLocal() as rowless_session:
+                                        rolled_back_rowless = await RowlessRecoveryRepository(
+                                            rowless_session
+                                        ).rollback_physically_unsent_after_send_marker(
+                                            authority_id=request_state.rowless_recovery_authority_id,
+                                            generation=request_state.rowless_recovery_generation,
+                                            request_id=request_state.request_id,
+                                            wire_request_fingerprint=(request_state.rowless_recovery_wire_fingerprint),
+                                            transport_proof_code=retry_exc.error_code,
+                                        )
+                                    if not rolled_back_rowless:
+                                        raise ProxyResponseError(
+                                            502,
+                                            openai_error(
+                                                "bridge_continuity_persistence_failed",
+                                                "The proven-unsent semantic rebase could not be restored safely.",
+                                            ),
+                                        ) from retry_exc
                                 if second_pre_dispatch_close and recovery_receipt is not None:
                                     # Both physical sockets rejected the send
                                     # before any bytes were dispatched. The

@@ -2050,7 +2050,7 @@ def test_pending_settlement_followup_rejects_inexact_or_unbounded_shapes(mutatio
         cast(dict[str, JsonValue], input_items[call_index])["status"] = "in_progress"
     elif mutation == "malformed-agent-message":
         input_items[-1] = _canonical_agent_message()
-        cast(dict[str, JsonValue], input_items[-1])["extra"] = "unbound"
+        input_items[-1]["extra"] = "unbound"
         input_items.append({"role": "user", "content": "sanitized-followup"})
     elif mutation == "developer-before-user":
         input_items[-1] = {"role": "developer", "content": "sanitized-control"}

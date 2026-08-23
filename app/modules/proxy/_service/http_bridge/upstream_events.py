@@ -43,6 +43,7 @@ from app.core.usage.live_hub import publish_live_usage
 from app.core.usage.live_snapshots import EVENT_MARKER, parse_rate_limit_event_text
 from app.core.utils.request_id import reset_request_id, set_request_id
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
+from app.db.session import SessionLocal
 from app.modules.proxy._service.api_key_usage import (
     _API_KEY_RESERVATION_HEARTBEAT_SECONDS as _API_KEY_RESERVATION_HEARTBEAT_SECONDS,
 )
@@ -183,10 +184,13 @@ from app.modules.proxy.affinity import (
 )
 from app.modules.proxy.continuity import is_http_bridge_account_neutral_replay
 from app.modules.proxy.durable_bridge_coordinator import DurableBridgeLookup
+from app.modules.proxy.durable_bridge_repository import durable_bridge_hash
 from app.modules.proxy.helpers import (
     _normalize_error_code,
     is_upstream_model_capacity_error,
 )
+from app.modules.proxy.rowless_recovery import rowless_projected_actual_wire_fingerprint
+from app.modules.proxy.rowless_recovery_repository import RowlessRecoveryRepository
 from app.modules.proxy.tool_call_dedupe import (
     mark_duplicate_tool_call_downstream_event,
     rewrite_parallel_tool_call_text,
@@ -1783,19 +1787,93 @@ class _HTTPBridgeUpstreamEventsMixin:
             event_block = f"data: {rewritten_text}\n\n"
 
         if status_request_state is not None and is_previous_response_not_found_event:
-            status_request_state.error_http_status_override = 502
-            status_request_state.previous_response_not_found_rewritten = (
-                response_id is None and not has_other_pending_requests
-            )
-            event, payload, event_type, rewritten_text = _maybe_rewrite_websocket_previous_response_not_found_event(
-                request_state=status_request_state,
-                event=event,
-                payload=payload,
-                event_type=event_type,
-                upstream_control=session.upstream_control,
-                original_text=text,
-            )
-            event_block = f"data: {rewritten_text}\n\n"
+            capture_intent = status_request_state.rowless_recovery_capture_intent
+            if (
+                capture_intent is not None
+                and response_id is None
+                and not has_other_pending_requests
+                and status_request_state.response_event_count == 0
+                and status_request_state.previous_response_id is not None
+                and isinstance(status_request_state.request_text, str)
+            ):
+                try:
+                    async with SessionLocal() as rowless_session:
+                        authority = await RowlessRecoveryRepository(rowless_session).capture(
+                            api_key_scope=capture_intent.api_key_scope,
+                            session_key_kind=capture_intent.session_key_kind,
+                            strong_session_hash=capture_intent.strong_session_hash,
+                            stale_anchor_hash=durable_bridge_hash(status_request_state.previous_response_id),
+                            selected_account_intent=session.account.id,
+                            task_identity=capture_intent.task_identity,
+                            session_identity=capture_intent.session_identity,
+                            task_authority_digest=capture_intent.task_authority_digest,
+                            facts=replace(
+                                capture_intent.facts,
+                                actual_wire_fingerprint=rowless_projected_actual_wire_fingerprint(
+                                    status_request_state.request_text,
+                                    capture_intent.facts.projected_input,
+                                ),
+                            ),
+                        )
+                except Exception:
+                    logger.warning("Failed to persist rowless recovery authority", exc_info=True)
+                    status_request_state.error_http_status_override = 502
+                    payload = cast(
+                        dict[str, JsonValue],
+                        dict(
+                            response_failed_event(
+                                "bridge_continuity_persistence_failed",
+                                "The semantic-rebase authority could not be persisted; retrying is unsafe.",
+                                response_id=status_request_state.request_id,
+                            )
+                        ),
+                    )
+                else:
+                    status_request_state.rowless_recovery_authority_id = authority.id
+                    # The failed turn may have created a transient durable
+                    # bridge row.  Retire it so an approved retry must bind a
+                    # fresh durable replacement instead of inheriting a row
+                    # already settled by the stale-anchor failure.
+                    session.closed = True
+                    session.upstream_control.reconnect_requested = True
+                    session.upstream_control.retire_after_drain = True
+                    status_request_state.error_http_status_override = 400
+                    payload = cast(
+                        dict[str, JsonValue],
+                        dict(
+                            response_failed_event(
+                                "previous_response_recovery_authorization_required",
+                                (
+                                    "The saved response anchor no longer has a durable checkpoint. "
+                                    "A dashboard administrator must approve a same-turn semantic rebase."
+                                ),
+                                error_type="invalid_request_error",
+                                response_id=status_request_state.request_id,
+                            )
+                        ),
+                    )
+                    response = payload.get("response")
+                    if isinstance(response, dict):
+                        error_detail = response.get("error")
+                        if isinstance(error_detail, dict):
+                            error_detail["action"] = "retry_same_turn_after_admin_approval"
+                event_block = format_sse_event(payload)
+                event = parse_sse_event_payload(payload)
+                event_type = "response.failed"
+            else:
+                status_request_state.error_http_status_override = 502
+                status_request_state.previous_response_not_found_rewritten = (
+                    response_id is None and not has_other_pending_requests
+                )
+                event, payload, event_type, rewritten_text = _maybe_rewrite_websocket_previous_response_not_found_event(
+                    request_state=status_request_state,
+                    event=event,
+                    payload=payload,
+                    event_type=event_type,
+                    upstream_control=session.upstream_control,
+                    original_text=text,
+                )
+                event_block = f"data: {rewritten_text}\n\n"
 
         retry_error_code = _websocket_precreated_retry_error_code(
             status_request_state,
@@ -2113,20 +2191,70 @@ class _HTTPBridgeUpstreamEventsMixin:
                 matched_request_state,
                 payload,
             )
-            alias_registered = await self._register_http_bridge_previous_response_id(
-                session,
-                response_id,
-                input_item_count=(
-                    matched_request_state.input_item_count if matched_request_state.input_item_count > 0 else None
-                ),
-                input_full_fingerprint=(
-                    matched_request_state.input_full_fingerprint if matched_request_state.input_item_count > 0 else None
-                ),
-                pending_tool_calls=completed_pending_tool_call_manifest,
-            )
-            if not alias_registered and is_http_bridge_account_neutral_replay(
-                kind=session.key.affinity_kind,
-                key=session.key.affinity_key,
+            if matched_request_state.rowless_recovery_authority_id is not None:
+                rowless_settled = False
+                if (
+                    matched_request_state.rowless_recovery_generation is not None
+                    and session.durable_session_id is not None
+                    and session.durable_owner_epoch is not None
+                    and matched_request_state.input_item_count > 0
+                    and matched_request_state.input_full_fingerprint is not None
+                    and completed_pending_tool_call_manifest is not None
+                ):
+                    async with SessionLocal() as rowless_session:
+                        rowless_settled = await RowlessRecoveryRepository(rowless_session).settle_completed(
+                            authority_id=matched_request_state.rowless_recovery_authority_id,
+                            generation=matched_request_state.rowless_recovery_generation,
+                            replacement_session_id=session.durable_session_id,
+                            owner_instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+                            owner_epoch=session.durable_owner_epoch,
+                            request_id=matched_request_state.request_id,
+                            response_id=response_id,
+                            input_item_count=matched_request_state.input_item_count,
+                            input_full_fingerprint=matched_request_state.input_full_fingerprint,
+                            pending_tool_calls=completed_pending_tool_call_manifest,
+                        )
+                if rowless_settled:
+                    # The durable transaction above owns publication.  This
+                    # second idempotent call publishes the in-memory alias
+                    # only after that transaction committed.
+                    live_alias_registered = await self._register_http_bridge_previous_response_id(
+                        session,
+                        response_id,
+                        input_item_count=matched_request_state.input_item_count,
+                        input_full_fingerprint=matched_request_state.input_full_fingerprint,
+                        pending_tool_calls=completed_pending_tool_call_manifest,
+                    )
+                    if not live_alias_registered:
+                        # Durable continuity is already atomically published.
+                        # Retire the stale live view but deliver the successful
+                        # response; the next turn resolves the durable alias.
+                        session.closed = True
+                        session.upstream_control.reconnect_requested = True
+                        session.upstream_control.retire_after_drain = True
+                    alias_registered = True
+                else:
+                    alias_registered = False
+            else:
+                alias_registered = await self._register_http_bridge_previous_response_id(
+                    session,
+                    response_id,
+                    input_item_count=(
+                        matched_request_state.input_item_count if matched_request_state.input_item_count > 0 else None
+                    ),
+                    input_full_fingerprint=(
+                        matched_request_state.input_full_fingerprint
+                        if matched_request_state.input_item_count > 0
+                        else None
+                    ),
+                    pending_tool_calls=completed_pending_tool_call_manifest,
+                )
+            if not alias_registered and (
+                matched_request_state.rowless_recovery_authority_id is not None
+                or is_http_bridge_account_neutral_replay(
+                    kind=session.key.affinity_kind,
+                    key=session.key.affinity_key,
+                )
             ):
                 session.upstream_control.reconnect_requested = True
                 session.upstream_control.retire_after_drain = True

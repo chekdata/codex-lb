@@ -18,11 +18,13 @@ import anyio
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 import app.modules.proxy.load_balancer as load_balancer_module
 import app.modules.proxy.replay_safety as replay_safety_module
 import app.modules.proxy.service as proxy_module
+from app.core.auth.dashboard_access import admin_principal
+from app.core.auth.dashboard_mode import DashboardAuthMode
 from app.core.clients.proxy_websocket import (
     UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE,
     UpstreamWebSocketTransportError,
@@ -42,6 +44,9 @@ from app.db.models import (
     DashboardSettings,
     HttpBridgeRecoveryAttemptRecord,
     HttpBridgeRecoveryAttemptState,
+    HttpBridgeRowlessRecoveryAuthority,
+    HttpBridgeRowlessRecoveryState,
+    HttpBridgeSessionAlias,
     HttpBridgeSessionState,
     RequestLog,
 )
@@ -60,11 +65,631 @@ from app.modules.proxy.load_balancer import (
     AccountSelection,
     CatalogOmissionQuotaAdmission,
 )
+from app.modules.proxy.rowless_recovery_api import require_authenticated_rebase_admin
+from app.modules.proxy.rowless_recovery_repository import (
+    RowlessCheckpointReceipt,
+)
 from app.modules.proxy.sticky_repository import StickySessionsRepository
 from app.modules.usage.repository import AdditionalUsageRepository
 
 pytestmark = pytest.mark.integration
 _TEST_SYNC_TIMEOUT_SECONDS = 5.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("recovery_mode", "incident_shape_index"),
+    (
+        ("success", 0),
+        ("success", 1),
+        ("success", 2),
+        ("approved_no_anchor", 1),
+        ("approved_wrong_anchor", 1),
+        ("two_closed_before_send", 1),
+        ("ambiguous_post_send", 1),
+        ("live_publication_failure", 1),
+        ("installation_id_drift", 1),
+        ("late_wire_drift", 1),
+    ),
+)
+async def test_rowless_stale_anchor_semantic_rebase_end_to_end(
+    async_client,
+    app_instance,
+    monkeypatch,
+    recovery_mode,
+    incident_shape_index,
+):
+    """A purged checkpoint requires one admin-bound same-turn semantic rebase."""
+
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc-rowless-rebase",
+        "rowless-rebase@example.com",
+    )
+    account = await _get_account(account_id)
+    stale_upstream = _RejectStalePreviousResponseUpstreamWebSocket("resp_purged")
+    recovered_upstream = _FakeBridgeUpstreamWebSocket("resp_rowless_recovered")
+    ambiguous_upstream = _AmbiguousAcceptedReceiveErrorUpstreamWebSocket()
+    closed_upstreams = [_ClosedBeforeSendUpstreamWebSocket(), _ClosedBeforeSendUpstreamWebSocket()]
+    if recovery_mode in {
+        "success",
+        "approved_no_anchor",
+        "approved_wrong_anchor",
+        "live_publication_failure",
+        "installation_id_drift",
+        "late_wire_drift",
+    }:
+        upstreams = [stale_upstream, recovered_upstream]
+    elif recovery_mode == "two_closed_before_send":
+        upstreams = [stale_upstream, *closed_upstreams, recovered_upstream]
+    else:
+        upstreams = [stale_upstream, ambiguous_upstream]
+    connect_count = 0
+    selection_count = 0
+
+    async def fake_select_account_with_budget(self, deadline, **kwargs):
+        nonlocal selection_count
+        del self, deadline, kwargs
+        selection_count += 1
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        nonlocal connect_count
+        del headers, access_token, account_id_header, base_url, session
+        upstream = upstreams[connect_count]
+        connect_count += 1
+        return upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+    if recovery_mode == "live_publication_failure":
+        service = get_proxy_service_for_app(app_instance)
+
+        async def fail_live_alias_publication(*args, **kwargs):
+            del args, kwargs
+            return False
+
+        monkeypatch.setattr(
+            service,
+            "_register_http_bridge_previous_response_id",
+            fail_live_alias_publication,
+        )
+    task_id = "01a02f21-77a1-7cc2-a892-b6abac317deb"
+    process_session_id = task_id
+    from tests.unit.test_replay_safety import _rehydrate_sanitized_pending_settlement_shapes
+
+    agent_message_input = _rehydrate_sanitized_pending_settlement_shapes()[incident_shape_index][0]
+    headers = {
+        "session-id": process_session_id,
+        "thread-id": task_id,
+        "x-client-request-id": task_id,
+    }
+    request = {
+        "model": "gpt-5.1",
+        "instructions": "Return exactly OK.",
+        "previous_response_id": "resp_purged",
+        "prompt_cache_key": task_id,
+        "input": agent_message_input,
+    }
+    captured_response = await async_client.post("/v1/responses", headers=headers, json=request)
+
+    assert captured_response.status_code == 400, (
+        captured_response.text,
+        connect_count,
+        stale_upstream.sent_text,
+    )
+    captured_error = captured_response.json()["error"]
+    assert captured_error["code"] == "previous_response_recovery_authorization_required"
+    assert captured_error["action"] == "retry_same_turn_after_admin_approval"
+    assert connect_count == 1
+    assert selection_count == 1
+
+    for anchor_mutation in (None, "resp_different_stale_anchor"):
+        drifted_request = copy.deepcopy(request)
+        if anchor_mutation is None:
+            drifted_request.pop("previous_response_id")
+        else:
+            drifted_request["previous_response_id"] = anchor_mutation
+        drifted_capture = await async_client.post(
+            "/v1/responses",
+            headers=headers,
+            json=drifted_request,
+        )
+        assert drifted_capture.status_code == 400
+        assert drifted_capture.json()["error"]["code"] == ("previous_response_recovery_authorization_required")
+        assert connect_count == 1
+        assert selection_count == 1
+
+    for drift_headers in (
+        {**headers, "x-codex-turn-state": "arbitrary-drift"},
+        {**headers, "x-client-request-id": "different-client-request"},
+        {**headers, "x-codex-session-id": "conflicting-session-alias"},
+    ):
+        drifted_capture = await async_client.post(
+            "/v1/responses",
+            headers=drift_headers,
+            json=request,
+        )
+        assert drifted_capture.status_code == 400
+        assert drifted_capture.json()["error"]["code"] == ("previous_response_recovery_authorization_required")
+        assert connect_count == 1
+        assert selection_count == 1
+
+    for anchor_mutation, routing_drift in (
+        (None, {"x-codex-turn-state": "combined-turn-state-drift"}),
+        ("resp_different_stale_anchor", {"x-client-request-id": "combined-client-drift"}),
+        (None, {"x-codex-session-id": "combined-session-alias-drift"}),
+    ):
+        drifted_request = copy.deepcopy(request)
+        if anchor_mutation is None:
+            drifted_request.pop("previous_response_id")
+        else:
+            drifted_request["previous_response_id"] = anchor_mutation
+        drifted_capture = await async_client.post(
+            "/v1/responses",
+            headers={**headers, **routing_drift},
+            json=drifted_request,
+        )
+        assert drifted_capture.status_code == 400
+        assert drifted_capture.json()["error"]["code"] == ("previous_response_recovery_authorization_required")
+        assert connect_count == 1
+        assert selection_count == 1
+
+    unresolved_retry = copy.deepcopy(request)
+    unresolved_input = unresolved_retry["input"]
+    assert isinstance(unresolved_input, list)
+    unresolved_input.append(
+        {
+            "type": "function_call",
+            "call_id": "call_unresolved_after_capture",
+            "name": "irreversible_action",
+            "arguments": "{}",
+        }
+    )
+    suppressed_unresolved = await async_client.post(
+        "/v1/responses",
+        headers=headers,
+        json=unresolved_retry,
+    )
+    assert suppressed_unresolved.status_code == 400
+    assert suppressed_unresolved.json()["error"]["code"] == ("previous_response_recovery_authorization_required")
+    assert connect_count == 1
+    assert selection_count == 1
+
+    async with SessionLocal() as db_session:
+        authority = await db_session.scalar(select(HttpBridgeRowlessRecoveryAuthority))
+        assert authority is not None
+        assert authority.state == HttpBridgeRowlessRecoveryState.CAPTURED
+        receipt = RowlessCheckpointReceipt(
+            schema="qk_http_bridge_rowless_checkpoint_receipt_v1",
+            remote_session_jsonl_sha256="a" * 64,
+            remote_session_jsonl_size_bytes=1153,
+            remote_session_jsonl_last_offset=1153,
+            full_checkpoint_tool_ledger_digest="b" * 64,
+            unresolved_count=0,
+            task_identity=task_id,
+            session_identity=process_session_id,
+            strong_session_hash=authority.strong_session_hash,
+            task_authority_digest=authority.captured_task_authority_digest,
+            captured_input_item_count=authority.captured_input_item_count,
+            captured_input_fingerprint=authority.captured_input_fingerprint,
+            non_input_contract_fingerprint=authority.non_input_contract_fingerprint,
+            retained_request_direct_call_ledger_digest=authority.settled_direct_call_ledger_digest,
+            captured_projected_payload_fingerprint=authority.projected_payload_fingerprint,
+            captured_actual_wire_fingerprint=authority.actual_wire_fingerprint,
+            captured_request_binding_provenance="server_challenge",
+        )
+    app_instance.dependency_overrides[require_authenticated_rebase_admin] = lambda: admin_principal(
+        auth_mode=DashboardAuthMode.TRUSTED_HEADER,
+        actor="test-dashboard-admin",
+    )
+    challenge_response = await async_client.post(
+        f"/api/http-bridge/rowless-recovery/{authority.id}/challenge",
+        json={"generation": authority.generation},
+    )
+    assert challenge_response.status_code == 200, challenge_response.text
+    challenge_payload = challenge_response.json()
+    assert challenge_payload["capturedInputItemCount"] == authority.captured_input_item_count
+    assert challenge_payload["capturedInputFingerprint"] == authority.captured_input_fingerprint
+    assert challenge_payload["nonInputContractFingerprint"] == authority.non_input_contract_fingerprint
+    assert challenge_payload["retainedRequestLedgerDigest"] == authority.settled_direct_call_ledger_digest
+    assert challenge_payload["projectedPayloadFingerprint"] == authority.projected_payload_fingerprint
+    assert challenge_payload["actualWireFingerprint"] == authority.actual_wire_fingerprint
+    assert challenge_payload["retainedUnresolvedCount"] == 0
+    assert challenge_payload["requestSelfContained"] is True
+    assert challenge_payload["requestAccountNeutral"] is True
+    assert "selectedAccountIntent" not in challenge_payload
+    approval_payload = {
+        "generation": authority.generation,
+        "challenge": challenge_payload["challenge"],
+        "receipt_sha256": receipt.sha256(),
+        "receipt": receipt.canonical_payload(),
+    }
+    missing_ack = await async_client.post(
+        f"/api/http-bridge/rowless-recovery/{authority.id}/approve",
+        json=approval_payload,
+    )
+    assert missing_ack.status_code == 422
+    wrong_ack = await async_client.post(
+        f"/api/http-bridge/rowless-recovery/{authority.id}/approve",
+        json={**approval_payload, "acknowledgement": "OPERATOR_ACKNOWLEDGED_SEMANTIC_REBASE"},
+    )
+    assert wrong_ack.status_code == 422
+    approve_response = await async_client.post(
+        f"/api/http-bridge/rowless-recovery/{authority.id}/approve",
+        json={
+            **approval_payload,
+            "acknowledgement": "operator_acknowledged_semantic_rebase",
+        },
+    )
+    app_instance.dependency_overrides.pop(require_authenticated_rebase_admin, None)
+    assert approve_response.status_code == 200, approve_response.text
+    assert approve_response.json()["state"] == HttpBridgeRowlessRecoveryState.APPROVED.value
+
+    approved_identity_drift = await async_client.post(
+        "/v1/responses",
+        headers={**headers, "x-codex-turn-state": "approved-drift"},
+        json=request,
+    )
+    assert approved_identity_drift.status_code == 400
+    assert approved_identity_drift.json()["error"]["code"] == "rowless_recovery_exact_identity_required"
+    assert connect_count == 1
+    assert selection_count == 1
+
+    approved_anchorless_identity_drift = copy.deepcopy(request)
+    approved_anchorless_identity_drift.pop("previous_response_id")
+    approved_anchorless_drift = await async_client.post(
+        "/v1/responses",
+        headers={**headers, "x-codex-turn-state": "approved-anchorless-drift"},
+        json=approved_anchorless_identity_drift,
+    )
+    assert approved_anchorless_drift.status_code == 400
+    assert approved_anchorless_drift.json()["error"]["code"] == "rowless_recovery_exact_identity_required"
+    assert connect_count == 1
+    assert selection_count == 1
+
+    approved_unresolved = await async_client.post(
+        "/v1/responses",
+        headers=headers,
+        json=unresolved_retry,
+    )
+    assert approved_unresolved.status_code == 400
+    assert approved_unresolved.json()["error"]["code"] == "rowless_recovery_exact_same_turn_required"
+    assert connect_count == 1
+    assert selection_count == 1
+
+    if recovery_mode == "installation_id_drift":
+        async with SessionLocal() as db_session:
+            await db_session.execute(
+                update(Account)
+                .where(Account.id == account_id)
+                .values(codex_installation_id="00000000-0000-4000-8000-000000000001")
+            )
+            await db_session.commit()
+        drifted = await async_client.post("/v1/responses", headers=headers, json=request)
+        assert drifted.status_code == 400
+        assert drifted.json()["error"]["code"] == "rowless_recovery_actual_wire_changed"
+        assert connect_count == 1
+        assert selection_count == 1
+        assert len(recovered_upstream.sent_text) == 0
+        async with SessionLocal() as db_session:
+            approved = await db_session.get(HttpBridgeRowlessRecoveryAuthority, authority.id)
+            assert approved is not None
+            assert approved.state == HttpBridgeRowlessRecoveryState.APPROVED
+        return
+
+    if recovery_mode == "late_wire_drift":
+        original_transform = proxy_module.ProxyService._http_bridge_text_with_account_installation_id
+
+        def drift_after_account_selection(self, session, request_state, text_data):
+            transformed = original_transform(self, session, request_state, text_data)
+            if request_state.rowless_recovery_authority_id is not None:
+                return f"{transformed} "
+            return transformed
+
+        monkeypatch.setattr(
+            proxy_module.ProxyService,
+            "_http_bridge_text_with_account_installation_id",
+            drift_after_account_selection,
+        )
+        drifted = await async_client.post("/v1/responses", headers=headers, json=request)
+        assert drifted.status_code == 400
+        assert drifted.json()["error"]["code"] == "rowless_recovery_actual_wire_changed"
+        assert connect_count == 2
+        assert selection_count == 2
+        assert len(recovered_upstream.sent_text) == 0
+        async with SessionLocal() as db_session:
+            approved = await db_session.get(HttpBridgeRowlessRecoveryAuthority, authority.id)
+            assert approved is not None
+            assert approved.state == HttpBridgeRowlessRecoveryState.APPROVED
+            assert approved.replacement_session_id is None
+            assert await db_session.scalar(select(HttpBridgeRecoveryAttemptRecord)) is None
+        return
+
+    if recovery_mode == "two_closed_before_send":
+        proven_unsent = await async_client.post("/v1/responses", headers=headers, json=request)
+        assert proven_unsent.status_code == 502, proven_unsent.text
+        assert connect_count == 3
+        assert all(not upstream.sent_text for upstream in closed_upstreams)
+        async with SessionLocal() as db_session:
+            restored = await db_session.get(HttpBridgeRowlessRecoveryAuthority, authority.id)
+            assert restored is not None
+            assert restored.state == HttpBridgeRowlessRecoveryState.APPROVED
+            assert restored.dispatch_send_started_at is None
+            assert await db_session.scalar(select(HttpBridgeRecoveryAttemptRecord)) is None
+        recovered_after_unsent = await async_client.post("/v1/responses", headers=headers, json=request)
+        assert recovered_after_unsent.status_code == 200, recovered_after_unsent.text
+        assert connect_count == 4
+        assert len(recovered_upstream.sent_text) == 1
+        async with SessionLocal() as db_session:
+            consumed = await db_session.get(HttpBridgeRowlessRecoveryAuthority, authority.id)
+            assert consumed is not None
+            assert consumed.state == HttpBridgeRowlessRecoveryState.CONSUMED
+        return
+
+    if recovery_mode == "ambiguous_post_send":
+        ambiguous = await async_client.post("/v1/responses", headers=headers, json=request)
+        assert ambiguous.status_code == 502
+        assert ambiguous.json()["error"]["code"] == "stream_incomplete"
+        assert connect_count == 2
+        assert selection_count == 2
+        assert len(ambiguous_upstream.sent_text) == 1
+        assert ambiguous_upstream.irreversible_effect_count == 1
+        async with SessionLocal() as db_session:
+            unknown = await db_session.get(HttpBridgeRowlessRecoveryAuthority, authority.id)
+            assert unknown is not None
+            assert unknown.state == HttpBridgeRowlessRecoveryState.UNKNOWN
+            journal = await db_session.scalar(select(HttpBridgeRecoveryAttemptRecord))
+            assert journal is not None
+            assert journal.state == HttpBridgeRecoveryAttemptState.UNKNOWN
+        local_retry = await async_client.post("/v1/responses", headers=headers, json=unresolved_retry)
+        assert local_retry.status_code == 400
+        assert local_retry.json()["error"]["code"] == "rowless_recovery_dispatch_outcome_unknown"
+        assert connect_count == 2
+        assert selection_count == 2
+        assert len(ambiguous_upstream.sent_text) == 1
+        assert ambiguous_upstream.irreversible_effect_count == 1
+        unknown_identity_drift = await async_client.post(
+            "/v1/responses",
+            headers={**headers, "x-codex-turn-state": "unknown-drift"},
+            json=request,
+        )
+        assert unknown_identity_drift.status_code == 400
+        assert unknown_identity_drift.json()["error"]["code"] == "rowless_recovery_dispatch_outcome_unknown"
+        assert connect_count == 2
+        assert selection_count == 2
+        for anchor_mutation in (None, "resp_different_stale_anchor"):
+            drifted_request = copy.deepcopy(request)
+            if anchor_mutation is None:
+                drifted_request.pop("previous_response_id")
+            else:
+                drifted_request["previous_response_id"] = anchor_mutation
+            suppressed = await async_client.post(
+                "/v1/responses",
+                headers=headers,
+                json=drifted_request,
+            )
+            assert suppressed.status_code == 400
+            assert suppressed.json()["error"]["code"] == "rowless_recovery_dispatch_outcome_unknown"
+            assert connect_count == 2
+            assert selection_count == 2
+            assert ambiguous_upstream.irreversible_effect_count == 1
+        for anchor_mutation, routing_drift in (
+            (None, {"x-codex-turn-state": "unknown-combined-turn-state"}),
+            ("resp_different_stale_anchor", {"x-client-request-id": "unknown-combined-client"}),
+            (None, {"x-codex-session-id": "unknown-combined-alias"}),
+        ):
+            drifted_request = copy.deepcopy(request)
+            if anchor_mutation is None:
+                drifted_request.pop("previous_response_id")
+            else:
+                drifted_request["previous_response_id"] = anchor_mutation
+            suppressed = await async_client.post(
+                "/v1/responses",
+                headers={**headers, **routing_drift},
+                json=drifted_request,
+            )
+            assert suppressed.status_code == 400
+            assert suppressed.json()["error"]["code"] == "rowless_recovery_dispatch_outcome_unknown"
+            assert connect_count == 2
+            assert selection_count == 2
+            assert ambiguous_upstream.irreversible_effect_count == 1
+        return
+
+    dispatch_request = copy.deepcopy(request)
+    if recovery_mode == "approved_no_anchor":
+        dispatch_request.pop("previous_response_id")
+    elif recovery_mode == "approved_wrong_anchor":
+        dispatch_request["previous_response_id"] = "resp_different_stale_anchor"
+    retry_a, retry_b = await asyncio.gather(
+        async_client.post("/v1/responses", headers=headers, json=dispatch_request),
+        async_client.post("/v1/responses", headers=headers, json=dispatch_request),
+    )
+    recovered = next(response for response in (retry_a, retry_b) if response.status_code == 200)
+    rejected_concurrent = next(response for response in (retry_a, retry_b) if response.status_code != 200)
+    assert rejected_concurrent.status_code == 400
+    assert rejected_concurrent.json()["error"]["code"] in {
+        "rowless_recovery_dispatch_already_claimed",
+        "rowless_recovery_dispatch_outcome_unknown",
+        "rowless_recovery_already_consumed",
+    }
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["id"] == "resp_rowless_recovered_1"
+    assert connect_count == 2
+    assert len(stale_upstream.sent_text) == 1
+    assert len(recovered_upstream.sent_text) == 1
+    recovered_wire = json.loads(recovered_upstream.sent_text[0])
+    assert "previous_response_id" not in recovered_wire
+    expected_projection = replay_safety_module.project_responses_input_for_account_neutral_fresh_replay(
+        request["input"],
+        stored_count=len(request["input"]),
+    )
+    assert expected_projection is not None
+    assert recovered_wire["input"] == expected_projection.input_items
+
+    async with SessionLocal() as db_session:
+        authority = await db_session.scalar(select(HttpBridgeRowlessRecoveryAuthority))
+        assert authority is not None
+        assert authority.state == HttpBridgeRowlessRecoveryState.CONSUMED
+        if recovery_mode == "live_publication_failure":
+            durable_alias = await db_session.scalar(
+                select(HttpBridgeSessionAlias).where(HttpBridgeSessionAlias.alias_value == recovered.json()["id"])
+            )
+            assert durable_alias is not None
+
+    if recovery_mode == "live_publication_failure":
+        assert recovered.status_code == 200
+        assert len(recovered_upstream.sent_text) == 1
+        assert connect_count == 2
+        assert selection_count == 2
+        return
+
+    repeated_old_turn = await async_client.post("/v1/responses", headers=headers, json=request)
+    assert repeated_old_turn.status_code == 400
+    assert repeated_old_turn.json()["error"]["code"] == "rowless_recovery_already_consumed"
+    assert connect_count == 2
+    assert selection_count == 2
+
+    for anchor_mutation in (None, "resp_different_stale_anchor"):
+        drifted_request = copy.deepcopy(request)
+        if anchor_mutation is None:
+            drifted_request.pop("previous_response_id")
+        else:
+            drifted_request["previous_response_id"] = anchor_mutation
+        suppressed = await async_client.post(
+            "/v1/responses",
+            headers=headers,
+            json=drifted_request,
+        )
+        assert suppressed.status_code == 400
+        assert suppressed.json()["error"]["code"] == "rowless_recovery_already_consumed"
+        assert connect_count == 2
+        assert selection_count == 2
+        assert len(recovered_upstream.sent_text) == 1
+
+    for anchor_mutation, routing_drift in (
+        (None, {"x-codex-turn-state": "consumed-combined-turn-state"}),
+        ("resp_different_stale_anchor", {"x-client-request-id": "consumed-combined-client"}),
+        (None, {"x-codex-session-id": "consumed-combined-alias"}),
+    ):
+        drifted_request = copy.deepcopy(request)
+        if anchor_mutation is None:
+            drifted_request.pop("previous_response_id")
+        else:
+            drifted_request["previous_response_id"] = anchor_mutation
+        suppressed = await async_client.post(
+            "/v1/responses",
+            headers={**headers, **routing_drift},
+            json=drifted_request,
+        )
+        assert suppressed.status_code == 400
+        assert suppressed.json()["error"]["code"] == "rowless_recovery_already_consumed"
+        assert connect_count == 2
+        assert selection_count == 2
+        assert len(recovered_upstream.sent_text) == 1
+
+    consumed_identity_drift = await async_client.post(
+        "/v1/responses",
+        headers={**headers, "x-codex-turn-state": "consumed-drift"},
+        json=request,
+    )
+    assert consumed_identity_drift.status_code == 400
+    assert consumed_identity_drift.json()["error"]["code"] == "rowless_recovery_already_consumed"
+    assert connect_count == 2
+    assert selection_count == 2
+    assert len(recovered_upstream.sent_text) == 1
+
+    consumed_unresolved = await async_client.post(
+        "/v1/responses",
+        headers=headers,
+        json=unresolved_retry,
+    )
+    assert consumed_unresolved.status_code == 400
+    assert consumed_unresolved.json()["error"]["code"] == "rowless_recovery_already_consumed"
+    assert connect_count == 2
+    assert selection_count == 2
+
+    follow_up = await async_client.post(
+        "/v1/responses",
+        headers=headers,
+        json={
+            "model": request["model"],
+            "instructions": request["instructions"],
+            "previous_response_id": recovered.json()["id"],
+            "prompt_cache_key": task_id,
+            "input": [{"role": "user", "content": "ordinary follow-up"}],
+        },
+    )
+    assert follow_up.status_code == 200, follow_up.text
+    assert len(recovered_upstream.sent_text) == 2
+    assert selection_count == 2
+
+
+@pytest.mark.asyncio
+async def test_rowless_child_thread_sharing_root_bridge_identity_fails_closed_without_capture(
+    async_client,
+    monkeypatch,
+):
+    """A child thread cannot rebase through its root's durable bridge row."""
+
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc-rowless-child-reject",
+        "rowless-child-reject@example.com",
+    )
+    account = await _get_account(account_id)
+    upstream = _RejectStalePreviousResponseUpstreamWebSocket("resp_child_stale")
+
+    async def fake_select_account_with_budget(self, deadline, **kwargs):
+        del self, deadline, kwargs
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(*args, **kwargs):
+        del args, kwargs
+        return upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+    root_session = "root-task"
+    child_thread = "child-task"
+    response = await async_client.post(
+        "/v1/responses",
+        headers={
+            "session-id": root_session,
+            "thread-id": child_thread,
+            "x-client-request-id": child_thread,
+        },
+        json={
+            "model": "gpt-5.1",
+            "previous_response_id": "resp_child_stale",
+            "prompt_cache_key": root_session,
+            "input": [{"role": "user", "content": "same-turn retry"}],
+        },
+    )
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] != "previous_response_recovery_authorization_required"
+    async with SessionLocal() as db_session:
+        authorities = list((await db_session.scalars(select(HttpBridgeRowlessRecoveryAuthority))).all())
+    assert authorities == []
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -14211,7 +14836,7 @@ async def test_v1_responses_http_bridge_quarantines_persistently_stale_proxy_anc
         },
     )
 
-    assert second.status_code == 409
+    assert second.status_code == 400
     assert second.json()["error"]["code"] == "previous_response_complete_context_required"
     assert connect_count == 2
     assert stale_upstream is not None
@@ -15986,7 +16611,7 @@ async def test_v1_responses_http_bridge_quarantined_unproved_full_resend_remains
 
     # Merely looking like a full resend is insufficient proof. The rejected
     # anchor stays attached, so missing prior output cannot be silently lost.
-    assert third.status_code == 409, third.text
+    assert third.status_code == 400, third.text
     assert third.json()["error"]["code"] == "previous_response_pending_call_resolution_required"
     assert connect_count == 3
     assert len(stale_anchor_upstream.sent_text) == 1
@@ -16093,7 +16718,7 @@ async def test_v1_responses_http_bridge_persists_pending_resolution_and_blocks_s
             "input": [{"role": "user", "content": "scheduled continue"}],
         },
     )
-    assert first_delta.status_code == 409, first_delta.text
+    assert first_delta.status_code == 400, first_delta.text
     assert first_delta.json()["error"]["code"] == "previous_response_pending_call_resolution_required"
     assert connect_count == 2
     assert json.loads(stale_upstream.sent_text[0])["previous_response_id"] == "resp_bridge_custom_1"
@@ -16138,7 +16763,7 @@ async def test_v1_responses_http_bridge_persists_pending_resolution_and_blocks_s
             "input": mismatched_full_resend,
         },
     )
-    assert repeated.status_code == 409, repeated.text
+    assert repeated.status_code == 400, repeated.text
     assert repeated.json()["error"]["code"] == "previous_response_pending_call_resolution_required"
     assert connect_count == 2
     assert replacement_upstream.sent_text == []
@@ -16486,7 +17111,7 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
             "input": [{"role": "user", "content": "scheduled continue"}],
         },
     )
-    assert first_delta.status_code == 409, first_delta.text
+    assert first_delta.status_code == 400, first_delta.text
     assert first_delta.json()["error"]["code"] == "previous_response_pending_call_resolution_required"
     assert connect_count == 2
 

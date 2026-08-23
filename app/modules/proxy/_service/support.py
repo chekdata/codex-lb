@@ -39,6 +39,7 @@ from app.modules.proxy.load_balancer import (
     AccountSelection,
     CatalogOmissionQuotaAdmission,
 )
+from app.modules.proxy.rowless_recovery import RowlessRecoveryCaptureIntent
 from app.modules.proxy.tool_call_dedupe import ToolCallDedupeKey
 from app.modules.proxy.work_admission import AdmissionLease
 
@@ -915,6 +916,11 @@ class _WebSocketRequestState:
     last_upstream_activity_at: float | None = None
     upstream_model_output_seen: bool = False
     previous_response_not_found_rewritten: bool = False
+    rowless_recovery_capture_intent: RowlessRecoveryCaptureIntent | None = None
+    rowless_recovery_authority_id: str | None = None
+    rowless_recovery_generation: int | None = None
+    rowless_recovery_task_authority_digest: str | None = None
+    rowless_recovery_wire_fingerprint: str | None = None
     previous_response_owner_lookup_source: str | None = None
     previous_response_owner_lookup_outcome: str | None = None
     previous_response_owner_requested_at: datetime | None = None
@@ -1311,6 +1317,11 @@ def _websocket_request_can_replay_before_visible_output(
     *,
     allow_clean_close_retry: bool = False,
 ) -> bool:
+    if request_state.rowless_recovery_authority_id is not None:
+        # The authority is UNKNOWN before the physical send.  Any transport,
+        # auth, or capacity error after that point is ambiguous and must never
+        # replay the operator-approved semantic turn.
+        return False
     if not request_state.request_text:
         return False
     if request_state.transport == _REQUEST_TRANSPORT_WEBSOCKET and request_state.response_create_sent_at is None:
@@ -1563,4 +1574,7 @@ def _openai_error_envelope_from_response_failed_payload(
     resets_in = error_payload.get("resets_in_seconds")
     if isinstance(resets_in, int | float):
         error_detail["resets_in_seconds"] = resets_in
+    action = error_payload.get("action")
+    if isinstance(action, str) and action.strip():
+        error_detail["action"] = action.strip()
     return envelope
