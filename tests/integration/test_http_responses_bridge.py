@@ -8969,6 +8969,7 @@ async def test_backend_responses_verified_full_resend_ignores_stale_broad_owner_
         latest_response_id="resp_durable_full_resend_previous",
         latest_input_item_count=len(historical_input),
         latest_input_full_fingerprint=proxy_module._fingerprint_input_items(historical_input),
+        latest_pending_tool_calls={},
     )
     assert renewed is not None
     released = await service._durable_bridge.release_live_session(
