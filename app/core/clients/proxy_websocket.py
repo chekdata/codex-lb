@@ -20,6 +20,7 @@ from websockets.exceptions import (
     ConnectionClosedOK,
     InvalidHandshake,
     InvalidProxy,
+    InvalidProxyMessage,
     InvalidStatus,
 )
 from websockets.typing import Origin, Subprotocol
@@ -205,7 +206,7 @@ async def _connect_websockets_transport(
 
     try:
         return await websocket_connect(url, **connect_kwargs)
-    except (asyncio.TimeoutError, OSError) as exc:
+    except (asyncio.TimeoutError, OSError, InvalidProxyMessage) as exc:
         if proxy_url is None or isinstance(exc, ssl.SSLCertVerificationError):
             raise
         logger.warning(
@@ -1061,6 +1062,13 @@ async def _connect_upstream_websocket(
         raise ProxyResponseError(
             502,
             openai_error("upstream_unavailable", message),
+            failure_phase="connect",
+            failure_detail=(
+                "shared_proxy_connect_pre_dispatch_exhausted"
+                if proxy_url is not None and isinstance(exc, InvalidProxyMessage)
+                else None
+            ),
+            failure_exception_type=type(exc).__name__,
         ) from exc
     except OSError as exc:
         error_code = process_network_error_code(
