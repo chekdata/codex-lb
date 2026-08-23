@@ -15734,3 +15734,133 @@ async def test_v1_responses_http_bridge_quarantined_unproved_full_resend_remains
     # quarantine test above proves that an exact owner-bound full resend still
     # recovers and clears quarantine.
     assert fresh_upstream.sent_text == []
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_anchor_rejection(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    """A rejected anchor may discard a call the client provably never accepted."""
+
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_abandoned_pending",
+        "http-bridge-abandoned-pending@example.com",
+    )
+    account = await _get_account(account_id)
+    source_upstream = _ClosingInterruptedCustomToolUpstreamWebSocket("resp_abandoned_pending_source")
+    stale_upstream = _RejectStalePreviousResponseUpstreamWebSocket("resp_bridge_custom_1")
+    recovered_upstream = _FakeBridgeUpstreamWebSocket("resp_abandoned_pending_recovered")
+    upstreams = [source_upstream, stale_upstream, recovered_upstream]
+    connect_count = 0
+
+    async def fake_select_account_with_budget(self, deadline, **kwargs):
+        nonlocal connect_count
+        del self, deadline, kwargs
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        nonlocal connect_count
+        del headers, access_token, account_id_header, base_url, session
+        upstream = upstreams[connect_count]
+        connect_count += 1
+        return upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    session_headers = {
+        "x-codex-session-id": "abandoned-pending-agent-boundary",
+        "x-codex-turn-state": "abandoned-pending-agent-boundary-turn",
+    }
+    historical_input = [{"role": "user", "content": "first question"}]
+    first = await async_client.post(
+        "/v1/responses",
+        headers=session_headers,
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": historical_input,
+        },
+    )
+    assert first.status_code == 200, first.text
+
+    service = get_proxy_service_for_app(app_instance)
+
+    agent_message = {
+        "type": "agent_message",
+        "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea0",
+        "author": "/root/episode_identity_final_audit",
+        "recipient": "/root",
+        "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+            "create_time": 1787431172.912141,
+        },
+        "content": [{"type": "input_text", "text": "verified inter-agent result"}],
+    }
+    full_resend = [
+        *historical_input,
+        agent_message,
+        {"role": "user", "content": "first retry"},
+        {"role": "user", "content": "second retry"},
+    ]
+    durable_lookup = await service._durable_bridge.lookup_request_targets(
+        session_key_kind="turn_state_header",
+        session_key_value=session_headers["x-codex-turn-state"],
+        api_key_id=None,
+        turn_state=session_headers["x-codex-turn-state"],
+        session_header=session_headers["x-codex-session-id"],
+        previous_response_id=None,
+    )
+    assert durable_lookup is not None
+    assert durable_lookup.latest_pending_tool_calls == {"call_custom_shell": "custom_tool_call"}
+    proof_payload = proxy_module.ResponsesRequest.model_validate(
+        {"model": "gpt-5.1", "instructions": "Return exactly OK.", "input": full_resend}
+    )
+    assert (
+        http_bridge_streaming_module._verify_durable_abandoned_pending_full_resend(
+            proof_payload,
+            durable_lookup,
+        )
+        is not None
+    )
+    recovered = await async_client.post(
+        "/v1/responses",
+        headers=session_headers,
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": full_resend,
+        },
+    )
+
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["id"] == "resp_abandoned_pending_recovered_1"
+    assert connect_count == 3
+    assert len(stale_upstream.sent_text) == 1
+    stale_payload = json.loads(stale_upstream.sent_text[0])
+    assert stale_payload["previous_response_id"] == "resp_bridge_custom_1"
+    assert any(
+        item.get("type") == "custom_tool_call_output" and item.get("call_id") == "call_custom_shell"
+        for item in stale_payload["input"]
+    )
+    assert len(recovered_upstream.sent_text) == 1
+    recovered_payload = json.loads(recovered_upstream.sent_text[0])
+    assert "previous_response_id" not in recovered_payload
+    assert recovered_payload["input"] == full_resend
+    assert all(item.get("call_id") != "call_custom_shell" for item in recovered_payload["input"])

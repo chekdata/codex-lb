@@ -53,6 +53,13 @@ loop and require the Codex client to be restarted.
   `amsg_` identity plus canonical agent paths, timestamp/turn metadata, and one
   self-contained text part, and continue rejecting malformed or client-shaped
   lookalikes.
+- Recover one additional abandoned-tool boundary only after upstream rejects
+  the exact durable anchor before emitting any response event: the durable
+  manifest must be nonempty, none of its call ids may occur anywhere in the
+  exact client resend, and the fresh suffix must begin with one canonical
+  response-owned `agent_message` followed only by new user input. This proves
+  the client never accepted or executed the orphan call while keeping ordinary
+  pending-tool replay fail-closed.
 
 ## Impact
 
@@ -75,3 +82,6 @@ loop and require the Codex client to be restarted.
 - Long-lived multi-agent Codex tasks whose latest completed turn ends in a
   sub-agent delivery can use the same one-shot, owner-bound stale-anchor
   recovery without weakening cross-account replay eligibility.
+- A durable pending call that was never delivered to the client no longer
+  strands that task after the corresponding upstream anchor has disappeared;
+  the exception remains same-owner, stale-anchor-triggered, and one-shot.

@@ -493,6 +493,45 @@ def responses_input_suffix_matches_pending_tool_calls(
     return suffix_calls == expected and suffix_outputs == expected
 
 
+def responses_input_suffix_proves_abandoned_pending_agent_boundary(
+    input_items: list[JsonValue],
+    *,
+    stored_count: int,
+    pending_tool_calls: Mapping[str, str],
+    canonical_lite_developer_index: int | None = None,
+) -> bool:
+    """Prove a later inter-agent boundary excludes an undelivered pending call.
+
+    This is deliberately narrower than ordinary fresh-replay eligibility.  It
+    exists for one stale-anchor recovery case: the durable response manifest
+    records a pending client-side tool call, the exact client resend contains
+    none of that call's ids, and a canonical response-owned ``agent_message``
+    followed by fresh user input proves that the client advanced without ever
+    accepting or executing the pending call.  The caller must additionally
+    prove that upstream rejected the exact response anchor before emitting any
+    response event; this predicate alone never authorizes proactive replay.
+    """
+
+    if stored_count <= 0 or len(input_items) <= stored_count or not pending_tool_calls:
+        return False
+    prefix_state = _direct_tool_call_prefix_state(
+        input_items[:stored_count],
+        canonical_lite_developer_index=canonical_lite_developer_index,
+    )
+    if prefix_state is None or prefix_state[0] or prefix_state[1] & pending_tool_calls.keys():
+        return False
+    for item in input_items:
+        if isinstance(item, dict) and item.get("call_id") in pending_tool_calls:
+            return False
+    suffix = input_items[stored_count:]
+    if len(suffix) < 2:
+        return False
+    first = suffix[0]
+    if not isinstance(first, dict) or first.get("type") != "agent_message" or not _is_retained_agent_message(first):
+        return False
+    return all(isinstance(item, dict) and _is_fresh_followup_input(item) for item in suffix[1:])
+
+
 def _direct_tool_call_prefix_state(
     input_items: list[JsonValue],
     *,

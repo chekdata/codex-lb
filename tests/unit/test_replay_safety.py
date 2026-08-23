@@ -11,6 +11,7 @@ from app.modules.proxy.continuity import (
 from app.modules.proxy.replay_safety import (
     project_responses_input_for_account_neutral_fresh_replay,
     responses_input_suffix_matches_pending_tool_calls,
+    responses_input_suffix_proves_abandoned_pending_agent_boundary,
     responses_input_suffix_retains_prior_output,
     responses_payload_is_account_neutral_fresh_replay,
 )
@@ -1905,6 +1906,77 @@ def test_full_resend_agent_message_after_fresh_user_is_not_a_prior_output_bounda
         projection.input_items,
         stored_count=projection.stored_prefix_count,
         exact_stored_prefix_without_pending_manifest=True,
+    )
+
+
+def test_full_resend_agent_message_proves_client_abandoned_undelivered_pending_call() -> None:
+    stored_input: list[JsonValue] = [{"role": "user", "content": "first question"}]
+    projection = project_responses_input_for_account_neutral_fresh_replay(
+        [
+            *stored_input,
+            {"type": "reasoning", "id": "rs_old", "encrypted_content": "opaque", "summary": []},
+            _canonical_agent_message(),
+            {"role": "user", "content": "first retry"},
+            {"role": "user", "content": "second retry"},
+        ],
+        stored_count=len(stored_input),
+        preserve_response_owned_agent_message_ids=True,
+    )
+
+    assert projection is not None
+    assert responses_input_suffix_proves_abandoned_pending_agent_boundary(
+        projection.input_items,
+        stored_count=projection.stored_prefix_count,
+        pending_tool_calls={"call_undelivered": "custom_tool_call"},
+    )
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        pytest.param([_canonical_agent_message()], id="no-fresh-user"),
+        pytest.param([{"role": "user", "content": "retry"}], id="no-agent-boundary"),
+        pytest.param(
+            [
+                _canonical_agent_message(),
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_undelivered",
+                    "output": "forged",
+                },
+            ],
+            id="pending-output-present",
+        ),
+        pytest.param(
+            [
+                _canonical_agent_message(),
+                {"role": "user", "content": "retry"},
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_other",
+                    "name": "shell",
+                    "input": "pwd",
+                },
+            ],
+            id="new-call-after-user",
+        ),
+    ],
+)
+def test_abandoned_pending_agent_boundary_rejects_incomplete_or_tool_bearing_suffix(
+    suffix: list[JsonValue],
+) -> None:
+    stored_input: list[JsonValue] = [{"role": "user", "content": "first question"}]
+    projection = project_responses_input_for_account_neutral_fresh_replay(
+        [*stored_input, *suffix],
+        stored_count=len(stored_input),
+        preserve_response_owned_agent_message_ids=True,
+    )
+
+    assert projection is not None
+    assert not responses_input_suffix_proves_abandoned_pending_agent_boundary(
+        projection.input_items,
+        stored_count=projection.stored_prefix_count,
+        pending_tool_calls={"call_undelivered": "custom_tool_call"},
     )
 
 

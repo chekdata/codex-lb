@@ -9892,6 +9892,67 @@ def test_verified_agent_message_recovery_requires_explicitly_empty_tool_manifest
     assert http_bridge_streaming_module._verify_store_context_full_resend(payload, session) is None
 
 
+def test_verified_abandoned_pending_agent_boundary_is_stale_anchor_only_and_state_bound() -> None:
+    stored_input_items: list[proxy_service.JsonValue] = [
+        {"role": "user", "content": "first question"},
+    ]
+    full_input: list[proxy_service.JsonValue] = [
+        *stored_input_items,
+        {
+            "type": "agent_message",
+            "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea0",
+            "author": "/root/episode_identity_final_audit",
+            "recipient": "/root",
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+                "create_time": 1787431172.912141,
+            },
+            "content": [{"type": "input_text", "text": "verified inter-agent result"}],
+        },
+        {"role": "user", "content": "continue"},
+    ]
+    payload = proxy_service.ResponsesRequest.model_validate(
+        {"model": "gpt-5.4", "instructions": "hi", "input": full_input}
+    )
+    durable_lookup = proxy_service.DurableBridgeLookup(
+        session_id="sess-abandoned-pending-proof",
+        canonical_kind="session_header",
+        canonical_key="sid-abandoned-pending-proof",
+        api_key_scope="__anonymous__",
+        account_id="acc-proof",
+        owner_instance_id=None,
+        owner_epoch=3,
+        lease_expires_at=None,
+        state=HttpBridgeSessionState.CLOSED,
+        latest_turn_state="http_turn_abandoned_pending_proof",
+        latest_response_id="resp-abandoned-pending-proof",
+        latest_input_item_count=len(stored_input_items),
+        latest_input_full_fingerprint=proxy_service._fingerprint_input_items(stored_input_items),
+        latest_pending_tool_calls={"call-undelivered": "custom_tool_call"},
+        model="gpt-5.4",
+    )
+
+    # This proof is intentionally excluded from ordinary fresh replay.
+    assert http_bridge_streaming_module._verify_durable_full_resend(payload, durable_lookup) is None
+    proof = http_bridge_streaming_module._verify_durable_abandoned_pending_full_resend(
+        payload,
+        durable_lookup,
+    )
+    assert proof is not None
+    assert proof.matches(payload, durable_lookup)
+    assert not proof.matches(
+        payload,
+        replace(durable_lookup, latest_pending_tool_calls={"call-other": "custom_tool_call"}),
+    )
+    assert (
+        http_bridge_streaming_module._verify_durable_abandoned_pending_full_resend(
+            payload.model_copy(update={"input": [*stored_input_items, full_input[-1]]}),
+            durable_lookup,
+        )
+        is None
+    )
+
+
 def test_verified_store_context_full_resend_proof_is_sealed_and_live_session_bound() -> None:
     stored_input_items: list[proxy_service.JsonValue] = [
         {"role": "user", "content": "hello"},

@@ -230,6 +230,7 @@ from app.modules.proxy.helpers import (
 from app.modules.proxy.replay_safety import (
     project_responses_input_for_account_neutral_fresh_replay,
     responses_input_suffix_matches_pending_tool_calls,
+    responses_input_suffix_proves_abandoned_pending_agent_boundary,
     responses_input_suffix_retains_prior_output,
     responses_payload_is_account_neutral_fresh_replay,
 )
@@ -426,8 +427,7 @@ class _VerifiedDurableFullResend:
         )
         if not safe_fresh_context:
             return None
-        return cls(
-            _token=cls.__construction_token,
+        return cls._seal(
             durable_session_id=durable_lookup.session_id,
             owner_account_id=owner_account_id,
             latest_response_id=latest_response_id,
@@ -435,6 +435,29 @@ class _VerifiedDurableFullResend:
             stored_input_fingerprint=stored_fingerprint,
             full_input_fingerprint=_fingerprint_input_items(input_items),
             pending_tool_calls=_pending_tool_calls_identity(pending_tool_calls),
+        )
+
+    @classmethod
+    def _seal(
+        cls,
+        *,
+        durable_session_id: str,
+        owner_account_id: str,
+        latest_response_id: str,
+        stored_input_item_count: int,
+        stored_input_fingerprint: str,
+        full_input_fingerprint: str,
+        pending_tool_calls: tuple[tuple[str, str], ...] | None,
+    ) -> "_VerifiedDurableFullResend":
+        return cls(
+            _token=cls.__construction_token,
+            durable_session_id=durable_session_id,
+            owner_account_id=owner_account_id,
+            latest_response_id=latest_response_id,
+            stored_input_item_count=stored_input_item_count,
+            stored_input_fingerprint=stored_input_fingerprint,
+            full_input_fingerprint=full_input_fingerprint,
+            pending_tool_calls=pending_tool_calls,
         )
 
 
@@ -451,6 +474,67 @@ def _verify_durable_full_resend(
     if durable_lookup is None or durable_lookup.account_id is None or durable_lookup.latest_response_id is None:
         return None
     return _VerifiedDurableFullResend._verify(payload, durable_lookup)
+
+
+def _verify_durable_abandoned_pending_full_resend(
+    payload: ResponsesRequest,
+    durable_lookup: DurableBridgeLookup | None,
+) -> _VerifiedDurableFullResend | None:
+    """Seal a full resend that may recover only after exact anchor rejection.
+
+    Unlike ``_verify_durable_full_resend``, this proof does not make a request
+    generally replay-safe.  It binds an exact stored prefix, a non-empty
+    durable pending-call manifest, and a later response-owned inter-agent
+    boundary whose client history contains none of those pending call ids.
+    Callers may use it only after upstream rejects the exact durable anchor
+    before producing any response event.
+    """
+
+    if durable_lookup is None:
+        return None
+    owner_account_id = durable_lookup.account_id
+    latest_response_id = durable_lookup.latest_response_id
+    stored_count = durable_lookup.latest_input_item_count
+    stored_fingerprint = durable_lookup.latest_input_full_fingerprint
+    pending_tool_calls = durable_lookup.latest_pending_tool_calls
+    if (
+        owner_account_id is None
+        or latest_response_id is None
+        or stored_count is None
+        or stored_fingerprint is None
+        or not pending_tool_calls
+        or not _http_bridge_payload_looks_like_full_resend(payload)
+        or not isinstance(payload.input, list)
+        or not _input_prefix_matches_stored_context(
+            payload.input,
+            stored_count=stored_count,
+            stored_fingerprint=stored_fingerprint,
+        )
+    ):
+        return None
+    input_items = cast(list[JsonValue], payload.input)
+    replay_projection = project_responses_input_for_account_neutral_fresh_replay(
+        input_items,
+        stored_count=stored_count,
+        preserve_developer_message_ids=True,
+        preserve_response_owned_agent_message_ids=True,
+    )
+    if replay_projection is None or not responses_input_suffix_proves_abandoned_pending_agent_boundary(
+        replay_projection.input_items,
+        stored_count=replay_projection.stored_prefix_count,
+        pending_tool_calls=pending_tool_calls,
+        canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+    ):
+        return None
+    return _VerifiedDurableFullResend._seal(
+        durable_session_id=durable_lookup.session_id,
+        owner_account_id=owner_account_id,
+        latest_response_id=latest_response_id,
+        stored_input_item_count=stored_count,
+        stored_input_fingerprint=stored_fingerprint,
+        full_input_fingerprint=_fingerprint_input_items(input_items),
+        pending_tool_calls=_pending_tool_calls_identity(pending_tool_calls),
+    )
 
 
 class _VerifiedStoreContextFullResend:
@@ -1493,6 +1577,10 @@ class _HTTPBridgeStreamingMixin:
         durable_recovery_attempt_session_id: str | None = None
         durable_recovery_attempt_owner_epoch: int | None = None
         durable_full_resend_proof = _verify_durable_full_resend(payload, durable_lookup)
+        durable_abandoned_pending_full_resend_proof = _verify_durable_abandoned_pending_full_resend(
+            payload,
+            durable_lookup,
+        )
         durable_full_resend_fresh_bridge_proof: _VerifiedDurableFullResend | None = None
         force_local_recovery_creation = False
         payload_looks_like_full_resend = _http_bridge_payload_looks_like_full_resend(payload)
@@ -2382,6 +2470,12 @@ class _HTTPBridgeStreamingMixin:
                         else:
                             if _http_bridge_durable_lookup_allows_turn_state_takeover(fresh_turn_state_lookup):
                                 durable_lookup = fresh_turn_state_lookup
+                                durable_abandoned_pending_full_resend_proof = (
+                                    _verify_durable_abandoned_pending_full_resend(
+                                        payload,
+                                        fresh_turn_state_lookup,
+                                    )
+                                )
                                 if fresh_turn_state_lookup is None:
                                     durable_full_resend_anchor_count = None
                                     durable_full_resend_anchor_fingerprint = None
@@ -3376,8 +3470,26 @@ class _HTTPBridgeStreamingMixin:
                 and durable_full_resend_proof is not None
                 and durable_full_resend_proof.matches(untrimmed_effective_payload, durable_lookup)
             )
+            abandoned_pending_stale_anchor_replay = bool(
+                should_attempt_previous_response_recovery
+                and stale_anchor_rejected
+                and request_state.response_event_count == 0
+                and durable_lookup is not None
+                and durable_abandoned_pending_full_resend_proof is not None
+                and durable_abandoned_pending_full_resend_proof.matches(
+                    untrimmed_effective_payload,
+                    durable_lookup,
+                )
+                and (
+                    request_state.proxy_injected_previous_response_id
+                    or effective_payload.previous_response_id is not None
+                )
+            )
             proof_gated_stale_anchor_replay = (
-                durable_stale_anchor_replay or store_context_stale_anchor_replay or client_provided_stale_anchor_replay
+                durable_stale_anchor_replay
+                or store_context_stale_anchor_replay
+                or client_provided_stale_anchor_replay
+                or abandoned_pending_stale_anchor_replay
             )
             should_attempt_context_overflow_fresh_turn_recovery = (
                 is_context_overflow
@@ -3471,7 +3583,9 @@ class _HTTPBridgeStreamingMixin:
                         )
                     ).inc()
                 proof_source = (
-                    "client_explicit"
+                    "abandoned_pending_agent_boundary"
+                    if abandoned_pending_stale_anchor_replay
+                    else "client_explicit"
                     if client_provided_stale_anchor_replay
                     else "store_context"
                     if store_context_stale_anchor_replay
