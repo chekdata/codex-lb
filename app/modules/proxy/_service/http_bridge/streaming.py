@@ -228,6 +228,7 @@ from app.modules.proxy.helpers import (
     _normalize_error_code,
 )
 from app.modules.proxy.replay_safety import (
+    project_responses_input_for_abandoned_pending_fresh_replay,
     project_responses_input_for_account_neutral_fresh_replay,
     responses_input_suffix_matches_pending_tool_calls,
     responses_input_suffix_proves_abandoned_pending_agent_boundary,
@@ -3609,12 +3610,10 @@ class _HTTPBridgeStreamingMixin:
                 if abandoned_pending_stale_anchor_replay:
                     if not isinstance(untrimmed_effective_payload.input, list):
                         raise
-                    abandoned_projection = project_responses_input_for_account_neutral_fresh_replay(
+                    abandoned_projection = project_responses_input_for_abandoned_pending_fresh_replay(
                         cast(list[JsonValue], untrimmed_effective_payload.input),
                         stored_count=durable_abandoned_pending_full_resend_proof.stored_input_item_count,
-                        preserve_developer_message_ids=True,
-                        preserve_response_owned_agent_message_ids=True,
-                        omit_response_owned_agent_messages_from_stored_prefix=True,
+                        pending_tool_calls=dict(durable_lookup.latest_pending_tool_calls or {}),
                     )
                     if abandoned_projection is None:
                         raise
