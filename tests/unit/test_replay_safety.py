@@ -1794,6 +1794,24 @@ def _canonical_agent_message() -> dict[str, JsonValue]:
     }
 
 
+def _canonical_response_owned_user_message(
+    *,
+    message_id: str = "msg_01a02c43-4980-7afb-97f5-2e2d30aa73de",
+    turn_id: str = "01a02c43-4980-7afb-97f5-2e2d30aa73de",
+    text: str = "retry",
+) -> dict[str, JsonValue]:
+    return {
+        "type": "message",
+        "id": message_id,
+        "role": "user",
+        "content": [{"type": "input_text", "text": text}],
+        "internal_chat_message_metadata_passthrough": {
+            "turn_id": turn_id,
+            "create_time": 1787433402.605,
+        },
+    }
+
+
 def test_full_resend_exact_prefix_accepts_canonical_agent_message_before_user_retries() -> None:
     stored_input: list[JsonValue] = [{"role": "user", "content": "first question"}]
     full_input: list[JsonValue] = [
@@ -1932,6 +1950,83 @@ def test_full_resend_agent_message_proves_client_abandoned_undelivered_pending_c
 
     assert responses_input_suffix_proves_abandoned_pending_agent_boundary(
         input_items,
+        stored_count=len(stored_input),
+        pending_tool_calls={"call_undelivered": "custom_tool_call"},
+    )
+
+
+def test_full_resend_real_codex_user_bookkeeping_is_stripped_after_boundary_proof() -> None:
+    stored_input: list[JsonValue] = [
+        _canonical_response_owned_user_message(
+            message_id="msg_01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+            turn_id="01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+            text="first question",
+        )
+    ]
+    first_retry = _canonical_response_owned_user_message(
+        message_id="msg_01a02c31-2f60-7dd2-9f22-d7ef316596b1",
+        turn_id="01a02c31-2f60-7dd2-9f22-d7ef316596b1",
+        text="scheduled retry",
+    )
+    second_retry = _canonical_response_owned_user_message(text="continue")
+    input_items: list[JsonValue] = [
+        *stored_input,
+        {
+            "type": "reasoning",
+            "id": "rs_08639659bba14680016a8a0902e9a887d090946ff27b898f05",
+            "encrypted_content": "opaque",
+            "summary": [],
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+            },
+        },
+        _canonical_agent_message(),
+        first_retry,
+        second_retry,
+    ]
+
+    assert responses_input_suffix_proves_abandoned_pending_agent_boundary(
+        input_items,
+        stored_count=len(stored_input),
+        pending_tool_calls={"call_undelivered": "custom_tool_call"},
+    )
+    projection = project_responses_input_for_account_neutral_fresh_replay(
+        input_items,
+        stored_count=len(stored_input),
+        omit_response_owned_agent_messages_from_stored_prefix=True,
+    )
+    assert projection is not None
+    for item in projection.input_items:
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        assert "id" not in item
+        metadata = item.get("internal_chat_message_metadata_passthrough")
+        assert isinstance(metadata, dict)
+        assert set(metadata) == {"turn_id"}
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda item: item.__setitem__("id", "msg_not-a-uuid"), id="invalid-message-id"),
+        pytest.param(
+            lambda item: item["internal_chat_message_metadata_passthrough"].__setitem__("extra", True),
+            id="extra-metadata",
+        ),
+        pytest.param(
+            lambda item: item["internal_chat_message_metadata_passthrough"].__setitem__("create_time", -1),
+            id="negative-create-time",
+        ),
+        pytest.param(lambda item: item.__setitem__("extra", "unbound"), id="extra-field"),
+    ],
+)
+def test_abandoned_pending_boundary_rejects_malformed_response_owned_user_messages(mutate) -> None:
+    stored_input: list[JsonValue] = [{"role": "user", "content": "first question"}]
+    user_message = _canonical_response_owned_user_message()
+    mutate(user_message)
+
+    assert not responses_input_suffix_proves_abandoned_pending_agent_boundary(
+        [*stored_input, _canonical_agent_message(), user_message],
         stored_count=len(stored_input),
         pending_tool_calls={"call_undelivered": "custom_tool_call"},
     )

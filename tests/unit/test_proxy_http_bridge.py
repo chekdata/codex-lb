@@ -9929,7 +9929,16 @@ def test_verified_abandoned_pending_agent_boundary_is_stale_anchor_only_and_stat
             },
             "content": [{"type": "input_text", "text": "verified inter-agent result"}],
         },
-        {"role": "user", "content": "continue"},
+        {
+            "type": "message",
+            "id": "msg_01a02c43-4980-7afb-97f5-2e2d30aa73de",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "continue"}],
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "01a02c43-4980-7afb-97f5-2e2d30aa73de",
+                "create_time": 1787433402.605,
+            },
+        },
     ]
     payload = proxy_service.ResponsesRequest.model_validate(
         {"model": "gpt-5.4", "instructions": "hi", "input": full_input}

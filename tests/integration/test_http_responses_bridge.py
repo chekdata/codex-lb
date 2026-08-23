@@ -15788,6 +15788,19 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
         "x-codex-session-id": "abandoned-pending-agent-boundary",
         "x-codex-turn-state": "abandoned-pending-agent-boundary-turn",
     }
+
+    def response_owned_user_message(*, message_id: str, text: str, create_time: float) -> dict[str, Any]:
+        return {
+            "type": "message",
+            "id": f"msg_{message_id}",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": message_id,
+                "create_time": create_time,
+            },
+        }
+
     historical_agent_message = {
         "type": "agent_message",
         "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea1",
@@ -15800,7 +15813,11 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
         "content": [{"type": "input_text", "text": "historical inter-agent result"}],
     }
     historical_input = [
-        {"role": "user", "content": "first question"},
+        response_owned_user_message(
+            message_id="01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+            text="first question",
+            create_time=1787431100.0,
+        ),
         historical_agent_message,
     ]
     first = await async_client.post(
@@ -15839,8 +15856,16 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
             },
         },
         agent_message,
-        {"role": "user", "content": "first retry"},
-        {"role": "user", "content": "second retry"},
+        response_owned_user_message(
+            message_id="01a02c31-2f60-7dd2-9f22-d7ef316596b1",
+            text="first retry",
+            create_time=1787433300.0,
+        ),
+        response_owned_user_message(
+            message_id="01a02c43-4980-7afb-97f5-2e2d30aa73de",
+            text="second retry",
+            create_time=1787433402.605,
+        ),
     ]
     durable_lookup = await service._durable_bridge.lookup_request_targets(
         session_key_kind="turn_state_header",
@@ -15886,9 +15911,30 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
     recovered_payload = json.loads(recovered_upstream.sent_text[0])
     assert "previous_response_id" not in recovered_payload
     assert recovered_payload["input"] == [
-        historical_input[0],
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "first question"}],
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+            },
+        },
         agent_message,
-        {"role": "user", "content": "first retry"},
-        {"role": "user", "content": "second retry"},
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "first retry"}],
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "01a02c31-2f60-7dd2-9f22-d7ef316596b1",
+            },
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "second retry"}],
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "01a02c43-4980-7afb-97f5-2e2d30aa73de",
+            },
+        },
     ]
     assert all(item.get("call_id") != "call_custom_shell" for item in recovered_payload["input"])
