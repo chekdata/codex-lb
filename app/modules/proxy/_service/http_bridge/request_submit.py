@@ -2045,6 +2045,7 @@ class _HTTPBridgeRequestSubmitMixin:
         *,
         detail: str,
         retry_circuit_detail: str | None = None,
+        retry_circuit_already_recorded: bool = False,
         response_events_seen: int | None = None,
     ) -> None:
         async with session.pending_lock:
@@ -2060,7 +2061,11 @@ class _HTTPBridgeRequestSubmitMixin:
         # transport cleanup, not another failed request. Recording it with an
         # empty retired set double-counts one semantic failure and can open the
         # durable retry circuit before the verified recovery turn is admitted.
-        if retired_request_states and (response_events_seen is None or response_events_seen == 0):
+        if (
+            not retry_circuit_already_recorded
+            and retired_request_states
+            and (response_events_seen is None or response_events_seen == 0)
+        ):
             await self._record_http_bridge_retry_circuit_failure(
                 session,
                 detail=retry_circuit_detail or detail,

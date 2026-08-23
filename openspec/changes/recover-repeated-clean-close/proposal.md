@@ -18,6 +18,10 @@ loop and require the Codex client to be restarted.
 - Emit a dedicated diagnostic event for the additional clean-close replay.
 - Keep the allowance hard-capped at one and preserve all existing no-replay
   behavior after downstream-visible output or continuity-sensitive state.
+- Treat an unclassified WebSocket receive error after dispatch as ambiguous
+  delivery and fail closed without reconnecting or resending the request.
+- Distinguish a generic receive failure on an idle bridge from an active
+  `stream_incomplete` failure without logging request content or identifiers.
 - When recovery is initiated outside the upstream reader, cancel and await the
   old reader before closing its socket, then start exactly one reader for the
   replacement socket.

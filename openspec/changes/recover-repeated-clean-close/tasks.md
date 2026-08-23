@@ -17,6 +17,14 @@
 - [x] Require a separate account-neutral proof before a fresh-body retry may change accounts.
 - [x] Keep physical-socket-only recovery pinned to the owning account until an explicit account-neutral logical fork strips prior affinity state.
 - [x] Keep post-dispatch send failures ambiguous and non-replayable.
+- [x] Keep unclassified post-dispatch receive failures ambiguous and
+  non-replayable while preserving the bounded clean-close and typed
+  closed-before-send recovery owners.
+- [x] Classify an idle generic receive failure as content-free bridge
+  retirement rather than an active `stream_incomplete` failure.
+- [x] Add regressions proving an unobserved upstream acceptance cannot cause a
+  second irreversible execution, while clean-close and typed pre-send recovery
+  remain bounded and available.
 - [x] Return an atomic retry-circuit decision with failure detail and remaining cooldown.
 - [x] Render accurate cooldown copy and one matching integer `Retry-After` value on every HTTP 503 cooldown path.
 - [x] Keep sub-threshold state out of half-open mode and prevent an admitted probe from suppressing its own stream.
