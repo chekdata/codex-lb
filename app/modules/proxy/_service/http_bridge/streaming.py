@@ -1644,6 +1644,20 @@ class _HTTPBridgeStreamingMixin:
             payload,
             durable_lookup,
         )
+        durable_marker_abandoned_pending_candidate = bool(
+            durable_lookup is not None
+            and durable_lookup.recovery_is_required_for_latest_anchor()
+            and durable_abandoned_pending_full_resend_proof is not None
+            and durable_abandoned_pending_full_resend_proof.matches(payload, durable_lookup)
+        )
+        durable_marker_verified_recovery_candidate = bool(
+            durable_lookup is not None
+            and durable_lookup.recovery_is_required_for_latest_anchor()
+            and (
+                (durable_full_resend_proof is not None and durable_full_resend_proof.matches(payload, durable_lookup))
+                or durable_marker_abandoned_pending_candidate
+            )
+        )
         if durable_full_resend_proof is None:
             _log_abandoned_pending_full_resend_rejection(
                 bridge_session_key=bridge_session_key,
@@ -1653,6 +1667,8 @@ class _HTTPBridgeStreamingMixin:
                 stage="initial_lookup",
             )
         durable_full_resend_fresh_bridge_proof: _VerifiedDurableFullResend | None = None
+        durable_marker_abandoned_pending_replay = False
+        durable_marker_verified_recovery = False
         force_local_recovery_creation = False
         payload_looks_like_full_resend = _http_bridge_payload_looks_like_full_resend(payload)
         # Set when the quarantine check below suppresses the durable-anchor
@@ -1723,6 +1739,92 @@ class _HTTPBridgeStreamingMixin:
                 )
             return stored_count, lookup.latest_input_full_fingerprint, safe_fresh_context
 
+        async def prepare_durable_recovery_attempt_journal(request_fingerprint: str) -> None:
+            nonlocal durable_recovery_attempt_available
+            nonlocal durable_recovery_attempt_claimed
+            nonlocal durable_recovery_attempt_owner_epoch
+            nonlocal durable_recovery_attempt_session_id
+
+            if durable_lookup is None:
+                return
+            try:
+                existing_attempt = await self._durable_bridge.lookup_recovery_attempt(
+                    session_id=durable_lookup.session_id,
+                    request_fingerprint=request_fingerprint,
+                )
+                if existing_attempt is not None and (
+                    durable_lookup.state != HttpBridgeSessionState.ACTIVE
+                    or not durable_lookup.lease_is_active(now=utcnow())
+                ):
+                    claim_instance_id = _service_get_settings().http_responses_session_bridge_instance_id
+                    claim_owner_epoch = durable_lookup.owner_epoch
+                    owner_is_current = (
+                        durable_lookup.owner_instance_id == claim_instance_id
+                        and durable_lookup.lease_is_active(now=utcnow())
+                    )
+                    if not owner_is_current:
+                        claimed_session = await self._durable_bridge.claim_live_session(
+                            session_key_kind=durable_lookup.canonical_kind,
+                            session_key_value=durable_lookup.canonical_key,
+                            api_key_id=bridge_session_key.api_key_id,
+                            instance_id=claim_instance_id,
+                            lease_ttl_seconds=_http_bridge_durable_lease_ttl_seconds(),
+                            account_id=durable_lookup.account_id,
+                            model=payload.model,
+                            service_tier=None,
+                            latest_turn_state=durable_lookup.latest_turn_state,
+                            latest_response_id=None,
+                            owner_process_epoch=http_bridge_owner_process_epoch(),
+                            # Revalidate the stale lookup under the row lock;
+                            # an active owner that appeared after lookup must
+                            # not be displaced.
+                            allow_takeover=False,
+                        )
+                        if claimed_session.owner_instance_id != claim_instance_id:
+                            raise ProxyResponseError(
+                                502,
+                                openai_error(
+                                    "bridge_continuity_persistence_failed",
+                                    "HTTP responses recovery ownership changed; retry the request.",
+                                ),
+                            )
+                        claim_owner_epoch = claimed_session.owner_epoch
+                    claimed = await self._durable_bridge.mark_recovery_attempt_replayed(
+                        session_id=durable_lookup.session_id,
+                        api_key_id=bridge_session_key.api_key_id,
+                        instance_id=claim_instance_id,
+                        owner_epoch=claim_owner_epoch,
+                        request_fingerprint=request_fingerprint,
+                    )
+                    if not claimed:
+                        raise ProxyResponseError(
+                            502,
+                            openai_error(
+                                "bridge_continuity_persistence_failed",
+                                "HTTP responses recovery ownership changed; retry the request.",
+                            ),
+                        )
+                    durable_recovery_attempt_claimed = True
+                    durable_recovery_attempt_available = False
+                    durable_recovery_attempt_session_id = durable_lookup.session_id
+                    durable_recovery_attempt_owner_epoch = claim_owner_epoch
+                elif existing_attempt is None:
+                    # The request-submit path journals this exact fingerprint
+                    # immediately before dispatch. An ambiguous outcome may
+                    # then consume only one same-owner replay generation.
+                    durable_recovery_attempt_available = True
+            except ProxyResponseError:
+                raise
+            except Exception:
+                logger.warning("Failed to claim HTTP bridge recovery attempt", exc_info=True)
+                raise ProxyResponseError(
+                    502,
+                    openai_error(
+                        "bridge_continuity_persistence_failed",
+                        "HTTP responses recovery state could not be claimed; retry the request.",
+                    ),
+                )
+
         if durable_lookup is not None:
             (
                 durable_full_resend_anchor_count,
@@ -1760,85 +1862,12 @@ class _HTTPBridgeStreamingMixin:
                 )
                 del _fresh_state
                 durable_recovery_attempt_fingerprint = durable_bridge_hash(fresh_replay_text)
-                if durable_lookup is not None and durable_full_resend_is_account_neutral:
-                    try:
-                        existing_attempt = await self._durable_bridge.lookup_recovery_attempt(
-                            session_id=durable_lookup.session_id,
-                            request_fingerprint=durable_recovery_attempt_fingerprint,
-                        )
-                        if existing_attempt is not None and (
-                            durable_lookup.state != HttpBridgeSessionState.ACTIVE
-                            or not durable_lookup.lease_is_active(now=utcnow())
-                        ):
-                            claim_instance_id = _service_get_settings().http_responses_session_bridge_instance_id
-                            claim_owner_epoch = durable_lookup.owner_epoch
-                            owner_is_current = (
-                                durable_lookup.owner_instance_id == claim_instance_id
-                                and durable_lookup.lease_is_active(now=utcnow())
-                            )
-                            if not owner_is_current:
-                                claimed_session = await self._durable_bridge.claim_live_session(
-                                    session_key_kind=durable_lookup.canonical_kind,
-                                    session_key_value=durable_lookup.canonical_key,
-                                    api_key_id=bridge_session_key.api_key_id,
-                                    instance_id=claim_instance_id,
-                                    lease_ttl_seconds=_http_bridge_durable_lease_ttl_seconds(),
-                                    account_id=durable_lookup.account_id,
-                                    model=payload.model,
-                                    service_tier=None,
-                                    latest_turn_state=durable_lookup.latest_turn_state,
-                                    latest_response_id=None,
-                                    owner_process_epoch=http_bridge_owner_process_epoch(),
-                                    # Revalidate the stale lookup under the
-                                    # row lock; an active owner that appeared
-                                    # after the lookup must not be displaced.
-                                    allow_takeover=False,
-                                )
-                                if claimed_session.owner_instance_id != claim_instance_id:
-                                    raise ProxyResponseError(
-                                        502,
-                                        openai_error(
-                                            "bridge_continuity_persistence_failed",
-                                            "HTTP responses recovery ownership changed; retry the request.",
-                                        ),
-                                    )
-                                claim_owner_epoch = claimed_session.owner_epoch
-                            claimed = await self._durable_bridge.mark_recovery_attempt_replayed(
-                                session_id=durable_lookup.session_id,
-                                api_key_id=bridge_session_key.api_key_id,
-                                instance_id=claim_instance_id,
-                                owner_epoch=claim_owner_epoch,
-                                request_fingerprint=durable_recovery_attempt_fingerprint,
-                            )
-                            if not claimed:
-                                raise ProxyResponseError(
-                                    502,
-                                    openai_error(
-                                        "bridge_continuity_persistence_failed",
-                                        "HTTP responses recovery ownership changed; retry the request.",
-                                    ),
-                                )
-                            durable_recovery_attempt_claimed = True
-                            durable_recovery_attempt_available = False
-                            durable_recovery_attempt_session_id = durable_lookup.session_id
-                            durable_recovery_attempt_owner_epoch = claim_owner_epoch
-                        elif existing_attempt is None:
-                            # No prior attempt owns this fingerprint. The
-                            # request-submit path will journal it immediately
-                            # before dispatch, and an ambiguous transport
-                            # outcome may then consume the one replay fence.
-                            durable_recovery_attempt_available = True
-                    except ProxyResponseError:
-                        raise
-                    except Exception:
-                        logger.warning("Failed to claim HTTP bridge recovery attempt", exc_info=True)
-                        raise ProxyResponseError(
-                            502,
-                            openai_error(
-                                "bridge_continuity_persistence_failed",
-                                "HTTP responses recovery state could not be claimed; retry the request.",
-                            ),
-                        )
+                if (
+                    durable_lookup is not None
+                    and durable_full_resend_is_account_neutral
+                    and not durable_marker_verified_recovery_candidate
+                ):
+                    await prepare_durable_recovery_attempt_journal(durable_recovery_attempt_fingerprint)
         durable_anchor_trimmable = durable_full_resend_anchor_count is not None
         durable_model_transition_lookup = (
             durable_lookup
@@ -1908,6 +1937,145 @@ class _HTTPBridgeStreamingMixin:
             verified_quarantine_full_resend = bool(
                 durable_full_resend_proof is not None and durable_full_resend_proof.matches(payload, durable_lookup)
             )
+            durable_recovery_marker_active = durable_lookup.recovery_is_required_for_latest_anchor()
+            verified_marker_full_resend = bool(
+                verified_quarantine_full_resend
+                or (
+                    durable_abandoned_pending_full_resend_proof is not None
+                    and durable_abandoned_pending_full_resend_proof.matches(payload, durable_lookup)
+                )
+            )
+            if durable_recovery_marker_active and not verified_marker_full_resend:
+                _log_http_bridge_event(
+                    "recovery_required_request_rejected",
+                    bridge_session_key,
+                    account_id=durable_lookup.account_id,
+                    model=payload.model,
+                    detail=(
+                        "reason=pending_call_resolution_required"
+                        if durable_lookup.latest_pending_tool_calls
+                        else "reason=complete_context_rehydration_required"
+                    ),
+                    cache_key_family=bridge_session_key.affinity_kind,
+                    model_class=_extract_model_class(payload.model) if payload.model else None,
+                    owner_check_applied=True,
+                )
+                raise ProxyResponseError(
+                    409,
+                    openai_error(
+                        (
+                            "previous_response_pending_call_resolution_required"
+                            if durable_lookup.latest_pending_tool_calls
+                            else "previous_response_complete_context_required"
+                        ),
+                        (
+                            "The saved response anchor has an unresolved pending call. "
+                            "Retry once with the complete conversation context after resolving that call."
+                            if durable_lookup.latest_pending_tool_calls
+                            else (
+                                "The saved response anchor requires complete conversation context. "
+                                "Retry once with a verified complete resend."
+                            )
+                        ),
+                    ),
+                    retryable_same_contract=False,
+                    failure_detail="durable_recovery_required",
+                    upstream_error_code="previous_response_not_found",
+                )
+            if durable_recovery_marker_active and verified_marker_full_resend:
+                # A prior request already supplied the physical stale-anchor
+                # rejection.  The durable marker is therefore equivalent to
+                # the process-local quarantine for this exact owner/anchor,
+                # but it remains proof-neutral: only the already sealed full
+                # resend objects above may suppress the anchor.
+                fresh_reattach_can_use_durable_anchor = False
+                fresh_reattach_anchor_suppressed_quarantined = True
+                durable_full_resend_fresh_bridge_proof = (
+                    durable_full_resend_proof
+                    if verified_quarantine_full_resend
+                    else durable_abandoned_pending_full_resend_proof
+                )
+                if not verified_quarantine_full_resend:
+                    abandoned_pending_proof = durable_abandoned_pending_full_resend_proof
+                    if abandoned_pending_proof is None:
+                        raise RuntimeError("verified marker replay lost its sealed abandoned-pending proof")
+                    if not isinstance(payload.input, list):
+                        raise RuntimeError("sealed abandoned-pending proof requires list input")
+                    abandoned_projection = project_responses_input_for_abandoned_pending_fresh_replay(
+                        cast(list[JsonValue], payload.input),
+                        stored_count=abandoned_pending_proof.stored_input_item_count,
+                        pending_tool_calls=dict(durable_lookup.latest_pending_tool_calls or {}),
+                    )
+                    if abandoned_projection is None:
+                        raise RuntimeError("sealed abandoned-pending proof lost its replay projection")
+                    effective_payload = _http_bridge_payload_without_previous_response_id(payload).model_copy(
+                        update={"input": abandoned_projection.input_items}
+                    )
+                    durable_marker_abandoned_pending_replay = True
+                durable_marker_verified_recovery = True
+                _marker_request_state, marker_request_text = prepare_bridge_request(effective_payload)
+                del _marker_request_state
+                durable_recovery_attempt_fingerprint = durable_bridge_hash(marker_request_text)
+                if durable_lookup.latest_response_id is None or durable_lookup.account_id is None:
+                    raise RuntimeError("sealed marker recovery lost its owner-bound rejected anchor")
+                try:
+                    marker_attempt_claimed = await self._durable_bridge.claim_live_session_recovery_attempt(
+                        session_id=durable_lookup.session_id,
+                        instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+                        owner_epoch=durable_lookup.owner_epoch,
+                        account_id=durable_lookup.account_id,
+                        rejected_response_id=durable_lookup.latest_response_id,
+                        attempt_fingerprint=durable_recovery_attempt_fingerprint,
+                    )
+                except Exception as exc:
+                    raise ProxyResponseError(
+                        502,
+                        openai_error(
+                            "bridge_continuity_persistence_failed",
+                            "The recovery generation could not be claimed; retrying is unsafe.",
+                        ),
+                    ) from exc
+                if not marker_attempt_claimed:
+                    raise ProxyResponseError(
+                        502,
+                        openai_error(
+                            "bridge_continuity_persistence_failed",
+                            "Another complete-context request already owns this recovery generation.",
+                        ),
+                    )
+                existing_marker_attempt = await self._durable_bridge.lookup_recovery_attempt(
+                    session_id=durable_lookup.session_id,
+                    request_fingerprint=durable_recovery_attempt_fingerprint,
+                )
+                if existing_marker_attempt is not None:
+                    # A marker-authorized recovery may contain irreversible
+                    # tool results.  UNKNOWN can mean the prior process died
+                    # after the upstream accepted the request, so it is never
+                    # eligible for the generic lease-expiry replay claim.
+                    # Reject before opening another physical upstream bridge;
+                    # only a terminal replacement checkpoint may clear the
+                    # marker and settle this generation.
+                    raise ProxyResponseError(
+                        502,
+                        openai_error(
+                            "bridge_continuity_persistence_failed",
+                            "The recovery checkpoint has an ambiguous prior delivery; retrying is unsafe.",
+                        ),
+                    )
+                _log_http_bridge_event(
+                    "recovery_required_full_resend_admitted",
+                    bridge_session_key,
+                    account_id=durable_lookup.account_id,
+                    model=payload.model,
+                    detail=(
+                        "proof_source=abandoned_pending_agent_boundary"
+                        if durable_marker_abandoned_pending_replay
+                        else "proof_source=durable_full_resend"
+                    ),
+                    cache_key_family=bridge_session_key.affinity_kind,
+                    model_class=_extract_model_class(payload.model) if payload.model else None,
+                    owner_check_applied=True,
+                )
             if verified_quarantine_full_resend and _http_bridge_session_key_quarantined(
                 self,
                 bridge_session_key,
@@ -2029,6 +2197,12 @@ class _HTTPBridgeStreamingMixin:
         request_state, text_data = prepare_bridge_request(effective_payload)
         request_state.enforce_openai_sdk_contract = enforce_openai_sdk_contract
         request_state.affinity_policy = affinity
+        if durable_marker_abandoned_pending_replay and isinstance(payload.input, list):
+            # Upstream receives the fail-closed projection while the new
+            # durable anchor remains bound to the exact complete client
+            # context that sealed the abandoned-pending proof.
+            request_state.input_item_count = len(payload.input)
+            request_state.input_full_fingerprint = _fingerprint_input_items(cast(list[JsonValue], payload.input))
         _apply_http_bridge_downstream_turn_state(
             request_state,
             downstream_turn_state=downstream_turn_state,
@@ -2143,6 +2317,21 @@ class _HTTPBridgeStreamingMixin:
             # Only the trim branch below (which verifies the stored prefix
             # fingerprint) is allowed to flip this flag to ``True``.
             request_state.fresh_upstream_request_is_retry_safe = False
+        elif durable_marker_verified_recovery:
+            # The durable marker and the sealed abandoned-pending proof have
+            # already authorized this exact same-account projection. Bind the
+            # attempt journal to that exact projected wire body; the terminal
+            # checkpoint separately retains the sealed complete client input
+            # count/fingerprint above. The projection remains pinned to the
+            # durable owner account rather than becoming account-neutral.
+            request_state.fresh_upstream_request_text = text_data
+            request_state.fresh_upstream_request_is_retry_safe = True
+            request_state.fresh_upstream_request_is_account_neutral = False
+            if durable_recovery_attempt_fingerprint is None or durable_lookup is None:
+                raise RuntimeError("sealed marker recovery lost its durable journal identity")
+            request_state.recovery_attempt_fingerprint = durable_recovery_attempt_fingerprint
+            request_state.recovery_attempt_session_id = durable_lookup.session_id
+            request_state.recovery_attempt_owner_epoch = durable_lookup.owner_epoch
         elif (
             effective_payload.previous_response_id is not None
             and payload_looks_like_full_resend
@@ -2311,7 +2500,8 @@ class _HTTPBridgeStreamingMixin:
             file_required_preferred_account = False
 
         if durable_recovery_attempt_claimed:
-            switch_to_account_neutral_replay()
+            if not durable_marker_verified_recovery_candidate:
+                switch_to_account_neutral_replay()
             request_state.recovery_attempt_fingerprint = durable_recovery_attempt_fingerprint
             request_state.recovery_attempt_session_id = durable_recovery_attempt_session_id
             request_state.recovery_attempt_owner_epoch = durable_recovery_attempt_owner_epoch
@@ -3152,6 +3342,21 @@ class _HTTPBridgeStreamingMixin:
                     request_state.fresh_upstream_request_is_account_neutral = (
                         _http_bridge_payload_is_account_neutral_fresh_replay(fresh_replay_payload)
                     )
+            elif durable_marker_verified_recovery:
+                # Interrupted-tool normalization re-prepares the projected
+                # request. Preserve both authorities across that mechanical
+                # rewrite: the final projected wire text/journal identity and
+                # the original complete client input for the new durable
+                # terminal checkpoint.
+                request_state.fresh_upstream_request_text = text_data
+                request_state.fresh_upstream_request_is_retry_safe = True
+                request_state.fresh_upstream_request_is_account_neutral = False
+                request_state.recovery_attempt_fingerprint = previous_request_state.recovery_attempt_fingerprint
+                request_state.recovery_attempt_session_id = previous_request_state.recovery_attempt_session_id
+                request_state.recovery_attempt_owner_epoch = previous_request_state.recovery_attempt_owner_epoch
+                request_state.recovery_attempt_claimed = previous_request_state.recovery_attempt_claimed
+                request_state.input_item_count = previous_request_state.input_item_count
+                request_state.input_full_fingerprint = previous_request_state.input_full_fingerprint
             elif client_full_resend_fresh_upstream_request_text is not None:
                 request_state.fresh_upstream_request_text = client_full_resend_fresh_upstream_request_text
                 request_state.fresh_upstream_request_is_retry_safe = True
@@ -3722,6 +3927,36 @@ class _HTTPBridgeStreamingMixin:
                     session,
                     reason=_HTTP_BRIDGE_QUARANTINE_REJECTED_STALE_ANCHOR_REASON,
                 )
+                marker_persisted = False
+                if (
+                    session.durable_session_id is not None
+                    and session.durable_owner_epoch is not None
+                    and request_state.previous_response_id is not None
+                ):
+                    try:
+                        marker_persisted = await self._durable_bridge.mark_live_session_recovery_required(
+                            session_id=session.durable_session_id,
+                            instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+                            owner_epoch=session.durable_owner_epoch,
+                            account_id=session.account.id,
+                            rejected_response_id=request_state.previous_response_id,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to persist durable HTTP bridge recovery-required marker",
+                            exc_info=True,
+                        )
+                if durable_lookup is not None and not marker_persisted:
+                    raise ProxyResponseError(
+                        502,
+                        openai_error(
+                            "bridge_continuity_persistence_failed",
+                            "The rejected response anchor could not be fenced; retry the request.",
+                        ),
+                        retryable_same_contract=False,
+                        failure_detail="recovery_required_marker_not_persisted",
+                        upstream_error_code="previous_response_not_found",
+                    ) from exc
                 _log_http_bridge_event(
                     "previous_response_anchor_rejected_quarantined",
                     bridge_session_key,
@@ -3738,18 +3973,30 @@ class _HTTPBridgeStreamingMixin:
                     error_message="The proxy-injected previous response anchor was rejected before execution",
                     preserve_durable_lease=True,
                 )
+                pending_call_resolution_required = bool(
+                    durable_lookup is not None and durable_lookup.latest_pending_tool_calls
+                )
                 raise ProxyResponseError(
-                    502,
+                    409,
                     openai_error(
-                        "previous_response_anchor_unrecoverable",
                         (
-                            "The upstream rejected the saved response anchor. "
-                            "Retry with the complete conversation context."
+                            "previous_response_pending_call_resolution_required"
+                            if pending_call_resolution_required
+                            else "previous_response_complete_context_required"
+                        ),
+                        (
+                            "The saved response anchor has an unresolved pending call. "
+                            "Retry once with the complete conversation context after resolving that call."
+                            if pending_call_resolution_required
+                            else (
+                                "The upstream rejected the saved response anchor. "
+                                "Retry once with the complete conversation context."
+                            )
                         ),
                     ),
                     failure_phase=exc.failure_phase,
                     retryable_same_contract=False,
-                    failure_detail="proxy_injected_previous_response_rejected",
+                    failure_detail="durable_recovery_required",
                     failure_exception_type=exc.failure_exception_type,
                     upstream_status_code=(
                         exc.upstream_status_code if exc.upstream_status_code is not None else exc.status_code

@@ -680,14 +680,21 @@ class _HTTPBridgeRequestSubmitMixin:
         # cooldown must not create or refresh a journal entry for a request
         # that was never dispatched upstream.
         if (
-            request_state.fresh_upstream_request_is_retry_safe
-            and request_state.fresh_upstream_request_text
-            and request_state.replay_count == 0
-            and request_state.recovery_attempt_fingerprint is None
+            request_state.replay_count == 0
+            and not request_state.recovery_attempt_claimed
+            and (
+                request_state.recovery_attempt_fingerprint is not None
+                or (request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text)
+            )
             and session.durable_session_id is not None
             and session.durable_owner_epoch is not None
         ):
-            attempt_fingerprint = durable_bridge_hash(request_state.fresh_upstream_request_text)
+            attempt_fingerprint = request_state.recovery_attempt_fingerprint
+            if attempt_fingerprint is None:
+                fresh_request_text = request_state.fresh_upstream_request_text
+                if fresh_request_text is None:
+                    raise RuntimeError("replay-safe recovery request lost its serialized body")
+                attempt_fingerprint = durable_bridge_hash(fresh_request_text)
             try:
                 attempt = await self._durable_bridge.record_recovery_attempt(
                     session_id=session.durable_session_id,

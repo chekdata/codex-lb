@@ -131,6 +131,18 @@ class DurableBridgeSessionSnapshot:
     closed_at: datetime | None
     latest_pending_tool_calls: dict[str, str] | None = None
     owner_process_epoch: str | None = None
+    recovery_required_anchor_hash: str | None = None
+    recovery_required_account_id: str | None = None
+    recovery_required_attempt_fingerprint: str | None = None
+    recovery_required_at: datetime | None = None
+
+    def recovery_is_required_for_latest_anchor(self) -> bool:
+        return bool(
+            self.latest_response_id is not None
+            and self.account_id is not None
+            and self.recovery_required_anchor_hash == durable_bridge_hash(self.latest_response_id)
+            and self.recovery_required_account_id == self.account_id
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -700,6 +712,10 @@ class DurableBridgeRepository:
             if latest_input_item_count is None or latest_input_full_fingerprint is None:
                 values["latest_input_item_count"] = None
                 values["latest_input_full_fingerprint"] = None
+            values["recovery_required_anchor_hash"] = None
+            values["recovery_required_account_id"] = None
+            values["recovery_required_attempt_fingerprint"] = None
+            values["recovery_required_at"] = None
         if latest_input_item_count is not None and latest_input_full_fingerprint is not None:
             values["latest_input_item_count"] = latest_input_item_count
             values["latest_input_full_fingerprint"] = latest_input_full_fingerprint
@@ -796,6 +812,10 @@ class DurableBridgeRepository:
             "latest_input_item_count": None,
             "latest_input_full_fingerprint": None,
             "latest_pending_tool_calls_json": None,
+            "recovery_required_anchor_hash": None,
+            "recovery_required_account_id": None,
+            "recovery_required_attempt_fingerprint": None,
+            "recovery_required_at": None,
         }
         return await self._execute_fenced_session_update(
             session_id=session_id,
@@ -803,6 +823,82 @@ class DurableBridgeRepository:
             owner_epoch=owner_epoch,
             values=values,
         )
+
+    async def mark_recovery_required(
+        self,
+        *,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        account_id: str,
+        rejected_response_id: str,
+    ) -> bool:
+        """Fence and persist an owner/anchor-bound recovery requirement.
+
+        The marker deliberately stores only the rejected anchor digest.  The
+        durable row already owns the plaintext anchor needed for exact replay
+        verification; duplicating request or conversation content here would
+        create a second continuity authority.
+        """
+
+        async with sqlite_writer_section():
+            result = await self._session.execute(
+                update(HttpBridgeSessionRecord)
+                .where(
+                    HttpBridgeSessionRecord.id == session_id,
+                    HttpBridgeSessionRecord.owner_instance_id == instance_id,
+                    HttpBridgeSessionRecord.owner_epoch == owner_epoch,
+                    HttpBridgeSessionRecord.account_id == account_id,
+                    HttpBridgeSessionRecord.latest_response_id == rejected_response_id,
+                )
+                .values(
+                    recovery_required_anchor_hash=durable_bridge_hash(rejected_response_id),
+                    recovery_required_account_id=account_id,
+                    recovery_required_at=utcnow(),
+                )
+            )
+            await self._session.commit()
+        return bool(getattr(result, "rowcount", 0))
+
+    async def claim_recovery_required_attempt(
+        self,
+        *,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        account_id: str,
+        rejected_response_id: str,
+        attempt_fingerprint: str,
+    ) -> bool:
+        """Bind one exact wire payload to the active marker generation."""
+
+        async with sqlite_writer_section():
+            marker = await self._session.scalar(
+                select(HttpBridgeSessionRecord)
+                .where(
+                    HttpBridgeSessionRecord.id == session_id,
+                    HttpBridgeSessionRecord.owner_instance_id == instance_id,
+                    HttpBridgeSessionRecord.owner_epoch == owner_epoch,
+                    HttpBridgeSessionRecord.account_id == account_id,
+                    HttpBridgeSessionRecord.latest_response_id == rejected_response_id,
+                    HttpBridgeSessionRecord.recovery_required_anchor_hash == durable_bridge_hash(rejected_response_id),
+                    HttpBridgeSessionRecord.recovery_required_account_id == account_id,
+                )
+                .with_for_update()
+            )
+            if marker is None:
+                await self._session.rollback()
+                return False
+            existing = marker.recovery_required_attempt_fingerprint
+            if existing is not None and existing != attempt_fingerprint:
+                await self._session.rollback()
+                return False
+            if existing is None:
+                marker.recovery_required_attempt_fingerprint = attempt_fingerprint
+                await self._session.commit()
+            else:
+                await self._session.rollback()
+            return True
 
     async def record_recovery_attempt(
         self,
@@ -1407,6 +1503,10 @@ class DurableBridgeRepository:
                     latest_response_id,
                     latest_pending_tool_calls,
                 )
+                session_values["recovery_required_anchor_hash"] = None
+                session_values["recovery_required_account_id"] = None
+                session_values["recovery_required_attempt_fingerprint"] = None
+                session_values["recovery_required_at"] = None
             elif latest_input_item_count is not None and latest_input_full_fingerprint is not None:
                 session_values["latest_input_item_count"] = latest_input_item_count
                 session_values["latest_input_full_fingerprint"] = latest_input_full_fingerprint
@@ -1831,6 +1931,10 @@ _SNAPSHOT_COLUMNS = (
     HttpBridgeSessionRecord.latest_input_item_count,
     HttpBridgeSessionRecord.latest_input_full_fingerprint,
     HttpBridgeSessionRecord.latest_pending_tool_calls_json,
+    HttpBridgeSessionRecord.recovery_required_anchor_hash,
+    HttpBridgeSessionRecord.recovery_required_account_id,
+    HttpBridgeSessionRecord.recovery_required_attempt_fingerprint,
+    HttpBridgeSessionRecord.recovery_required_at,
     HttpBridgeSessionRecord.last_seen_at,
     HttpBridgeSessionRecord.closed_at,
 )
@@ -1860,6 +1964,10 @@ def _returned_row_to_snapshot(row: Row[tuple[object, ...]]) -> DurableBridgeSess
             mapping[HttpBridgeSessionRecord.latest_response_id],
             mapping[HttpBridgeSessionRecord.latest_pending_tool_calls_json],
         ),
+        recovery_required_anchor_hash=mapping[HttpBridgeSessionRecord.recovery_required_anchor_hash],
+        recovery_required_account_id=mapping[HttpBridgeSessionRecord.recovery_required_account_id],
+        recovery_required_attempt_fingerprint=mapping[HttpBridgeSessionRecord.recovery_required_attempt_fingerprint],
+        recovery_required_at=mapping[HttpBridgeSessionRecord.recovery_required_at],
         last_seen_at=mapping[HttpBridgeSessionRecord.last_seen_at],
         closed_at=mapping[HttpBridgeSessionRecord.closed_at],
     )
@@ -1890,6 +1998,10 @@ def _to_snapshot(row: HttpBridgeSessionRecord | None) -> DurableBridgeSessionSna
             row.latest_response_id,
             row.latest_pending_tool_calls_json,
         ),
+        recovery_required_anchor_hash=row.recovery_required_anchor_hash,
+        recovery_required_account_id=row.recovery_required_account_id,
+        recovery_required_attempt_fingerprint=row.recovery_required_attempt_fingerprint,
+        recovery_required_at=row.recovery_required_at,
         last_seen_at=row.last_seen_at,
         closed_at=row.closed_at,
     )

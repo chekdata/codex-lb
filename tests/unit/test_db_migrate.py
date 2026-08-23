@@ -13,6 +13,8 @@ from typing import cast
 import pytest
 import sqlalchemy as sa
 from alembic import command
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from alembic.util.exc import CommandError
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy import exc as sa_exc
@@ -762,6 +764,90 @@ def test_hourly_rollup_cancelled_count_migration_round_trips_with_default_zero(t
         engine.dispose()
 
     assert inspect_migration_state(url).current_revision == parent_revision
+
+
+def test_http_bridge_recovery_required_marker_migration_round_trips(tmp_path: Path) -> None:
+    db_path = tmp_path / "http-bridge-recovery-required.db"
+    url = _db_url(db_path)
+    parent_revision = "20260811_000000_add_hourly_rollup_cancelled_count"
+    marker_revision = "20260823_000000_add_http_bridge_recovery_required_marker"
+    marker_columns = {
+        "recovery_required_anchor_hash",
+        "recovery_required_account_id",
+        "recovery_required_attempt_fingerprint",
+        "recovery_required_at",
+    }
+
+    run_upgrade(url, parent_revision, bootstrap_legacy=False)
+    engine = create_engine(to_sync_database_url(url))
+    try:
+        with engine.connect() as connection:
+            columns = {column["name"] for column in inspect(connection).get_columns("http_bridge_sessions")}
+            assert marker_columns.isdisjoint(columns)
+
+        result = run_upgrade(url, marker_revision, bootstrap_legacy=False)
+        assert result.current_revision == marker_revision
+        with engine.connect() as connection:
+            columns = {column["name"] for column in inspect(connection).get_columns("http_bridge_sessions")}
+            assert marker_columns <= columns
+
+        config = _build_alembic_config(url)
+        command.downgrade(config, parent_revision)
+        with engine.connect() as connection:
+            columns = {column["name"] for column in inspect(connection).get_columns("http_bridge_sessions")}
+            assert marker_columns.isdisjoint(columns)
+    finally:
+        engine.dispose()
+
+    assert inspect_migration_state(url).current_revision == parent_revision
+
+
+def test_http_bridge_recovery_required_marker_migration_renders_postgres_upgrade_and_downgrade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = importlib.import_module(
+        "app.db.alembic.versions.20260823_000000_add_http_bridge_recovery_required_marker"
+    )
+
+    upgrade_sql = StringIO()
+    upgrade_context = MigrationContext.configure(
+        dialect_name="postgresql",
+        opts={"as_sql": True, "output_buffer": upgrade_sql},
+    )
+    monkeypatch.setattr(migration, "op", Operations(upgrade_context))
+    monkeypatch.setattr(migration, "_columns", lambda _bind: set())
+    migration.upgrade()
+
+    assert upgrade_sql.getvalue().splitlines() == [
+        "ALTER TABLE http_bridge_sessions ADD COLUMN recovery_required_anchor_hash VARCHAR(64);",
+        "",
+        "ALTER TABLE http_bridge_sessions ADD COLUMN recovery_required_account_id VARCHAR;",
+        "",
+        "ALTER TABLE http_bridge_sessions ADD COLUMN recovery_required_attempt_fingerprint VARCHAR(64);",
+        "",
+        "ALTER TABLE http_bridge_sessions ADD COLUMN recovery_required_at TIMESTAMP WITH TIME ZONE;",
+        "",
+    ]
+
+    downgrade_sql = StringIO()
+    downgrade_context = MigrationContext.configure(
+        dialect_name="postgresql",
+        opts={"as_sql": True, "output_buffer": downgrade_sql},
+    )
+    monkeypatch.setattr(migration, "op", Operations(downgrade_context))
+    monkeypatch.setattr(migration, "_columns", lambda _bind: set(migration._COLUMNS))
+    migration.downgrade()
+
+    assert downgrade_sql.getvalue().splitlines() == [
+        "ALTER TABLE http_bridge_sessions DROP COLUMN recovery_required_at;",
+        "",
+        "ALTER TABLE http_bridge_sessions DROP COLUMN recovery_required_attempt_fingerprint;",
+        "",
+        "ALTER TABLE http_bridge_sessions DROP COLUMN recovery_required_account_id;",
+        "",
+        "ALTER TABLE http_bridge_sessions DROP COLUMN recovery_required_anchor_hash;",
+        "",
+    ]
 
 
 def test_request_log_useragent_family_migration_backfills_only_slash_values(tmp_path: Path) -> None:
