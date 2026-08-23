@@ -275,6 +275,13 @@ projection MUST omit those reasoning items and any exact historical
 response-owned agent deliveries already covered by the immutable stored-prefix
 fingerprint. The actual one-shot unanchored retry MUST use that same projected
 input. It MUST NOT resend omitted response bookkeeping or any pending call id.
+User follow-ups in this proved suffix MAY carry Codex's exact persisted message
+bookkeeping: a `msg_` UUID, `user` role, one self-contained `input_text`, and
+exact `turn_id` plus finite nonnegative `create_time` metadata. The proof MUST
+validate that complete raw shape before projection. The projected replay MUST
+remove the response-owned message id and `create_time` while preserving the
+validated `turn_id`; missing, extra, malformed, or non-finite fields MUST fail
+closed.
 
 Rejected-proof observability MUST classify only known string-valued `type` and
 `role` fields. Non-string or otherwise malformed values MUST be labeled as an
@@ -349,6 +356,17 @@ classification and MUST NOT fail on non-string item types.
 - **AND** omits the response-owned reasoning and sealed historical agent
   deliveries from the one-shot recovery payload
 - **AND** publishes a replacement anchor only after successful completion
+
+#### Scenario: persisted user bookkeeping is validated then normalized
+
+- **GIVEN** the proved abandoned-pending suffix contains one or more persisted
+  user messages with canonical `msg_` UUIDs and exact turn/timestamp metadata
+- **WHEN** the bridge builds the one-shot same-owner unanchored projection
+- **THEN** it first validates every raw user-message field and content part
+- **AND** removes each response-owned message id and `create_time`
+- **AND** preserves only the validated `turn_id` metadata in the replay
+- **AND** any malformed id, timestamp, metadata, content, or extra field rejects
+  the proof before dispatch
 
 #### Scenario: malformed diagnostic fields remain fail-closed
 

@@ -66,6 +66,10 @@ loop and require the Codex client to be restarted.
   the one recovery attempt from the same verified projection. Do not serialize
   stale reasoning identifiers or historical agent identifiers into the fresh
   request.
+- Recognize Codex's exact persisted user-message bookkeeping (`msg_` UUID plus
+  `turn_id` and finite `create_time`) in that proved suffix. Validate the raw
+  shape before removing the response-owned message id and timestamp from the
+  one-shot projection; malformed lookalikes remain fail-closed.
 
 ## Impact
 

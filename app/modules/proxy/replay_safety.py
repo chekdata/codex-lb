@@ -41,6 +41,9 @@ _RESPONSE_OWNED_AGENT_MESSAGE_FIELDS = frozenset(
     {"author", "content", "id", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD, "recipient", "type"}
 )
 _RESPONSE_OWNED_AGENT_MESSAGE_METADATA_FIELDS = frozenset({"create_time", "turn_id"})
+_RESPONSE_OWNED_USER_MESSAGE_FIELDS = frozenset(
+    {"content", "id", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD, "role", "type"}
+)
 # Agent paths are produced by the collaboration runtime, whose root is
 # literally ``/root`` and whose task-name segments are restricted to lowercase
 # letters, digits, and underscores.  This is replay authority, so accepting a
@@ -268,6 +271,12 @@ def _project_account_neutral_replay_item(
         return item
     if preserve_response_owned_agent_message_ids and item_type == "agent_message":
         return item
+    if _is_response_owned_user_message(item):
+        projected_item = dict(item)
+        projected_item.pop("id")
+        metadata = cast(dict[str, JsonValue], projected_item[_INTERNAL_CHAT_MESSAGE_METADATA_FIELD])
+        projected_item[_INTERNAL_CHAT_MESSAGE_METADATA_FIELD] = {"turn_id": metadata["turn_id"]}
+        return projected_item
     if item_type is not None and not isinstance(item_type, str):
         return item
     if item_type == "reasoning" or (
@@ -541,7 +550,10 @@ def responses_input_suffix_proves_abandoned_pending_agent_boundary(
     if not isinstance(boundary, dict) or not _is_retained_agent_message(boundary):
         return False
     followups = raw_suffix[boundary_index + 1 :]
-    if not followups or not all(isinstance(item, dict) and _is_fresh_followup_input(item) for item in followups):
+    if not followups or not all(
+        isinstance(item, dict) and (_is_fresh_followup_input(item) or _is_response_owned_user_message(item))
+        for item in followups
+    ):
         return False
     for item in input_items:
         if isinstance(item, dict) and item.get("call_id") in pending_tool_calls:
@@ -810,6 +822,35 @@ def _is_retained_agent_message(item: Mapping[str, JsonValue]) -> bool:
     )
 
 
+def _is_response_owned_user_message(item: Mapping[str, JsonValue]) -> bool:
+    """Validate Codex's persisted user-message bookkeeping before stripping it."""
+
+    item_id = item.get("id")
+    metadata = item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
+    content = item.get("content")
+    if (
+        set(item) != _RESPONSE_OWNED_USER_MESSAGE_FIELDS
+        or item.get("type") != "message"
+        or item.get("role") != "user"
+        or not isinstance(item_id, str)
+        or not item_id.startswith("msg_")
+        or not _is_uuid(item_id.removeprefix("msg_"))
+        or not isinstance(metadata, dict)
+        or set(metadata) != _RESPONSE_OWNED_AGENT_MESSAGE_METADATA_FIELDS
+        or not _is_uuid(metadata.get("turn_id"))
+        or not _is_finite_nonnegative_number(metadata.get("create_time"))
+        or not isinstance(content, list)
+        or len(content) != 1
+        or not isinstance(content[0], dict)
+        or content[0].get("type") != "input_text"
+    ):
+        return False
+    return _input_content_part_is_self_contained(
+        cast(dict[str, JsonValue], content[0]),
+        allow_output=False,
+    )
+
+
 def _is_uuid(value: JsonValue | None) -> bool:
     if not isinstance(value, str) or not value:
         return False
@@ -834,10 +875,18 @@ def _is_finite_nonnegative_number(value: JsonValue | None) -> bool:
 def _is_fresh_followup_input(item: Mapping[str, JsonValue]) -> bool:
     item_type = item.get("type")
     if item_type in {"input_file", "input_image", "input_text"}:
-        return _input_content_part_is_self_contained(item, allow_output=False)
+        return _input_item_has_only_known_fields(item, cast(str, item_type)) and _input_content_part_is_self_contained(
+            item,
+            allow_output=False,
+        )
     return (
         item_type in (None, "message")
         and item.get("role") == "user"
+        and item.get("id") in (None, "")
+        and item.get("phase") is None
+        and item.get("status") in (None, "completed")
+        and _internal_chat_message_metadata_is_account_neutral(item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD))
+        and _input_item_has_only_known_fields(item, cast(str | None, item_type))
         and _message_has_valid_account_neutral_content(item)
     )
 
