@@ -7,7 +7,7 @@ import re
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import cast
+from typing import Literal, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -40,15 +40,32 @@ _ACCOUNT_NEUTRAL_MESSAGE_ROLES = frozenset({"assistant", "developer", "system", 
 _RESPONSE_OWNED_AGENT_MESSAGE_FIELDS = frozenset(
     {"author", "content", "id", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD, "recipient", "type"}
 )
+_TRANSPORT_RESPONSE_OWNED_AGENT_MESSAGE_FIELDS = frozenset({"author", "content", "id", "recipient", "type"})
 _RESPONSE_OWNED_AGENT_MESSAGE_METADATA_FIELDS = frozenset({"create_time", "turn_id"})
 _RESPONSE_OWNED_USER_MESSAGE_FIELDS = frozenset(
     {"content", "id", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD, "role", "type"}
 )
+_TRANSPORT_RESPONSE_OWNED_USER_MESSAGE_FIELDS = frozenset({"content", "id", "role", "type"})
 # Agent paths are produced by the collaboration runtime, whose root is
 # literally ``/root`` and whose task-name segments are restricted to lowercase
 # letters, digits, and underscores.  This is replay authority, so accepting a
 # merely path-shaped client string would be too broad.
 _AGENT_PATH_PATTERN = re.compile(r"^/root(?:/[a-z0-9_]+)*$")
+AbandonedPendingBoundaryRejectionReason = Literal[
+    "stored_prefix_invalid",
+    "pending_call_manifest_missing",
+    "boundary_reasoning_shape_invalid",
+    "boundary_agent_message_shape_invalid",
+    "followup_missing",
+    "followup_shape_invalid",
+    "developer_message_shape_invalid",
+    "developer_message_sequence_invalid",
+    "pending_call_conflict",
+    "projection_failed",
+    "direct_call_prefix_state_invalid",
+    "projected_boundary_invalid",
+    "projected_followup_invalid",
+]
 _ACCOUNT_NEUTRAL_INPUT_ITEM_TYPES = frozenset(
     {
         "additional_tools",
@@ -184,6 +201,7 @@ def project_responses_input_for_account_neutral_fresh_replay(
     preserve_response_owned_agent_message_ids: bool = False,
     omit_response_owned_agent_messages_from_stored_prefix: bool = False,
     project_response_owned_developer_messages_from_stored_prefix: bool = False,
+    project_response_owned_developer_messages_from_suffix: bool = False,
 ) -> AccountNeutralReplayProjection | None:
     """Remove known response-owned bookkeeping after durable prefix proof.
 
@@ -219,8 +237,20 @@ def project_responses_input_for_account_neutral_fresh_replay(
         ):
             projected_item = dict(item)
             projected_item.pop("id")
-            metadata = cast(dict[str, JsonValue], projected_item[_INTERNAL_CHAT_MESSAGE_METADATA_FIELD])
-            projected_item[_INTERNAL_CHAT_MESSAGE_METADATA_FIELD] = {"turn_id": metadata["turn_id"]}
+            metadata = projected_item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
+            if isinstance(metadata, dict):
+                projected_item[_INTERNAL_CHAT_MESSAGE_METADATA_FIELD] = {"turn_id": metadata["turn_id"]}
+        elif (
+            project_response_owned_developer_messages_from_suffix
+            and index >= stored_count
+            and isinstance(item, dict)
+            and _is_response_owned_developer_message(item)
+        ):
+            projected_item = dict(item)
+            projected_item.pop("id")
+            metadata = projected_item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
+            if isinstance(metadata, dict):
+                projected_item[_INTERNAL_CHAT_MESSAGE_METADATA_FIELD] = {"turn_id": metadata["turn_id"]}
         else:
             projected_item = _project_account_neutral_replay_item(
                 item,
@@ -285,6 +315,7 @@ def project_responses_input_for_abandoned_pending_fresh_replay(
         preserve_response_owned_agent_message_ids=True,
         omit_response_owned_agent_messages_from_stored_prefix=True,
         project_response_owned_developer_messages_from_stored_prefix=True,
+        project_response_owned_developer_messages_from_suffix=True,
     )
     if projection is None:
         return None
@@ -387,8 +418,9 @@ def _project_account_neutral_replay_item(
     if _is_response_owned_user_message(item):
         projected_item = dict(item)
         projected_item.pop("id")
-        metadata = cast(dict[str, JsonValue], projected_item[_INTERNAL_CHAT_MESSAGE_METADATA_FIELD])
-        projected_item[_INTERNAL_CHAT_MESSAGE_METADATA_FIELD] = {"turn_id": metadata["turn_id"]}
+        metadata = projected_item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
+        if isinstance(metadata, dict):
+            projected_item[_INTERNAL_CHAT_MESSAGE_METADATA_FIELD] = {"turn_id": metadata["turn_id"]}
         return projected_item
     if item_type is not None and not isinstance(item_type, str):
         return item
@@ -659,8 +691,28 @@ def responses_input_suffix_proves_abandoned_pending_agent_boundary(
     response event; this predicate alone never authorizes proactive replay.
     """
 
-    if stored_count <= 0 or len(input_items) <= stored_count or not pending_tool_calls:
-        return False
+    return (
+        abandoned_pending_agent_boundary_rejection_reason(
+            input_items,
+            stored_count=stored_count,
+            pending_tool_calls=pending_tool_calls,
+        )
+        is None
+    )
+
+
+def abandoned_pending_agent_boundary_rejection_reason(
+    input_items: list[JsonValue],
+    *,
+    stored_count: int,
+    pending_tool_calls: Mapping[str, str],
+) -> AbandonedPendingBoundaryRejectionReason | None:
+    """Return the first content-free failure branch for boundary proof."""
+
+    if stored_count <= 0 or len(input_items) <= stored_count:
+        return "stored_prefix_invalid"
+    if not pending_tool_calls:
+        return "pending_call_manifest_missing"
     raw_suffix = input_items[stored_count:]
     boundary_index = 0
     while boundary_index < len(raw_suffix) and isinstance(raw_suffix[boundary_index], dict):
@@ -668,49 +720,119 @@ def responses_input_suffix_proves_abandoned_pending_agent_boundary(
         if item.get("type") != "reasoning":
             break
         if not _is_response_owned_reasoning_boundary_item(item):
-            return False
+            return "boundary_reasoning_shape_invalid"
         boundary_index += 1
     if boundary_index >= len(raw_suffix):
-        return False
+        return "boundary_agent_message_shape_invalid"
     boundary = raw_suffix[boundary_index]
     if not isinstance(boundary, dict) or not _is_retained_agent_message(boundary):
-        return False
+        return "boundary_agent_message_shape_invalid"
     followups = raw_suffix[boundary_index + 1 :]
-    if not followups or not all(
-        isinstance(item, dict) and (_is_fresh_followup_input(item) or _is_response_owned_user_message(item))
-        for item in followups
-    ):
-        return False
+    followup_rejection = _abandoned_pending_followup_sequence_rejection_reason(
+        followups,
+        allow_response_owned_messages=True,
+    )
+    if followup_rejection is not None:
+        return followup_rejection
     for item in input_items:
         if isinstance(item, dict) and item.get("call_id") in pending_tool_calls:
-            return False
+            return "pending_call_conflict"
     replay_projection = project_responses_input_for_abandoned_pending_fresh_replay(
         input_items,
         stored_count=stored_count,
         pending_tool_calls=pending_tool_calls,
     )
     if replay_projection is None:
-        return False
+        return "projection_failed"
     prefix_state = _direct_tool_call_prefix_state(
         replay_projection.input_items[: replay_projection.stored_prefix_count],
         allow_exact_stored_developer_items=True,
         canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
     )
-    if prefix_state is None or prefix_state[0] or prefix_state[1] & pending_tool_calls.keys():
-        return False
+    if prefix_state is None or prefix_state[0]:
+        return "direct_call_prefix_state_invalid"
+    if prefix_state[1] & pending_tool_calls.keys():
+        return "pending_call_conflict"
     suffix = replay_projection.input_items[replay_projection.stored_prefix_count :]
     if len(suffix) < 2:
-        return False
+        return "followup_missing"
     first = suffix[0]
     if not isinstance(first, dict) or first.get("type") != "agent_message" or not _is_retained_agent_message(first):
-        return False
-    return all(isinstance(item, dict) and _is_fresh_followup_input(item) for item in suffix[1:])
+        return "projected_boundary_invalid"
+    if not _abandoned_pending_followup_sequence_is_bounded(
+        suffix[1:],
+        allow_response_owned_messages=False,
+    ):
+        return "projected_followup_invalid"
+    return None
+
+
+def _abandoned_pending_followup_sequence_is_bounded(
+    input_items: list[JsonValue],
+    *,
+    allow_response_owned_messages: bool,
+) -> bool:
+    """Require one bounded developer refresh between proven user followups."""
+
+    return (
+        _abandoned_pending_followup_sequence_rejection_reason(
+            input_items,
+            allow_response_owned_messages=allow_response_owned_messages,
+        )
+        is None
+    )
+
+
+def _abandoned_pending_followup_sequence_rejection_reason(
+    input_items: list[JsonValue],
+    *,
+    allow_response_owned_messages: bool,
+) -> AbandonedPendingBoundaryRejectionReason | None:
+    """Classify one bounded follow-up sequence without exposing content."""
+
+    if not input_items:
+        return "followup_missing"
+    user_seen = False
+    developer_seen = False
+    user_after_developer_seen = False
+    for item in input_items:
+        if not isinstance(item, dict):
+            return "followup_shape_invalid"
+        is_user = _is_fresh_followup_input(item) or (
+            allow_response_owned_messages and _is_response_owned_user_message(item)
+        )
+        item_type_value = item.get("type")
+        item_type = item_type_value if isinstance(item_type_value, str) else None
+        is_developer = (
+            _is_response_owned_developer_message(item)
+            if allow_response_owned_messages
+            else _historical_pending_developer_message_is_transparent(item, item_type=item_type)
+        )
+        if is_user:
+            user_seen = True
+            if developer_seen:
+                user_after_developer_seen = True
+            continue
+        if is_developer:
+            if developer_seen or not user_seen:
+                return "developer_message_sequence_invalid"
+            developer_seen = True
+            continue
+        if item.get("role") == "developer":
+            return "developer_message_shape_invalid"
+        return "followup_shape_invalid"
+    if not user_seen:
+        return "followup_missing"
+    if developer_seen and not user_after_developer_seen:
+        return "developer_message_sequence_invalid"
+    return None
 
 
 def _is_response_owned_reasoning_boundary_item(item: Mapping[str, JsonValue]) -> bool:
     """Recognize the exact Codex response bookkeeping allowed before a boundary."""
 
     allowed_fields = {
+        "content",
         "encrypted_content",
         "id",
         _INTERNAL_CHAT_MESSAGE_METADATA_FIELD,
@@ -723,7 +845,7 @@ def _is_response_owned_reasoning_boundary_item(item: Mapping[str, JsonValue]) ->
     status = item.get("status")
     return (
         set(item) <= allowed_fields
-        and {"encrypted_content", "id", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD, "summary", "type"} <= set(item)
+        and {"encrypted_content", "id", "summary", "type"} <= set(item)
         and item.get("type") == "reasoning"
         and isinstance(item.get("id"), str)
         and cast(str, item["id"]).startswith("rs_")
@@ -736,9 +858,23 @@ def _is_response_owned_reasoning_boundary_item(item: Mapping[str, JsonValue]) ->
             and isinstance(part.get("text"), str)
             for part in summary
         )
-        and isinstance(metadata, dict)
-        and set(metadata) == _ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS
-        and _is_uuid(metadata.get("turn_id"))
+        and (
+            (
+                metadata is None
+                # Codex sends ``content: null`` on the HTTP transport. The
+                # ResponsesRequest model intentionally drops that null field
+                # before the recovery predicate sees the item, so both exact
+                # representations describe the same response-owned boundary.
+                # No non-null content or additional field is admitted.
+                and ("content" not in item or item.get("content") is None)
+            )
+            or (
+                isinstance(metadata, dict)
+                and "content" not in item
+                and set(metadata) == _ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS
+                and _is_uuid(metadata.get("turn_id"))
+            )
+        )
         and status in (None, "completed")
     )
 
@@ -921,7 +1057,11 @@ def _is_retained_agent_message(item: Mapping[str, JsonValue]) -> bool:
     metadata = item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
     content = item.get("content")
     if (
-        set(item) != _RESPONSE_OWNED_AGENT_MESSAGE_FIELDS
+        set(item)
+        not in {
+            _RESPONSE_OWNED_AGENT_MESSAGE_FIELDS,
+            _TRANSPORT_RESPONSE_OWNED_AGENT_MESSAGE_FIELDS,
+        }
         or item.get("type") != "agent_message"
         or not isinstance(item_id, str)
         or not item_id.startswith("amsg_")
@@ -931,10 +1071,15 @@ def _is_retained_agent_message(item: Mapping[str, JsonValue]) -> bool:
         or not isinstance(recipient, str)
         or not _AGENT_PATH_PATTERN.fullmatch(recipient)
         or author == recipient
-        or not isinstance(metadata, dict)
-        or set(metadata) != _RESPONSE_OWNED_AGENT_MESSAGE_METADATA_FIELDS
-        or not _is_uuid(metadata.get("turn_id"))
-        or not _is_finite_nonnegative_number(metadata.get("create_time"))
+        or not (
+            metadata is None
+            or (
+                isinstance(metadata, dict)
+                and set(metadata) == _RESPONSE_OWNED_AGENT_MESSAGE_METADATA_FIELDS
+                and _is_uuid(metadata.get("turn_id"))
+                and _is_finite_nonnegative_number(metadata.get("create_time"))
+            )
+        )
         or not isinstance(content, list)
         or len(content) != 1
         or not isinstance(content[0], dict)
@@ -954,16 +1099,25 @@ def _is_response_owned_user_message(item: Mapping[str, JsonValue]) -> bool:
     metadata = item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
     content = item.get("content")
     if (
-        set(item) != _RESPONSE_OWNED_USER_MESSAGE_FIELDS
+        set(item)
+        not in {
+            _RESPONSE_OWNED_USER_MESSAGE_FIELDS,
+            _TRANSPORT_RESPONSE_OWNED_USER_MESSAGE_FIELDS,
+        }
         or item.get("type") != "message"
         or item.get("role") != "user"
         or not isinstance(item_id, str)
         or not item_id.startswith("msg_")
         or not _is_uuid(item_id.removeprefix("msg_"))
-        or not isinstance(metadata, dict)
-        or set(metadata) != _RESPONSE_OWNED_AGENT_MESSAGE_METADATA_FIELDS
-        or not _is_uuid(metadata.get("turn_id"))
-        or not _is_finite_nonnegative_number(metadata.get("create_time"))
+        or not (
+            metadata is None
+            or (
+                isinstance(metadata, dict)
+                and set(metadata) == _RESPONSE_OWNED_AGENT_MESSAGE_METADATA_FIELDS
+                and _is_uuid(metadata.get("turn_id"))
+                and _is_finite_nonnegative_number(metadata.get("create_time"))
+            )
+        )
         or not isinstance(content, list)
         or len(content) != 1
         or not isinstance(content[0], dict)
@@ -983,20 +1137,26 @@ def _is_response_owned_developer_message(item: Mapping[str, JsonValue]) -> bool:
     metadata = item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
     content = item.get("content")
     return (
-        set(item) == _RESPONSE_OWNED_USER_MESSAGE_FIELDS
+        set(item)
+        in {
+            _RESPONSE_OWNED_USER_MESSAGE_FIELDS,
+            _TRANSPORT_RESPONSE_OWNED_USER_MESSAGE_FIELDS,
+        }
         and item.get("type") == "message"
         and item.get("role") == "developer"
         and isinstance(item_id, str)
         and item_id.startswith("msg_")
         and _is_uuid(item_id.removeprefix("msg_"))
-        and isinstance(metadata, dict)
         and (
-            (
-                set(metadata) == _ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS
+            metadata is None
+            or (
+                isinstance(metadata, dict)
+                and set(metadata) == _ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS
                 and _is_uuid(metadata.get("turn_id"))
             )
             or (
-                set(metadata) == _RESPONSE_OWNED_AGENT_MESSAGE_METADATA_FIELDS
+                isinstance(metadata, dict)
+                and set(metadata) == _RESPONSE_OWNED_AGENT_MESSAGE_METADATA_FIELDS
                 and _is_uuid(metadata.get("turn_id"))
                 and _is_finite_nonnegative_number(metadata.get("create_time"))
             )
