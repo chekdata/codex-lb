@@ -12,7 +12,13 @@ import pytest
 from websockets.asyncio.server import serve as websocket_serve
 from websockets.client import ClientProtocol
 from websockets.datastructures import Headers
-from websockets.exceptions import ConnectionClosedError, InvalidHandshake, InvalidProxy, InvalidStatus
+from websockets.exceptions import (
+    ConnectionClosedError,
+    InvalidHandshake,
+    InvalidProxy,
+    InvalidProxyMessage,
+    InvalidStatus,
+)
 from websockets.frames import Close
 from websockets.http11 import Response
 from websockets.uri import parse_uri
@@ -548,6 +554,94 @@ async def test_proxied_websocket_early_close_retries_fresh_tunnel_on_same_accoun
 
     assert attempts == 2
     assert fake_connection.sent == ["hello"]
+
+
+@pytest.mark.asyncio
+async def test_proxied_websocket_invalid_proxy_message_retries_fresh_tunnel_on_same_account(monkeypatch):
+    fake_connection = _FakeConnection()
+    attempts = 0
+
+    async def failing_websocket_connect(url: str, **kwargs):
+        nonlocal attempts
+        del url, kwargs
+        attempts += 1
+        if attempts == 1:
+            raise InvalidProxyMessage("did not receive a valid HTTP response from proxy")
+        return fake_connection
+
+    monkeypatch.setattr(proxy_websocket_module, "websocket_connect", failing_websocket_connect)
+    monkeypatch.setattr(
+        proxy_websocket_module,
+        "resolve_websocket_proxy_from_env",
+        lambda url, env: "http://proxy.test:3128",
+    )
+    monkeypatch.setattr(
+        proxy_websocket_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            upstream_base_url="https://chatgpt.com/backend-api",
+            upstream_connect_timeout_seconds=7.0,
+            proxy_downstream_websocket_idle_timeout_seconds=120.0,
+            max_sse_event_bytes=4321,
+            upstream_websocket_trust_env=True,
+            upstream_websocket_proxy_env=lambda: {},
+        ),
+    )
+
+    websocket = await connect_responses_websocket(
+        {"openai-beta": "responses_websockets=2026-02-06"},
+        "access-token",
+        "account-123",
+        allow_direct_egress=True,
+    )
+    await websocket.send_text("hello")
+
+    assert attempts == 2
+    assert fake_connection.sent == ["hello"]
+
+
+@pytest.mark.asyncio
+async def test_proxied_websocket_invalid_proxy_message_exhaustion_is_typed_pre_dispatch(monkeypatch):
+    attempts = 0
+
+    async def failing_websocket_connect(url: str, **kwargs):
+        nonlocal attempts
+        del url, kwargs
+        attempts += 1
+        raise InvalidProxyMessage("did not receive a valid HTTP response from proxy")
+
+    monkeypatch.setattr(proxy_websocket_module, "websocket_connect", failing_websocket_connect)
+    monkeypatch.setattr(
+        proxy_websocket_module,
+        "resolve_websocket_proxy_from_env",
+        lambda url, env: "http://proxy.test:3128",
+    )
+    monkeypatch.setattr(
+        proxy_websocket_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            upstream_base_url="https://chatgpt.com/backend-api",
+            upstream_connect_timeout_seconds=7.0,
+            proxy_downstream_websocket_idle_timeout_seconds=120.0,
+            max_sse_event_bytes=4321,
+            upstream_websocket_trust_env=True,
+            upstream_websocket_proxy_env=lambda: {},
+        ),
+    )
+
+    with pytest.raises(ProxyResponseError) as exc_info:
+        await connect_responses_websocket(
+            {"openai-beta": "responses_websockets=2026-02-06"},
+            "access-token",
+            "account-123",
+            allow_direct_egress=True,
+        )
+
+    assert attempts == 2
+    assert exc_info.value.failure_phase == "connect"
+    assert exc_info.value.failure_detail == "shared_proxy_connect_pre_dispatch_exhausted"
+    assert exc_info.value.failure_exception_type == "InvalidProxyMessage"
+    assert exc_info.value.retryable_same_contract is False
 
 
 @pytest.mark.asyncio

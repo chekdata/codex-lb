@@ -1813,6 +1813,23 @@ def _canonical_response_owned_user_message(
     }
 
 
+def _canonical_response_owned_developer_message() -> dict[str, JsonValue]:
+    return {
+        "type": "message",
+        "id": "msg_01a02a78-d2b5-71e3-a33e-fab25a40b322",
+        "role": "developer",
+        "content": [
+            {"type": "input_text", "text": "stored permissions"},
+            {"type": "input_text", "text": "stored app context"},
+            {"type": "input_text", "text": "stored collaboration mode"},
+            {"type": "input_text", "text": "stored skills"},
+        ],
+        "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a02a78-d2b4-7a73-b03f-6d85db9cf496",
+        },
+    }
+
+
 def test_full_resend_exact_prefix_accepts_canonical_agent_message_before_user_retries() -> None:
     stored_input: list[JsonValue] = [{"role": "user", "content": "first question"}]
     full_input: list[JsonValue] = [
@@ -2004,6 +2021,98 @@ def test_full_resend_real_codex_user_bookkeeping_is_stripped_after_boundary_proo
         metadata = item.get("internal_chat_message_metadata_passthrough")
         assert isinstance(metadata, dict)
         assert set(metadata) == {"turn_id"}
+
+
+def test_abandoned_pending_boundary_projects_response_owned_developer_in_exact_stored_prefix() -> None:
+    developer_message = _canonical_response_owned_developer_message()
+    stored_input: list[JsonValue] = [
+        _canonical_response_owned_user_message(text="compacted user context"),
+        developer_message,
+        {
+            "type": "custom_tool_call",
+            "call_id": "call_settled",
+            "name": "shell",
+            "input": "pwd",
+            "status": "completed",
+        },
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call_settled",
+            "output": "/workspace",
+        },
+    ]
+    input_items: list[JsonValue] = [
+        *stored_input,
+        {
+            "type": "reasoning",
+            "id": "rs_08639659bba14680016a8a0902e9a887d090946ff27b898f05",
+            "encrypted_content": "opaque",
+            "summary": [],
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+            },
+        },
+        _canonical_agent_message(),
+        _canonical_response_owned_user_message(text="scheduled retry"),
+        _canonical_response_owned_user_message(
+            message_id="msg_01a02c59-7810-75fc-a7ee-ea7db5a66b6e",
+            turn_id="01a02c59-7810-75fc-a7ee-ea7db5a66b6e",
+            text="continue",
+        ),
+    ]
+    pending_tool_calls = {"call_undelivered": "custom_tool_call"}
+
+    assert responses_input_suffix_proves_abandoned_pending_agent_boundary(
+        input_items,
+        stored_count=len(stored_input),
+        pending_tool_calls=pending_tool_calls,
+    )
+    projection = project_responses_input_for_abandoned_pending_fresh_replay(
+        input_items,
+        stored_count=len(stored_input),
+        pending_tool_calls=pending_tool_calls,
+    )
+    assert projection is not None
+    projected_developer = next(
+        item
+        for item in projection.input_items[: projection.stored_prefix_count]
+        if isinstance(item, dict) and item.get("role") == "developer"
+    )
+    assert "id" not in projected_developer
+    assert projected_developer["content"] == developer_message["content"]
+    assert projected_developer["internal_chat_message_metadata_passthrough"] == {
+        "turn_id": "01a02a78-d2b4-7a73-b03f-6d85db9cf496"
+    }
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda item: item.__setitem__("id", "msg_not-a-uuid"), id="invalid-message-id"),
+        pytest.param(
+            lambda item: item["internal_chat_message_metadata_passthrough"].__setitem__("extra", True),
+            id="extra-metadata",
+        ),
+        pytest.param(
+            lambda item: item.__setitem__("content", [{"type": "output_text", "text": "wrong authority"}]),
+            id="output-content",
+        ),
+        pytest.param(lambda item: item.__setitem__("extra", "unbound"), id="extra-field"),
+    ],
+)
+def test_abandoned_pending_boundary_rejects_malformed_response_owned_developer_messages(mutate) -> None:
+    developer_message = _canonical_response_owned_developer_message()
+    mutate(developer_message)
+    stored_input: list[JsonValue] = [
+        _canonical_response_owned_user_message(text="compacted user context"),
+        developer_message,
+    ]
+
+    assert not responses_input_suffix_proves_abandoned_pending_agent_boundary(
+        [*stored_input, _canonical_agent_message(), _canonical_response_owned_user_message()],
+        stored_count=len(stored_input),
+        pending_tool_calls={"call_undelivered": "custom_tool_call"},
+    )
 
 
 def test_abandoned_pending_boundary_drops_only_exact_leading_orphan_output() -> None:
