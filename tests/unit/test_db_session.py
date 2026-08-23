@@ -12,8 +12,10 @@ from typing import Any, cast
 
 import pytest
 from sqlalchemy import event as sa_event
+from sqlalchemy import text
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
+from sqlalchemy.pool import AsyncAdaptedQueuePool, NullPool
 
 import app.db.session as session_module
 from app.db.models import Account, AccountStatus, Base
@@ -789,6 +791,135 @@ async def test_get_background_session_falls_back_to_main_pool_when_not_initializ
     async with session_module.get_background_session() as session:
         assert session is not None
         assert isinstance(session, session_module.AsyncSession)
+
+
+@pytest.mark.asyncio
+async def test_get_request_session_always_uses_main_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    main_session = object()
+    background_session = object()
+    closed: list[object] = []
+
+    monkeypatch.setattr(session_module, "SessionLocal", lambda: main_session)
+    monkeypatch.setattr(session_module, "_background_session_factory", lambda: background_session)
+
+    async def _close_session(session: object) -> None:
+        closed.append(session)
+
+    monkeypatch.setattr(session_module, "close_session", _close_session)
+
+    async with session_module.get_request_session() as session:
+        assert session is main_session
+        assert session is not background_session
+
+    assert closed == [main_session]
+
+
+@pytest.mark.asyncio
+async def test_get_request_session_returns_connection_after_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+
+    class FakeSession:
+        transaction_open = True
+
+        def in_transaction(self) -> bool:
+            return self.transaction_open
+
+        async def rollback(self) -> None:
+            events.append("rollback")
+            self.transaction_open = False
+
+        async def close(self) -> None:
+            events.append("close")
+
+    monkeypatch.setattr(session_module, "SessionLocal", FakeSession)
+
+    with pytest.raises(asyncio.CancelledError):
+        async with session_module.get_request_session():
+            raise asyncio.CancelledError
+
+    assert events == ["rollback", "close"]
+
+
+@pytest.mark.asyncio
+async def test_get_request_session_returns_connection_after_pool_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+
+    class FakeSession:
+        transaction_open = True
+
+        def in_transaction(self) -> bool:
+            return self.transaction_open
+
+        async def rollback(self) -> None:
+            events.append("rollback")
+            self.transaction_open = False
+
+        async def close(self) -> None:
+            events.append("close")
+
+    monkeypatch.setattr(session_module, "SessionLocal", FakeSession)
+
+    with pytest.raises(SQLAlchemyTimeoutError, match="private topology"):
+        async with session_module.get_request_session():
+            raise SQLAlchemyTimeoutError("private topology")
+
+    assert events == ["rollback", "close"]
+
+
+@pytest.mark.asyncio
+async def test_request_pool_progresses_while_real_background_queue_pool_is_saturated(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    request_engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'request-pool.db'}",
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.1,
+    )
+    background_engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'background-pool.db'}",
+        pool_size=2,
+        max_overflow=1,
+        pool_timeout=0.1,
+    )
+    request_factory = async_sessionmaker(request_engine, expire_on_commit=False)
+    background_factory = async_sessionmaker(background_engine, expire_on_commit=False)
+    request_pool = cast(AsyncAdaptedQueuePool, request_engine.sync_engine.pool)
+    background_pool = cast(AsyncAdaptedQueuePool, background_engine.sync_engine.pool)
+    monkeypatch.setattr(session_module, "SessionLocal", request_factory)
+    monkeypatch.setattr(session_module, "_background_session_factory", background_factory)
+
+    release = asyncio.Event()
+    all_background_checked_out = asyncio.Event()
+    started = 0
+
+    async def hold_background_checkout() -> None:
+        nonlocal started
+        async with session_module.get_background_session() as session:
+            await session.execute(text("SELECT 1"))
+            started += 1
+            if started == 3:
+                all_background_checked_out.set()
+            await release.wait()
+
+    holders = [asyncio.create_task(hold_background_checkout()) for _ in range(3)]
+    try:
+        await asyncio.wait_for(all_background_checked_out.wait(), timeout=1.0)
+        assert background_pool.checkedout() == 3
+
+        async with session_module.get_request_session() as request_session:
+            result = await asyncio.wait_for(request_session.execute(text("SELECT 1")), timeout=0.5)
+            assert result.scalar_one() == 1
+            assert request_pool.checkedout() == 1
+    finally:
+        release.set()
+        await asyncio.gather(*holders, return_exceptions=True)
+        await request_engine.dispose()
+        await background_engine.dispose()
+
+    assert background_pool.checkedout() == 0
+    assert request_pool.checkedout() == 0
 
 
 @pytest.mark.asyncio

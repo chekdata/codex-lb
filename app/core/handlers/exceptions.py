@@ -12,6 +12,7 @@ from fastapi.exception_handlers import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from starlette._utils import get_route_path
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -43,6 +44,11 @@ from app.core.middleware.request_body_limit import (
 )
 from app.core.multipart import MultipartPayloadTooLarge
 from app.core.runtime_logging import log_error_response
+from app.db.session import (
+    DATABASE_POOL_RETRY_AFTER_SECONDS,
+    DATABASE_POOL_UNAVAILABLE_CODE,
+    DATABASE_POOL_UNAVAILABLE_MESSAGE,
+)
 from app.modules.proxy.images_observability import (
     IMAGE_ROUTE_MODEL_STATE,
     IMAGE_ROUTE_STARTED_AT_STATE,
@@ -261,6 +267,47 @@ def add_exception_handlers(app: FastAPI) -> None:
                 content=dashboard_error(exc.code, exc.message),
                 headers=headers,
             )
+
+    @app.exception_handler(SQLAlchemyTimeoutError)
+    async def database_pool_timeout_handler(
+        request: Request,
+        exc: SQLAlchemyTimeoutError,
+    ) -> JSONResponse:
+        del exc
+        fmt = _error_format(request)
+        log_error_response(
+            logger,
+            request,
+            503,
+            DATABASE_POOL_UNAVAILABLE_CODE,
+            DATABASE_POOL_UNAVAILABLE_MESSAGE,
+            category="database_pool_unavailable_response",
+        )
+        headers = {"Retry-After": str(DATABASE_POOL_RETRY_AFTER_SECONDS)}
+        if fmt == "dashboard":
+            return JSONResponse(
+                status_code=503,
+                content=dashboard_error(
+                    DATABASE_POOL_UNAVAILABLE_CODE,
+                    DATABASE_POOL_UNAVAILABLE_MESSAGE,
+                ),
+                headers=headers,
+            )
+        if fmt == "openai":
+            return JSONResponse(
+                status_code=503,
+                content=openai_error(
+                    DATABASE_POOL_UNAVAILABLE_CODE,
+                    DATABASE_POOL_UNAVAILABLE_MESSAGE,
+                    error_type="server_error",
+                ),
+                headers=headers,
+            )
+        return JSONResponse(
+            status_code=503,
+            content={"detail": DATABASE_POOL_UNAVAILABLE_MESSAGE},
+            headers=headers,
+        )
 
     # --- Framework exceptions: format based on router marker ---
 

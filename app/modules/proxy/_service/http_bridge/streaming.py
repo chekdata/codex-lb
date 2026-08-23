@@ -3887,6 +3887,20 @@ class _HTTPBridgeStreamingMixin:
                     reservation=retry_api_key_reservation,
                 )
                 retry_request_state.enforce_openai_sdk_contract = enforce_openai_sdk_contract
+                if abandoned_pending_stale_anchor_replay:
+                    # The upstream must receive only the fail-closed projection,
+                    # but continuity is still owned by the client's verified
+                    # full resend.  Persist that original prefix so the next
+                    # client full resend can trim against the recovered anchor
+                    # instead of replaying the projected history again.
+                    abandoned_pending_client_input = cast(
+                        list[JsonValue],
+                        untrimmed_effective_payload.input,
+                    )
+                    retry_request_state.input_item_count = len(abandoned_pending_client_input)
+                    retry_request_state.input_full_fingerprint = _fingerprint_input_items(
+                        abandoned_pending_client_input
+                    )
                 if durable_recovery_fresh_replay and durable_recovery_attempt_fingerprint is not None:
                     retry_request_state.recovery_attempt_fingerprint = durable_recovery_attempt_fingerprint
                     retry_request_state.recovery_attempt_session_id = request_state.recovery_attempt_session_id

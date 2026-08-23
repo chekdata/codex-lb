@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from ipaddress import IPv4Network, IPv6Network
 from typing import cast
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from app.core.config.settings import get_settings
 from app.core.errors import openai_error
@@ -15,9 +17,16 @@ from app.core.request_locality import (
     parse_trusted_proxy_networks,
     resolve_connection_client_ip,
 )
-from app.db.session import get_background_session
+from app.db.session import (
+    DATABASE_POOL_RETRY_AFTER_SECONDS,
+    DATABASE_POOL_UNAVAILABLE_CODE,
+    DATABASE_POOL_UNAVAILABLE_MESSAGE,
+    get_request_session,
+)
 from app.modules.firewall.repository import FirewallRepository
 from app.modules.firewall.service import FirewallRepositoryPort, FirewallService
+
+logger = logging.getLogger(__name__)
 
 
 def add_api_firewall_middleware(app: FastAPI) -> None:
@@ -46,10 +55,22 @@ def add_api_firewall_middleware(app: FastAPI) -> None:
             is_allowed = cached_decision
         else:
             version_before_read = firewall_cache.version
-            async with get_background_session() as session:
-                repository = cast(FirewallRepositoryPort, FirewallRepository(session))
-                service = FirewallService(repository)
-                is_allowed = await service.is_ip_allowed(client_ip)
+            try:
+                async with get_request_session() as session:
+                    repository = cast(FirewallRepositoryPort, FirewallRepository(session))
+                    service = FirewallService(repository)
+                    is_allowed = await service.is_ip_allowed(client_ip)
+            except SQLAlchemyTimeoutError:
+                logger.warning("database_pool_checkout_timeout surface=api_firewall")
+                return JSONResponse(
+                    status_code=503,
+                    content=openai_error(
+                        DATABASE_POOL_UNAVAILABLE_CODE,
+                        DATABASE_POOL_UNAVAILABLE_MESSAGE,
+                        error_type="server_error",
+                    ),
+                    headers={"Retry-After": str(DATABASE_POOL_RETRY_AFTER_SECONDS)},
+                )
             if client_ip is not None:
                 await firewall_cache.set(client_ip, is_allowed, if_version=version_before_read)
 

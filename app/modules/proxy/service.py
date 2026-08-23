@@ -5,7 +5,7 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable, Collection
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any, AsyncIterator, Literal, Mapping, NoReturn, TypeVar, cast
 
 import aiohttp
@@ -927,9 +927,11 @@ class ProxyService(
         self,
         repo_factory: ProxyRepoFactory,
         *,
+        refresh_repo_factory: Callable[[], AbstractAsyncContextManager[AccountsRepositoryPort]] | None = None,
         live_websocket_connector: LiveWebSocketConnector = connect_live_websocket,
     ) -> None:
         self._repo_factory = repo_factory
+        self._refresh_repo_factory = refresh_repo_factory or self._accounts_refresh_scope
         self._encryptor = TokenEncryptor()
         self._load_balancer = LoadBalancer(repo_factory)
         self._capability_router = CapabilityRouter(repo_factory)
@@ -1448,8 +1450,6 @@ class ProxyService(
 
     @asynccontextmanager
     async def _accounts_refresh_scope(self) -> AsyncIterator[AccountsRepositoryPort]:
-        # A self-contained repo prevents request cancellation from closing the
-        # session under AuthManager's shielded refresh and stranding a connection.
         async with self._repo_factory() as repos:
             yield repos.accounts
 
@@ -1463,11 +1463,11 @@ class ProxyService(
     ) -> Account:
         token = push_token_refresh_timeout_override(timeout_seconds)
         try:
-            async with self._repo_factory() as repos:
+            async with self._refresh_repo_factory() as accounts_repo:
                 auth_manager = AuthManager(
-                    repos.accounts,
+                    accounts_repo,
                     acquire_refresh_admission=self._get_work_admission().acquire_token_refresh,
-                    refresh_repo_factory=self._accounts_refresh_scope,
+                    refresh_repo_factory=self._refresh_repo_factory,
                     redact_sensitive_details=redact_sensitive_details,
                 )
                 refresh = auth_manager.ensure_fresh(account, force=force)

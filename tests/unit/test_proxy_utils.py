@@ -35705,6 +35705,38 @@ async def test_ensure_fresh_skips_token_refresh_admission_for_fresh_account(monk
 
 
 @pytest.mark.asyncio
+async def test_ensure_fresh_uses_per_operation_repository_without_opening_request_repo(monkeypatch):
+    settings = _make_proxy_settings()
+    explicit_repo = cast(Any, object())
+
+    def fail_repo_factory():
+        raise AssertionError("request repository must not be opened for token refresh")
+
+    @asynccontextmanager
+    async def refresh_repo_factory():
+        yield explicit_repo
+
+    service = proxy_service.ProxyService(
+        fail_repo_factory,
+        refresh_repo_factory=refresh_repo_factory,
+    )
+    account = _make_account("acc_per_operation_refresh_repo")
+
+    async def fake_ensure_fresh(manager, target, *, force: bool = False):
+        assert manager._repo is explicit_repo
+        assert manager._refresh_repo_factory is refresh_repo_factory
+        assert force is True
+        return target
+
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(proxy_service.AuthManager, "ensure_fresh", fake_ensure_fresh)
+
+    refreshed = await service._ensure_fresh(account, force=True)
+
+    assert refreshed is account
+
+
+@pytest.mark.asyncio
 async def test_ensure_fresh_same_stale_account_joins_singleflight_before_refresh_admission(monkeypatch):
     auth_manager_module._clear_refresh_singleflight_state()
     settings = _make_proxy_settings()

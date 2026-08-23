@@ -42,6 +42,9 @@ _SQLITE_BUSY_TIMEOUT_SECONDS = _SQLITE_BUSY_TIMEOUT_MS / 1000
 # ``database_pool_size`` / ``database_max_overflow``.
 _POSTGRES_POOL_TIMEOUT_SECONDS = 30.0
 _POSTGRES_POOL_RECYCLE_SECONDS = 1800
+DATABASE_POOL_UNAVAILABLE_CODE = "database_pool_unavailable"
+DATABASE_POOL_UNAVAILABLE_MESSAGE = "Database capacity is temporarily unavailable; retry shortly."
+DATABASE_POOL_RETRY_AFTER_SECONDS = 1
 _database_url = normalize_sqlite_url(_settings.database_url)
 
 
@@ -286,12 +289,31 @@ def init_background_db(url: str | None = None) -> None:
 
 @asynccontextmanager
 async def get_background_session() -> AsyncIterator[AsyncSession]:
-    """Session provider for background tasks, schedulers, and auth dependencies.
+    """Session provider for detached background tasks and schedulers.
 
     Uses the separate background pool if initialized, otherwise falls back to main pool.
     """
     factory = _background_session_factory or SessionLocal
     session = factory()
+    try:
+        yield session
+    except BaseException:
+        await _safe_rollback(session)
+        raise
+    finally:
+        await close_session(session)
+
+
+@asynccontextmanager
+async def get_request_session() -> AsyncIterator[AsyncSession]:
+    """Explicit session boundary for foreground request work.
+
+    Request middleware and authentication cache misses must use the main pool
+    so detached refresh and scheduler saturation cannot consume their checkout
+    budget.  The session still owns rollback and close across cancellation and
+    timeout paths.
+    """
+    session = SessionLocal()
     try:
         yield session
     except BaseException:
@@ -349,14 +371,8 @@ async def sqlite_writer_section() -> AsyncIterator[None]:
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
-    session = SessionLocal()
-    try:
+    async with get_request_session() as session:
         yield session
-    except BaseException:
-        await _safe_rollback(session)
-        raise
-    finally:
-        await close_session(session)
 
 
 async def init_db() -> None:

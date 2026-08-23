@@ -16,8 +16,8 @@ from app.core.auth.refresh import RefreshError
 from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import Account, AccountStatus
 from app.db.session import get_background_session
-from app.modules.accounts.auth_manager import AuthManager
-from app.modules.accounts.repository import AccountsRepository
+from app.modules.accounts.auth_manager import AccountsRepositoryPort, AuthManager
+from app.modules.accounts.background_repository import BackgroundAccountsRepository
 from app.modules.proxy.account_cache import get_account_selection_cache
 
 logger = logging.getLogger(__name__)
@@ -176,49 +176,49 @@ class AuthGuardianScheduler:
                     max_age_seconds=self.max_age_seconds,
                 ):
                     return
-                manager = self.auth_manager_factory(repo)
+            manager = self.auth_manager_factory(repo)
+            try:
+                refresh_task = asyncio.create_task(manager.ensure_fresh(account, force=True))
                 try:
-                    refresh_task = asyncio.create_task(manager.ensure_fresh(account, force=True))
-                    try:
-                        await asyncio.shield(refresh_task)
-                    except asyncio.CancelledError:
-                        with contextlib.suppress(Exception):
-                            await refresh_task
-                        raise
-                except RefreshError as exc:
-                    self._record_failure(account_id)
-                    if exc.is_permanent:
-                        get_account_selection_cache().invalidate()
-                    logger.warning(
-                        "Auth Guardian refresh failed account_id=%s account_alias=%s status=%s code=%s permanent=%s "
-                        "transport=%s",
-                        account.id,
-                        _safe_account_alias(account),
-                        source_status,
-                        exc.code,
-                        exc.is_permanent,
-                        exc.transport_error,
-                    )
-                    return
-                except Exception as exc:
-                    self._record_failure(account_id)
-                    logger.warning(
-                        "Auth Guardian refresh failed account_id=%s account_alias=%s status=%s error_type=%s",
-                        account.id,
-                        _safe_account_alias(account),
-                        source_status,
-                        exc.__class__.__name__,
-                        exc_info=True,
-                    )
-                    return
-                self._failures.pop(account_id, None)
-                get_account_selection_cache().invalidate()
-                logger.info(
-                    "Auth Guardian refreshed account_id=%s account_alias=%s status=%s",
+                    await asyncio.shield(refresh_task)
+                except asyncio.CancelledError:
+                    with contextlib.suppress(Exception):
+                        await refresh_task
+                    raise
+            except RefreshError as exc:
+                self._record_failure(account_id)
+                if exc.is_permanent:
+                    get_account_selection_cache().invalidate()
+                logger.warning(
+                    "Auth Guardian refresh failed account_id=%s account_alias=%s status=%s code=%s permanent=%s "
+                    "transport=%s",
                     account.id,
                     _safe_account_alias(account),
                     source_status,
+                    exc.code,
+                    exc.is_permanent,
+                    exc.transport_error,
                 )
+                return
+            except Exception as exc:
+                self._record_failure(account_id)
+                logger.warning(
+                    "Auth Guardian refresh failed account_id=%s account_alias=%s status=%s error_type=%s",
+                    account.id,
+                    _safe_account_alias(account),
+                    source_status,
+                    exc.__class__.__name__,
+                    exc_info=True,
+                )
+                return
+            self._failures.pop(account_id, None)
+            get_account_selection_cache().invalidate()
+            logger.info(
+                "Auth Guardian refreshed account_id=%s account_alias=%s status=%s",
+                account.id,
+                _safe_account_alias(account),
+                source_status,
+            )
 
     def _in_backoff(self, account_id: str) -> bool:
         failure = self._failures.get(account_id)
@@ -321,13 +321,13 @@ async def _count_live_bridge_ring_members() -> int:
 
 
 @asynccontextmanager
-async def _default_accounts_repo_factory() -> AsyncIterator[AccountsRepository]:
-    async with get_background_session() as session:
-        yield AccountsRepository(session)
+async def _default_accounts_repo_factory() -> AsyncIterator[BackgroundAccountsRepository]:
+    yield BackgroundAccountsRepository()
 
 
-def _default_auth_manager_factory(repo: _AccountsRepositoryLike) -> _AuthManagerLike:
-    return AuthManager(cast(AccountsRepository, repo), refresh_repo_factory=_default_accounts_repo_factory)
+def _default_auth_manager_factory(_repo: _AccountsRepositoryLike) -> _AuthManagerLike:
+    repo = BackgroundAccountsRepository()
+    return AuthManager(cast(AccountsRepositoryPort, repo), refresh_repo_factory=_default_accounts_repo_factory)
 
 
 def _jitter_delay(max_seconds: float) -> float:

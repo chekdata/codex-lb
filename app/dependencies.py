@@ -8,8 +8,9 @@ from typing import cast
 from fastapi import Depends, FastAPI, Request, WebSocket
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.session import get_background_session, get_session
+from app.db.session import get_background_session, get_request_session, get_session
 from app.modules.accounts.auth_manager import AuthManager
+from app.modules.accounts.background_repository import BackgroundAccountsRepository
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.accounts.service import AccountsService
 from app.modules.api_keys.repository import ApiKeysRepository
@@ -169,7 +170,7 @@ def get_accounts_context(
         usage_repository,
         additional_usage_repository,
         limit_warmup_repository,
-        auth_manager=AuthManager(repository, refresh_repo_factory=_accounts_repo_context),
+        auth_manager=AuthManager(repository, refresh_repo_factory=_accounts_refresh_repo_context),
     )
     return AccountsContext(
         session=session,
@@ -205,14 +206,25 @@ def get_usage_context(
 
 
 @asynccontextmanager
+async def _accounts_refresh_repo_context() -> AsyncIterator[BackgroundAccountsRepository]:
+    # Shielded refresh work must own only short, per-operation sessions.  A
+    # context-held AccountsRepository would pin a checkout across upstream I/O.
+    yield BackgroundAccountsRepository()
+
+
+@asynccontextmanager
 async def _accounts_repo_context() -> AsyncIterator[AccountsRepository]:
+    # OAuth token persistence runs after the external exchange has completed;
+    # keep its existing single-transaction repository contract.
     async with get_background_session() as session:
         yield AccountsRepository(session)
 
 
 @asynccontextmanager
 async def _proxy_repo_context() -> AsyncIterator[ProxyRepositories]:
-    async with get_background_session() as session:
+    # This factory serves foreground proxy request work.  Detached schedulers
+    # and refresh persistence use their explicit background repositories.
+    async with get_request_session() as session:
         yield ProxyRepositories(
             accounts=AccountsRepository(session),
             usage=UsageRepository(session),
@@ -249,7 +261,10 @@ def get_proxy_service_for_app(app: FastAPI) -> ProxyService:
     state = app.state
     service = getattr(state, "proxy_service", None)
     if not isinstance(service, ProxyService):
-        service = ProxyService(repo_factory=_proxy_repo_context)
+        service = ProxyService(
+            repo_factory=_proxy_repo_context,
+            refresh_repo_factory=_accounts_refresh_repo_context,
+        )
         setattr(state, "proxy_service", service)
     return service
 

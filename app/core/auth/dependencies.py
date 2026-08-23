@@ -29,7 +29,7 @@ from app.core.socket_peer import raw_socket_peer_host
 from app.core.upstream_proxy import UpstreamProxyRouteError, resolve_upstream_route
 from app.core.utils.time import utcnow
 from app.db.models import AccountStatus
-from app.db.session import get_background_session
+from app.db.session import get_request_session
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import ApiKeyData, ApiKeyInvalidError, ApiKeysService
@@ -108,7 +108,7 @@ async def _validate_api_key_token(token: str) -> ApiKeyData:
             return cached
 
     version_before_read = cache.version
-    async with get_background_session() as session:
+    async with get_request_session() as session:
         service = ApiKeysService(ApiKeysRepository(session))
         try:
             validated = await service.validate_key(token)
@@ -301,7 +301,7 @@ async def validate_codex_usage_identity(request: Request) -> ApiKeyData | None:
             return await _validate_api_key_token(token)
         raise ProxyAuthError("Missing chatgpt-account-id header")
 
-    async with get_background_session() as session:
+    async with get_request_session() as session:
         accounts_repo = AccountsRepository(session)
         account = await accounts_repo.get_active_by_chatgpt_account_id(account_id)
         if account is None:
@@ -341,7 +341,7 @@ async def validate_codex_usage_identity(request: Request) -> ApiKeyData | None:
             usage_payload.workspace_id,
             usage_payload.workspace_label,
         )
-        async with get_background_session() as session:
+        async with get_request_session() as session:
             accounts_repo = AccountsRepository(session)
             workspace_account = await accounts_repo.get_by_id(expected_account_id)
             if workspace_account is not None and workspace_account.chatgpt_account_id == account_id:
