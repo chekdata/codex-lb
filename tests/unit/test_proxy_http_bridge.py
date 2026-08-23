@@ -9895,9 +9895,29 @@ def test_verified_agent_message_recovery_requires_explicitly_empty_tool_manifest
 def test_verified_abandoned_pending_agent_boundary_is_stale_anchor_only_and_state_bound() -> None:
     stored_input_items: list[proxy_service.JsonValue] = [
         {"role": "user", "content": "first question"},
+        {
+            "type": "agent_message",
+            "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea1",
+            "author": "/root/historical_worker",
+            "recipient": "/root",
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2daa",
+                "create_time": 1787431100.0,
+            },
+            "content": [{"type": "input_text", "text": "historical inter-agent result"}],
+        },
     ]
     full_input: list[proxy_service.JsonValue] = [
         *stored_input_items,
+        {
+            "type": "reasoning",
+            "id": "rs_08639659bba14680016a8a0904462c87d08ae1115f2aef2ccc",
+            "encrypted_content": "opaque",
+            "summary": [],
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+            },
+        },
         {
             "type": "agent_message",
             "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea0",

@@ -1910,23 +1910,29 @@ def test_full_resend_agent_message_after_fresh_user_is_not_a_prior_output_bounda
 
 
 def test_full_resend_agent_message_proves_client_abandoned_undelivered_pending_call() -> None:
-    stored_input: list[JsonValue] = [{"role": "user", "content": "first question"}]
-    projection = project_responses_input_for_account_neutral_fresh_replay(
-        [
-            *stored_input,
-            {"type": "reasoning", "id": "rs_old", "encrypted_content": "opaque", "summary": []},
-            _canonical_agent_message(),
-            {"role": "user", "content": "first retry"},
-            {"role": "user", "content": "second retry"},
-        ],
-        stored_count=len(stored_input),
-        preserve_response_owned_agent_message_ids=True,
-    )
+    stored_input: list[JsonValue] = [
+        {"role": "user", "content": "first question"},
+        _canonical_agent_message(),
+    ]
+    input_items: list[JsonValue] = [
+        *stored_input,
+        {
+            "type": "reasoning",
+            "id": "rs_old",
+            "encrypted_content": "opaque",
+            "summary": [],
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+            },
+        },
+        _canonical_agent_message(),
+        {"role": "user", "content": "first retry"},
+        {"role": "user", "content": "second retry"},
+    ]
 
-    assert projection is not None
     assert responses_input_suffix_proves_abandoned_pending_agent_boundary(
-        projection.input_items,
-        stored_count=projection.stored_prefix_count,
+        input_items,
+        stored_count=len(stored_input),
         pending_tool_calls={"call_undelivered": "custom_tool_call"},
     )
 
@@ -1966,16 +1972,48 @@ def test_abandoned_pending_agent_boundary_rejects_incomplete_or_tool_bearing_suf
     suffix: list[JsonValue],
 ) -> None:
     stored_input: list[JsonValue] = [{"role": "user", "content": "first question"}]
-    projection = project_responses_input_for_account_neutral_fresh_replay(
+    assert not responses_input_suffix_proves_abandoned_pending_agent_boundary(
         [*stored_input, *suffix],
         stored_count=len(stored_input),
-        preserve_response_owned_agent_message_ids=True,
+        pending_tool_calls={"call_undelivered": "custom_tool_call"},
     )
 
-    assert projection is not None
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        pytest.param(
+            [
+                {"type": "reasoning", "id": "rs_missing_provenance", "encrypted_content": "opaque", "summary": []},
+                _canonical_agent_message(),
+                {"role": "user", "content": "retry"},
+            ],
+            id="reasoning-missing-turn-provenance",
+        ),
+        pytest.param(
+            [
+                _canonical_agent_message(),
+                {
+                    "type": "reasoning",
+                    "id": "rs_after_boundary",
+                    "encrypted_content": "opaque",
+                    "summary": [],
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+                    },
+                },
+                {"role": "user", "content": "retry"},
+            ],
+            id="reasoning-after-agent-boundary",
+        ),
+    ],
+)
+def test_abandoned_pending_agent_boundary_rejects_unproven_or_misordered_reasoning(
+    suffix: list[JsonValue],
+) -> None:
     assert not responses_input_suffix_proves_abandoned_pending_agent_boundary(
-        projection.input_items,
-        stored_count=projection.stored_prefix_count,
+        [{"role": "user", "content": "first question"}, *suffix],
+        stored_count=1,
         pending_tool_calls={"call_undelivered": "custom_tool_call"},
     )
 
