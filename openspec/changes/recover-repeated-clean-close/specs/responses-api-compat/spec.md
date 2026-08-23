@@ -266,6 +266,16 @@ proxy-injected stale `previous_response_id`, replay the complete context once
 on the same account, and publish a replacement anchor only after
 `response.completed`.
 
+For the abandoned-pending-call exception, the new suffix MAY contain zero or
+more exact response-owned reasoning items immediately before the canonical
+`agent_message`. Each such item MUST carry an `rs_` identity, encrypted
+content, a structured summary, and exact internal turn provenance; malformed
+reasoning or reasoning after the agent boundary MUST fail closed. The proof
+projection MUST omit those reasoning items and any exact historical
+response-owned agent deliveries already covered by the immutable stored-prefix
+fingerprint. The actual one-shot unanchored retry MUST use that same projected
+input. It MUST NOT resend omitted response bookkeeping or any pending call id.
+
 Rejected-proof observability MUST classify only known string-valued `type` and
 `role` fields. Non-string or otherwise malformed values MUST be labeled as an
 opaque `other` shape without logging their content and MUST NOT turn the
@@ -327,7 +337,8 @@ classification and MUST NOT fail on non-string item types.
 - **GIVEN** the durable owner has a nonempty pending client-side tool-call manifest
 - **AND** an exact-prefix full resend contains none of those pending call ids
 - **AND** its fresh suffix begins with one canonical response-owned
-  `agent_message` followed only by one or more new user inputs
+  `agent_message` (optionally preceded only by exact response-owned reasoning)
+  followed only by one or more new user inputs
 - **WHEN** upstream rejects the exact durable `previous_response_id` before
   emitting any response event
 - **THEN** the bridge treats the pending call as never accepted or executed by
@@ -335,6 +346,8 @@ classification and MUST NOT fail on non-string item types.
 - **AND** retries the complete request exactly once without the stale anchor
   on the same owning account
 - **AND** does not synthesize the orphan call or output into the unanchored replay
+- **AND** omits the response-owned reasoning and sealed historical agent
+  deliveries from the one-shot recovery payload
 - **AND** publishes a replacement anchor only after successful completion
 
 #### Scenario: malformed diagnostic fields remain fail-closed

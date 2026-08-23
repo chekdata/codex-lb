@@ -15788,7 +15788,21 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
         "x-codex-session-id": "abandoned-pending-agent-boundary",
         "x-codex-turn-state": "abandoned-pending-agent-boundary-turn",
     }
-    historical_input = [{"role": "user", "content": "first question"}]
+    historical_agent_message = {
+        "type": "agent_message",
+        "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea1",
+        "author": "/root/historical_worker",
+        "recipient": "/root",
+        "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2daa",
+            "create_time": 1787431100.0,
+        },
+        "content": [{"type": "input_text", "text": "historical inter-agent result"}],
+    }
+    historical_input = [
+        {"role": "user", "content": "first question"},
+        historical_agent_message,
+    ]
     first = await async_client.post(
         "/v1/responses",
         headers=session_headers,
@@ -15815,6 +15829,15 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
     }
     full_resend = [
         *historical_input,
+        {
+            "type": "reasoning",
+            "id": "rs_08639659bba14680016a8a0904462c87d08ae1115f2aef2ccc",
+            "encrypted_content": "opaque",
+            "summary": [],
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+            },
+        },
         agent_message,
         {"role": "user", "content": "first retry"},
         {"role": "user", "content": "second retry"},
@@ -15862,5 +15885,10 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
     assert len(recovered_upstream.sent_text) == 1
     recovered_payload = json.loads(recovered_upstream.sent_text[0])
     assert "previous_response_id" not in recovered_payload
-    assert recovered_payload["input"] == full_resend
+    assert recovered_payload["input"] == [
+        historical_input[0],
+        agent_message,
+        {"role": "user", "content": "first retry"},
+        {"role": "user", "content": "second retry"},
+    ]
     assert all(item.get("call_id") != "call_custom_shell" for item in recovered_payload["input"])

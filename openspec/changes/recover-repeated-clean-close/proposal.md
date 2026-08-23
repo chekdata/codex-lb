@@ -60,6 +60,12 @@ loop and require the Codex client to be restarted.
   response-owned `agent_message` followed only by new user input. This proves
   the client never accepted or executed the orphan call while keeping ordinary
   pending-tool replay fail-closed.
+- For that exception only, recognize and omit strictly shaped response-owned
+  reasoning bookkeeping immediately before the new agent boundary, omit
+  already sealed historical agent deliveries from the stored prefix, and send
+  the one recovery attempt from the same verified projection. Do not serialize
+  stale reasoning identifiers or historical agent identifiers into the fresh
+  request.
 
 ## Impact
 

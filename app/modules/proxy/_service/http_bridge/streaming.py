@@ -513,17 +513,10 @@ def _verify_durable_abandoned_pending_full_resend(
     ):
         return None
     input_items = cast(list[JsonValue], payload.input)
-    replay_projection = project_responses_input_for_account_neutral_fresh_replay(
+    if not responses_input_suffix_proves_abandoned_pending_agent_boundary(
         input_items,
         stored_count=stored_count,
-        preserve_developer_message_ids=True,
-        preserve_response_owned_agent_message_ids=True,
-    )
-    if replay_projection is None or not responses_input_suffix_proves_abandoned_pending_agent_boundary(
-        replay_projection.input_items,
-        stored_count=replay_projection.stored_prefix_count,
         pending_tool_calls=pending_tool_calls,
-        canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
     ):
         return None
     return _VerifiedDurableFullResend._seal(
@@ -3613,6 +3606,19 @@ class _HTTPBridgeStreamingMixin:
                     else "stale_anchor_full_resend"
                 )
                 retry_payload = _http_bridge_payload_without_previous_response_id(untrimmed_effective_payload)
+                if abandoned_pending_stale_anchor_replay:
+                    if not isinstance(untrimmed_effective_payload.input, list):
+                        raise
+                    abandoned_projection = project_responses_input_for_account_neutral_fresh_replay(
+                        cast(list[JsonValue], untrimmed_effective_payload.input),
+                        stored_count=durable_abandoned_pending_full_resend_proof.stored_input_item_count,
+                        preserve_developer_message_ids=True,
+                        preserve_response_owned_agent_message_ids=True,
+                        omit_response_owned_agent_messages_from_stored_prefix=True,
+                    )
+                    if abandoned_projection is None:
+                        raise
+                    retry_payload = retry_payload.model_copy(update={"input": abandoned_projection.input_items})
                 retry_previous_response_id = None
                 retry_request_stage = "durable_recovery"
                 retry_preferred_account_id = session.account.id

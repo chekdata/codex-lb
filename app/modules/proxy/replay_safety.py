@@ -179,6 +179,7 @@ def project_responses_input_for_account_neutral_fresh_replay(
     stored_count: int,
     preserve_developer_message_ids: bool = False,
     preserve_response_owned_agent_message_ids: bool = False,
+    omit_response_owned_agent_messages_from_stored_prefix: bool = False,
 ) -> AccountNeutralReplayProjection | None:
     """Remove known response-owned bookkeeping after durable prefix proof.
 
@@ -195,11 +196,23 @@ def project_responses_input_for_account_neutral_fresh_replay(
     canonical_lite_developer_index: int | None = None
     prefix_begins_with_lite_tool_bundle = stored_count >= 2 and _is_canonical_lite_tool_bundle(input_items[0])
     for index, item in enumerate(input_items):
-        projected_item = _project_account_neutral_replay_item(
-            item,
-            preserve_developer_message_ids=preserve_developer_message_ids,
-            preserve_response_owned_agent_message_ids=preserve_response_owned_agent_message_ids,
-        )
+        if (
+            omit_response_owned_agent_messages_from_stored_prefix
+            and index < stored_count
+            and isinstance(item, dict)
+            and item.get("type") == "agent_message"
+            and _is_retained_agent_message(item)
+        ):
+            projected_item = None
+        else:
+            projected_item = _project_account_neutral_replay_item(
+                item,
+                preserve_developer_message_ids=preserve_developer_message_ids,
+                preserve_response_owned_agent_message_ids=(
+                    preserve_response_owned_agent_message_ids
+                    and (not omit_response_owned_agent_messages_from_stored_prefix or index >= stored_count)
+                ),
+            )
         if projected_item is not None:
             projected_items.append(projected_item)
             # The canonical position is the bundle's original immediate
@@ -498,7 +511,6 @@ def responses_input_suffix_proves_abandoned_pending_agent_boundary(
     *,
     stored_count: int,
     pending_tool_calls: Mapping[str, str],
-    canonical_lite_developer_index: int | None = None,
 ) -> bool:
     """Prove a later inter-agent boundary excludes an undelivered pending call.
 
@@ -514,22 +526,84 @@ def responses_input_suffix_proves_abandoned_pending_agent_boundary(
 
     if stored_count <= 0 or len(input_items) <= stored_count or not pending_tool_calls:
         return False
-    prefix_state = _direct_tool_call_prefix_state(
-        input_items[:stored_count],
-        canonical_lite_developer_index=canonical_lite_developer_index,
-    )
-    if prefix_state is None or prefix_state[0] or prefix_state[1] & pending_tool_calls.keys():
+    raw_suffix = input_items[stored_count:]
+    boundary_index = 0
+    while boundary_index < len(raw_suffix) and isinstance(raw_suffix[boundary_index], dict):
+        item = cast(dict[str, JsonValue], raw_suffix[boundary_index])
+        if item.get("type") != "reasoning":
+            break
+        if not _is_response_owned_reasoning_boundary_item(item):
+            return False
+        boundary_index += 1
+    if boundary_index >= len(raw_suffix):
+        return False
+    boundary = raw_suffix[boundary_index]
+    if not isinstance(boundary, dict) or not _is_retained_agent_message(boundary):
+        return False
+    followups = raw_suffix[boundary_index + 1 :]
+    if not followups or not all(isinstance(item, dict) and _is_fresh_followup_input(item) for item in followups):
         return False
     for item in input_items:
         if isinstance(item, dict) and item.get("call_id") in pending_tool_calls:
             return False
-    suffix = input_items[stored_count:]
+    replay_projection = project_responses_input_for_account_neutral_fresh_replay(
+        input_items,
+        stored_count=stored_count,
+        preserve_developer_message_ids=True,
+        preserve_response_owned_agent_message_ids=True,
+        omit_response_owned_agent_messages_from_stored_prefix=True,
+    )
+    if replay_projection is None:
+        return False
+    prefix_state = _direct_tool_call_prefix_state(
+        replay_projection.input_items[: replay_projection.stored_prefix_count],
+        canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+    )
+    if prefix_state is None or prefix_state[0] or prefix_state[1] & pending_tool_calls.keys():
+        return False
+    suffix = replay_projection.input_items[replay_projection.stored_prefix_count :]
     if len(suffix) < 2:
         return False
     first = suffix[0]
     if not isinstance(first, dict) or first.get("type") != "agent_message" or not _is_retained_agent_message(first):
         return False
     return all(isinstance(item, dict) and _is_fresh_followup_input(item) for item in suffix[1:])
+
+
+def _is_response_owned_reasoning_boundary_item(item: Mapping[str, JsonValue]) -> bool:
+    """Recognize the exact Codex response bookkeeping allowed before a boundary."""
+
+    allowed_fields = {
+        "encrypted_content",
+        "id",
+        _INTERNAL_CHAT_MESSAGE_METADATA_FIELD,
+        "status",
+        "summary",
+        "type",
+    }
+    metadata = item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
+    summary = item.get("summary")
+    status = item.get("status")
+    return (
+        set(item) <= allowed_fields
+        and {"encrypted_content", "id", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD, "summary", "type"} <= set(item)
+        and item.get("type") == "reasoning"
+        and isinstance(item.get("id"), str)
+        and cast(str, item["id"]).startswith("rs_")
+        and _is_nonblank_string(item.get("encrypted_content"))
+        and isinstance(summary, list)
+        and all(
+            isinstance(part, dict)
+            and set(part) == {"text", "type"}
+            and part.get("type") == "summary_text"
+            and isinstance(part.get("text"), str)
+            for part in summary
+        )
+        and isinstance(metadata, dict)
+        and set(metadata) == _ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS
+        and _is_uuid(metadata.get("turn_id"))
+        and status in (None, "completed")
+    )
 
 
 def _direct_tool_call_prefix_state(
