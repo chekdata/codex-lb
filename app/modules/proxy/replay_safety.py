@@ -183,12 +183,16 @@ def project_responses_input_for_account_neutral_fresh_replay(
     preserve_developer_message_ids: bool = False,
     preserve_response_owned_agent_message_ids: bool = False,
     omit_response_owned_agent_messages_from_stored_prefix: bool = False,
+    project_response_owned_developer_messages_from_stored_prefix: bool = False,
 ) -> AccountNeutralReplayProjection | None:
     """Remove known response-owned bookkeeping after durable prefix proof.
 
     The two ``preserve_*_ids`` options are classification-only evidence for
     response-owned items. A projection created with either option must not be
-    serialized as an account-neutral replay payload.
+    serialized as an account-neutral replay payload. The stored-prefix
+    developer option is reserved for the separately fingerprint-bound
+    abandoned-pending recovery path; it strips response ownership without
+    changing developer content or admitting a new developer item.
     """
 
     if stored_count <= 0 or stored_count > len(input_items):
@@ -207,6 +211,16 @@ def project_responses_input_for_account_neutral_fresh_replay(
             and _is_retained_agent_message(item)
         ):
             projected_item = None
+        elif (
+            project_response_owned_developer_messages_from_stored_prefix
+            and index < stored_count
+            and isinstance(item, dict)
+            and _is_response_owned_developer_message(item)
+        ):
+            projected_item = dict(item)
+            projected_item.pop("id")
+            metadata = cast(dict[str, JsonValue], projected_item[_INTERNAL_CHAT_MESSAGE_METADATA_FIELD])
+            projected_item[_INTERNAL_CHAT_MESSAGE_METADATA_FIELD] = {"turn_id": metadata["turn_id"]}
         else:
             projected_item = _project_account_neutral_replay_item(
                 item,
@@ -270,6 +284,7 @@ def project_responses_input_for_abandoned_pending_fresh_replay(
         preserve_developer_message_ids=True,
         preserve_response_owned_agent_message_ids=True,
         omit_response_owned_agent_messages_from_stored_prefix=True,
+        project_response_owned_developer_messages_from_stored_prefix=True,
     )
     if projection is None:
         return None
@@ -323,6 +338,7 @@ def project_responses_input_for_abandoned_pending_fresh_replay(
     if (
         _direct_tool_call_prefix_state(
             retained_prefix,
+            allow_exact_stored_developer_items=True,
             canonical_lite_developer_index=projected_canonical_index,
         )
         is None
@@ -677,6 +693,7 @@ def responses_input_suffix_proves_abandoned_pending_agent_boundary(
         return False
     prefix_state = _direct_tool_call_prefix_state(
         replay_projection.input_items[: replay_projection.stored_prefix_count],
+        allow_exact_stored_developer_items=True,
         canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
     )
     if prefix_state is None or prefix_state[0] or prefix_state[1] & pending_tool_calls.keys():
@@ -956,6 +973,42 @@ def _is_response_owned_user_message(item: Mapping[str, JsonValue]) -> bool:
     return _input_content_part_is_self_contained(
         cast(dict[str, JsonValue], content[0]),
         allow_output=False,
+    )
+
+
+def _is_response_owned_developer_message(item: Mapping[str, JsonValue]) -> bool:
+    """Validate a persisted developer message inside an exact stored prefix."""
+
+    item_id = item.get("id")
+    metadata = item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
+    content = item.get("content")
+    return (
+        set(item) == _RESPONSE_OWNED_USER_MESSAGE_FIELDS
+        and item.get("type") == "message"
+        and item.get("role") == "developer"
+        and isinstance(item_id, str)
+        and item_id.startswith("msg_")
+        and _is_uuid(item_id.removeprefix("msg_"))
+        and isinstance(metadata, dict)
+        and (
+            (
+                set(metadata) == _ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS
+                and _is_uuid(metadata.get("turn_id"))
+            )
+            or (
+                set(metadata) == _RESPONSE_OWNED_AGENT_MESSAGE_METADATA_FIELDS
+                and _is_uuid(metadata.get("turn_id"))
+                and _is_finite_nonnegative_number(metadata.get("create_time"))
+            )
+        )
+        and isinstance(content, list)
+        and bool(content)
+        and all(
+            isinstance(part, dict)
+            and part.get("type") == "input_text"
+            and _input_content_part_is_self_contained(part, allow_output=False)
+            for part in content
+        )
     )
 
 

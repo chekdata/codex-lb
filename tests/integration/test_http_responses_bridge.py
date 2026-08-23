@@ -15812,16 +15812,6 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
         },
         "content": [{"type": "input_text", "text": "historical inter-agent result"}],
     }
-    clipped_leading_output = {
-        "type": "custom_tool_call_output",
-        "id": "ctco_01a02b31-bc02-70b0-a09e-0dedbc2e2dab",
-        "call_id": "call_clipped_before_retained_window",
-        "output": "historical clipped result",
-        "internal_chat_message_metadata_passthrough": {
-            "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2dab",
-            "create_time": 1787431090.0,
-        },
-    }
     historical_assistant_message = {
         "type": "message",
         "id": "msg_01a02b31-bc02-70b0-a09e-0dedbc2e2dac",
@@ -15833,13 +15823,44 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
             "create_time": 1787431110.0,
         },
     }
+    historical_developer_message = {
+        "type": "message",
+        "id": "msg_01a02a78-d2b5-71e3-a33e-fab25a40b322",
+        "role": "developer",
+        "content": [
+            {"type": "input_text", "text": "stored permissions"},
+            {"type": "input_text", "text": "stored app context"},
+            {"type": "input_text", "text": "stored collaboration mode"},
+            {"type": "input_text", "text": "stored skills"},
+        ],
+        "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a02a74-35a4-7bd3-bc2e-ba95279d6c04",
+        },
+    }
     historical_input = [
-        clipped_leading_output,
+        {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "shell",
+                    "description": "execute a bounded shell command",
+                    "format": {"type": "text"},
+                }
+            ],
+        },
+        {
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "canonical Responses Lite instructions"}],
+        },
         response_owned_user_message(
             message_id="01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
             text="first question",
             create_time=1787431100.0,
         ),
+        historical_developer_message,
         historical_agent_message,
         historical_assistant_message,
     ]
@@ -15934,12 +15955,22 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
     recovered_payload = json.loads(recovered_upstream.sent_text[0])
     assert "previous_response_id" not in recovered_payload
     assert recovered_payload["input"] == [
+        historical_input[0],
+        historical_input[1],
         {
             "type": "message",
             "role": "user",
             "content": [{"type": "input_text", "text": "first question"}],
             "internal_chat_message_metadata_passthrough": {
                 "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+            },
+        },
+        {
+            "type": "message",
+            "role": "developer",
+            "content": historical_developer_message["content"],
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "01a02a74-35a4-7bd3-bc2e-ba95279d6c04",
             },
         },
         {
@@ -15969,5 +16000,4 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
             },
         },
     ]
-    assert all(item.get("call_id") != "call_clipped_before_retained_window" for item in recovered_payload["input"])
     assert all(item.get("call_id") != "call_custom_shell" for item in recovered_payload["input"])
