@@ -2085,6 +2085,202 @@ def test_abandoned_pending_boundary_projects_response_owned_developer_in_exact_s
     }
 
 
+def test_abandoned_pending_boundary_accepts_exact_http_transport_normalized_bookkeeping() -> None:
+    """Codex strips internal metadata, but not response IDs, before HTTP."""
+
+    stored_developer = _canonical_response_owned_developer_message()
+    stored_developer.pop("internal_chat_message_metadata_passthrough")
+    stored_user = _canonical_response_owned_user_message(text="stored user")
+    stored_user.pop("internal_chat_message_metadata_passthrough")
+    stored_input: list[JsonValue] = [
+        {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "shell",
+                    "description": "execute a bounded shell command",
+                    "format": {"type": "text"},
+                }
+            ],
+        },
+        {
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "request-scoped instructions"}],
+        },
+        stored_user,
+        stored_developer,
+        {
+            "type": "custom_tool_call",
+            "id": "ctc_transport_settled",
+            "call_id": "call_transport_settled",
+            "name": "shell",
+            "input": "pwd",
+            "status": "completed",
+        },
+        {
+            "type": "custom_tool_call_output",
+            "id": "ctco_transport_settled",
+            "call_id": "call_transport_settled",
+            "output": "/workspace",
+        },
+    ]
+    reasoning = {
+        "type": "reasoning",
+        "id": "rs_08639659bba14680016a8a0902e9a887d090946ff27b898f05",
+        "content": None,
+        "encrypted_content": "opaque",
+        "summary": [],
+    }
+    agent_message = _canonical_agent_message()
+    agent_message.pop("internal_chat_message_metadata_passthrough")
+    first_user = _canonical_response_owned_user_message(text="first retry")
+    first_user.pop("internal_chat_message_metadata_passthrough")
+    developer_followup = _canonical_response_owned_developer_message()
+    developer_followup["id"] = "msg_01a02d3a-0319-76f1-9fd0-b28e9b9bc2d7"
+    developer_followup.pop("internal_chat_message_metadata_passthrough")
+    second_user = _canonical_response_owned_user_message(
+        message_id="msg_01a02d3a-0321-7631-8a0a-7b90517b4bb2",
+        turn_id="01a02d3a-0321-7631-8a0a-7b90517b4bb2",
+        text="second retry",
+    )
+    second_user.pop("internal_chat_message_metadata_passthrough")
+    input_items = [
+        *stored_input,
+        reasoning,
+        agent_message,
+        first_user,
+        developer_followup,
+        second_user,
+    ]
+    pending_tool_calls = {"call_undelivered": "custom_tool_call"}
+
+    assert responses_input_suffix_proves_abandoned_pending_agent_boundary(
+        input_items,
+        stored_count=len(stored_input),
+        pending_tool_calls=pending_tool_calls,
+    )
+    parsed_reasoning = dict(reasoning)
+    parsed_reasoning.pop("content")
+    parsed_input_items = [*stored_input, parsed_reasoning, *input_items[len(stored_input) + 1 :]]
+    assert responses_input_suffix_proves_abandoned_pending_agent_boundary(
+        parsed_input_items,
+        stored_count=len(stored_input),
+        pending_tool_calls=pending_tool_calls,
+    )
+    projection = project_responses_input_for_abandoned_pending_fresh_replay(
+        input_items,
+        stored_count=len(stored_input),
+        pending_tool_calls=pending_tool_calls,
+    )
+    assert projection is not None
+    assert all(
+        not isinstance(item, dict) or item.get("role") not in {"developer", "user"} or "id" not in item
+        for item in projection.input_items
+    )
+    assert all(not isinstance(item, dict) or item.get("type") != "reasoning" for item in projection.input_items)
+    assert projection.input_items[-2] == {
+        "type": "message",
+        "role": "developer",
+        "content": developer_followup["content"],
+    }
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda items: items[0].__setitem__("content", "not-null"), id="reasoning-content"),
+        pytest.param(lambda items: items[1].__setitem__("extra", True), id="agent-extra-field"),
+        pytest.param(lambda items: items[2].__setitem__("id", "msg_not-a-uuid"), id="user-invalid-id"),
+        pytest.param(lambda items: items[3].__setitem__("extra", True), id="developer-extra-field"),
+        pytest.param(
+            lambda items: items[3].__setitem__("internal_chat_message_metadata_passthrough", {}),
+            id="developer-empty-metadata",
+        ),
+    ],
+)
+def test_abandoned_pending_boundary_rejects_malformed_transport_normalized_bookkeeping(mutate) -> None:
+    reasoning: dict[str, JsonValue] = {
+        "type": "reasoning",
+        "id": "rs_08639659bba14680016a8a0902e9a887d090946ff27b898f05",
+        "content": None,
+        "encrypted_content": "opaque",
+        "summary": [],
+    }
+    agent_message = _canonical_agent_message()
+    agent_message.pop("internal_chat_message_metadata_passthrough")
+    user_message = _canonical_response_owned_user_message()
+    user_message.pop("internal_chat_message_metadata_passthrough")
+    developer_message = _canonical_response_owned_developer_message()
+    developer_message.pop("internal_chat_message_metadata_passthrough")
+    suffix = [reasoning, agent_message, user_message, developer_message]
+    mutate(suffix)
+
+    assert not responses_input_suffix_proves_abandoned_pending_agent_boundary(
+        [{"role": "user", "content": "stored"}, *suffix],
+        stored_count=1,
+        pending_tool_calls={"call_undelivered": "custom_tool_call"},
+    )
+
+
+def test_abandoned_pending_boundary_requires_a_user_after_transport_developer_followup() -> None:
+    reasoning: dict[str, JsonValue] = {
+        "type": "reasoning",
+        "id": "rs_08639659bba14680016a8a0902e9a887d090946ff27b898f05",
+        "content": None,
+        "encrypted_content": "opaque",
+        "summary": [],
+    }
+    agent_message = _canonical_agent_message()
+    agent_message.pop("internal_chat_message_metadata_passthrough")
+    developer_message = _canonical_response_owned_developer_message()
+    developer_message.pop("internal_chat_message_metadata_passthrough")
+
+    assert not responses_input_suffix_proves_abandoned_pending_agent_boundary(
+        [{"role": "user", "content": "stored"}, reasoning, agent_message, developer_message],
+        stored_count=1,
+        pending_tool_calls={"call_undelivered": "custom_tool_call"},
+    )
+
+
+def test_abandoned_pending_boundary_rejects_unbounded_transport_developer_followups() -> None:
+    reasoning: dict[str, JsonValue] = {
+        "type": "reasoning",
+        "id": "rs_08639659bba14680016a8a0902e9a887d090946ff27b898f05",
+        "content": None,
+        "encrypted_content": "opaque",
+        "summary": [],
+    }
+    agent_message = _canonical_agent_message()
+    agent_message.pop("internal_chat_message_metadata_passthrough")
+    first_user = _canonical_response_owned_user_message(text="first retry")
+    first_user.pop("internal_chat_message_metadata_passthrough")
+    second_user = _canonical_response_owned_user_message(
+        message_id="msg_01a02d3a-0321-7631-8a0a-7b90517b4bb2",
+        turn_id="01a02d3a-0321-7631-8a0a-7b90517b4bb2",
+        text="second retry",
+    )
+    second_user.pop("internal_chat_message_metadata_passthrough")
+    first_developer = _canonical_response_owned_developer_message()
+    first_developer.pop("internal_chat_message_metadata_passthrough")
+    second_developer = _canonical_response_owned_developer_message()
+    second_developer["id"] = "msg_01a02d3a-0319-76f1-9fd0-b28e9b9bc2d7"
+    second_developer.pop("internal_chat_message_metadata_passthrough")
+
+    for followups in (
+        [first_developer, first_user],
+        [first_user, first_developer],
+        [first_user, first_developer, second_developer, second_user],
+    ):
+        assert not responses_input_suffix_proves_abandoned_pending_agent_boundary(
+            [{"role": "user", "content": "stored"}, reasoning, agent_message, *followups],
+            stored_count=1,
+            pending_tool_calls={"call_undelivered": "custom_tool_call"},
+        )
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -2329,11 +2525,11 @@ def test_abandoned_pending_agent_boundary_rejects_incomplete_or_tool_bearing_suf
     [
         pytest.param(
             [
-                {"type": "reasoning", "id": "rs_missing_provenance", "encrypted_content": "opaque", "summary": []},
+                {"type": "reasoning", "id": "rs_missing_encrypted_content", "summary": []},
                 _canonical_agent_message(),
                 {"role": "user", "content": "retry"},
             ],
-            id="reasoning-missing-turn-provenance",
+            id="reasoning-missing-encrypted-content",
         ),
         pytest.param(
             [

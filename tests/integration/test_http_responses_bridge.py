@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import copy
 import json
 import time
 from collections import deque
@@ -20,6 +21,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
 import app.modules.proxy.load_balancer as load_balancer_module
+import app.modules.proxy.replay_safety as replay_safety_module
 import app.modules.proxy.service as proxy_module
 from app.core.clients.proxy_websocket import (
     UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE,
@@ -15837,6 +15839,12 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
             "turn_id": "01a02a74-35a4-7bd3-bc2e-ba95279d6c04",
         },
     }
+
+    def http_transport_normalize(item: dict[str, Any]) -> dict[str, Any]:
+        normalized = copy.deepcopy(item)
+        normalized.pop("internal_chat_message_metadata_passthrough", None)
+        return normalized
+
     historical_input = [
         {
             "type": "additional_tools",
@@ -15855,14 +15863,16 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
             "role": "developer",
             "content": [{"type": "input_text", "text": "canonical Responses Lite instructions"}],
         },
-        response_owned_user_message(
-            message_id="01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
-            text="first question",
-            create_time=1787431100.0,
+        http_transport_normalize(
+            response_owned_user_message(
+                message_id="01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+                text="first question",
+                create_time=1787431100.0,
+            )
         ),
-        historical_developer_message,
-        historical_agent_message,
-        historical_assistant_message,
+        http_transport_normalize(historical_developer_message),
+        http_transport_normalize(historical_agent_message),
+        http_transport_normalize(historical_assistant_message),
     ]
     first = await async_client.post(
         "/v1/responses",
@@ -15877,38 +15887,59 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
 
     service = get_proxy_service_for_app(app_instance)
 
-    agent_message = {
-        "type": "agent_message",
-        "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea0",
-        "author": "/root/episode_identity_final_audit",
-        "recipient": "/root",
-        "internal_chat_message_metadata_passthrough": {
-            "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
-            "create_time": 1787431172.912141,
-        },
-        "content": [{"type": "input_text", "text": "verified inter-agent result"}],
-    }
+    agent_message = http_transport_normalize(
+        {
+            "type": "agent_message",
+            "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea0",
+            "author": "/root/episode_identity_final_audit",
+            "recipient": "/root",
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+                "create_time": 1787431172.912141,
+            },
+            "content": [{"type": "input_text", "text": "verified inter-agent result"}],
+        }
+    )
+    developer_followup = http_transport_normalize(
+        {
+            "type": "message",
+            "id": "msg_01a02d3a-0319-76f1-9fd0-b28e9b9bc2d7",
+            "role": "developer",
+            "content": [
+                {"type": "input_text", "text": "updated permissions"},
+                {"type": "input_text", "text": "updated app context"},
+                {"type": "input_text", "text": "updated skills"},
+            ],
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "01a02d3a-0319-76f1-9fd0-b28e9b9bc2d7",
+                "create_time": 1787433450.0,
+            },
+        }
+    )
     full_resend = [
         *historical_input,
         {
             "type": "reasoning",
             "id": "rs_08639659bba14680016a8a0904462c87d08ae1115f2aef2ccc",
+            "content": None,
             "encrypted_content": "opaque",
             "summary": [],
-            "internal_chat_message_metadata_passthrough": {
-                "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
-            },
         },
         agent_message,
-        response_owned_user_message(
-            message_id="01a02c31-2f60-7dd2-9f22-d7ef316596b1",
-            text="first retry",
-            create_time=1787433300.0,
+        http_transport_normalize(
+            response_owned_user_message(
+                message_id="01a02c31-2f60-7dd2-9f22-d7ef316596b1",
+                text="first retry",
+                create_time=1787433300.0,
+            )
         ),
-        response_owned_user_message(
-            message_id="01a02c43-4980-7afb-97f5-2e2d30aa73de",
-            text="second retry",
-            create_time=1787433402.605,
+        developer_followup,
+        http_transport_normalize(
+            response_owned_user_message(
+                message_id="01a02c43-4980-7afb-97f5-2e2d30aa73de",
+                text="second retry",
+                create_time=1787433402.605,
+            )
         ),
     ]
     durable_lookup = await service._durable_bridge.lookup_request_targets(
@@ -15923,6 +15954,31 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
     assert durable_lookup.latest_pending_tool_calls == {"call_custom_shell": "custom_tool_call"}
     proof_payload = proxy_module.ResponsesRequest.model_validate(
         {"model": "gpt-5.1", "instructions": "Return exactly OK.", "input": full_resend}
+    )
+    assert isinstance(proof_payload.input, list)
+    proof_input = cast(list[proxy_module.JsonValue], proof_payload.input)
+    assert durable_lookup.latest_input_item_count == len(historical_input)
+    assert http_bridge_streaming_module._input_prefix_matches_stored_context(
+        proof_input,
+        stored_count=len(historical_input),
+        stored_fingerprint=durable_lookup.latest_input_full_fingerprint,
+    )
+    parsed_suffix = cast(list[dict[str, proxy_module.JsonValue]], proof_input[len(historical_input) :])
+    assert replay_safety_module._is_response_owned_reasoning_boundary_item(parsed_suffix[0])
+    assert replay_safety_module._is_retained_agent_message(parsed_suffix[1])
+    assert replay_safety_module._is_response_owned_user_message(parsed_suffix[2])
+    assert replay_safety_module._is_response_owned_developer_message(parsed_suffix[3])
+    assert replay_safety_module._is_response_owned_user_message(parsed_suffix[4])
+    proof_projection = replay_safety_module.project_responses_input_for_abandoned_pending_fresh_replay(
+        proof_input,
+        stored_count=len(historical_input),
+        pending_tool_calls=durable_lookup.latest_pending_tool_calls,
+    )
+    assert proof_projection is not None
+    assert http_bridge_streaming_module.responses_input_suffix_proves_abandoned_pending_agent_boundary(
+        proof_input,
+        stored_count=len(historical_input),
+        pending_tool_calls=durable_lookup.latest_pending_tool_calls,
     )
     assert (
         http_bridge_streaming_module._verify_durable_abandoned_pending_full_resend(
@@ -15961,43 +16017,33 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
             "type": "message",
             "role": "user",
             "content": [{"type": "input_text", "text": "first question"}],
-            "internal_chat_message_metadata_passthrough": {
-                "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
-            },
         },
         {
             "type": "message",
             "role": "developer",
             "content": historical_developer_message["content"],
-            "internal_chat_message_metadata_passthrough": {
-                "turn_id": "01a02a74-35a4-7bd3-bc2e-ba95279d6c04",
-            },
         },
         {
             "type": "message",
             "role": "assistant",
             "phase": "final_answer",
             "content": [{"type": "output_text", "text": "historical task completed"}],
-            "internal_chat_message_metadata_passthrough": {
-                "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2dac",
-            },
         },
         agent_message,
         {
             "type": "message",
             "role": "user",
             "content": [{"type": "input_text", "text": "first retry"}],
-            "internal_chat_message_metadata_passthrough": {
-                "turn_id": "01a02c31-2f60-7dd2-9f22-d7ef316596b1",
-            },
+        },
+        {
+            "type": "message",
+            "role": "developer",
+            "content": developer_followup["content"],
         },
         {
             "type": "message",
             "role": "user",
             "content": [{"type": "input_text", "text": "second retry"}],
-            "internal_chat_message_metadata_passthrough": {
-                "turn_id": "01a02c43-4980-7afb-97f5-2e2d30aa73de",
-            },
         },
     ]
     assert all(item.get("call_id") != "call_custom_shell" for item in recovered_payload["input"])
