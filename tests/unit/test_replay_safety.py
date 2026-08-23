@@ -9,6 +9,7 @@ from app.modules.proxy.continuity import (
     make_http_bridge_account_neutral_replay_key,
 )
 from app.modules.proxy.replay_safety import (
+    project_responses_input_for_abandoned_pending_fresh_replay,
     project_responses_input_for_account_neutral_fresh_replay,
     responses_input_suffix_matches_pending_tool_calls,
     responses_input_suffix_proves_abandoned_pending_agent_boundary,
@@ -2003,6 +2004,146 @@ def test_full_resend_real_codex_user_bookkeeping_is_stripped_after_boundary_proo
         metadata = item.get("internal_chat_message_metadata_passthrough")
         assert isinstance(metadata, dict)
         assert set(metadata) == {"turn_id"}
+
+
+def test_abandoned_pending_boundary_drops_only_exact_leading_orphan_output() -> None:
+    orphan_call_id = "call_clipped_before_retained_window"
+    stored_input: list[JsonValue] = [
+        {
+            "type": "custom_tool_call_output",
+            "call_id": orphan_call_id,
+            "output": "historical result",
+            "internal_chat_message_metadata_passthrough": {"turn_id": "turn-clipped"},
+        },
+        {
+            "type": "custom_tool_call",
+            "id": "ctc_response_owned_retained",
+            "call_id": "call_retained",
+            "name": "shell",
+            "input": "pwd",
+            "status": "completed",
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "turn-retained",
+                "create_time": 1787433300.0,
+            },
+        },
+        {
+            "type": "custom_tool_call_output",
+            "id": "ctco_response_owned_retained",
+            "call_id": "call_retained",
+            "output": "done",
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "turn-retained",
+                "create_time": 1787433301.0,
+            },
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "phase": "final_answer",
+            "content": [{"type": "output_text", "text": "historical task completed"}],
+            "internal_chat_message_metadata_passthrough": {"turn_id": "turn-retained"},
+        },
+    ]
+    input_items = [
+        *stored_input,
+        _canonical_agent_message(),
+        _canonical_response_owned_user_message(text="continue"),
+    ]
+    pending_tool_calls = {"call_undelivered": "custom_tool_call"}
+
+    assert responses_input_suffix_proves_abandoned_pending_agent_boundary(
+        input_items,
+        stored_count=len(stored_input),
+        pending_tool_calls=pending_tool_calls,
+    )
+    projection = project_responses_input_for_abandoned_pending_fresh_replay(
+        input_items,
+        stored_count=len(stored_input),
+        pending_tool_calls=pending_tool_calls,
+    )
+    assert projection is not None
+    assert projection.stored_prefix_count == len(stored_input) - 1
+    projected_call = projection.input_items[0]
+    projected_output = projection.input_items[1]
+    assert isinstance(projected_call, dict)
+    assert isinstance(projected_output, dict)
+    assert projected_call["call_id"] == "call_retained"
+    assert projected_call["internal_chat_message_metadata_passthrough"] == {"turn_id": "turn-retained"}
+    assert projected_output["internal_chat_message_metadata_passthrough"] == {"turn_id": "turn-retained"}
+    assert all(not isinstance(item, dict) or item.get("call_id") != orphan_call_id for item in projection.input_items)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda items: items[0].__setitem__("call_id", "call_undelivered"),
+            id="orphan-is-abandoned-pending-call",
+        ),
+        pytest.param(
+            lambda items: items.append(
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_clipped_before_retained_window",
+                    "name": "shell",
+                    "input": "pwd",
+                    "status": "completed",
+                }
+            ),
+            id="orphan-call-id-reused-later",
+        ),
+        pytest.param(
+            lambda items: items.__setitem__(
+                3,
+                {"type": "message", "role": "user", "content": "no retained assistant boundary"},
+            ),
+            id="no-retained-assistant-boundary",
+        ),
+        pytest.param(
+            lambda items: items.insert(
+                2,
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_nonleading_orphan",
+                    "output": "ambiguous",
+                },
+            ),
+            id="nonleading-orphan-remains-invalid",
+        ),
+    ],
+)
+def test_abandoned_pending_boundary_rejects_ambiguous_orphan_output(mutate) -> None:
+    stored_input: list[JsonValue] = [
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call_clipped_before_retained_window",
+            "output": "historical result",
+            "internal_chat_message_metadata_passthrough": {"turn_id": "turn-clipped"},
+        },
+        {
+            "type": "custom_tool_call",
+            "call_id": "call_retained",
+            "name": "shell",
+            "input": "pwd",
+            "status": "completed",
+        },
+        {"type": "custom_tool_call_output", "call_id": "call_retained", "output": "done"},
+        {
+            "type": "message",
+            "role": "assistant",
+            "phase": "final_answer",
+            "content": "historical task completed",
+        },
+    ]
+    mutate(stored_input)
+    input_items = [*stored_input, _canonical_agent_message(), {"role": "user", "content": "continue"}]
+
+    assert not responses_input_suffix_proves_abandoned_pending_agent_boundary(
+        input_items,
+        stored_count=len(stored_input),
+        pending_tool_calls={"call_undelivered": "custom_tool_call"},
+    )
 
 
 @pytest.mark.parametrize(

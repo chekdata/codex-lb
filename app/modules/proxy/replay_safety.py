@@ -239,6 +239,103 @@ def project_responses_input_for_account_neutral_fresh_replay(
     )
 
 
+def project_responses_input_for_abandoned_pending_fresh_replay(
+    input_items: list[JsonValue],
+    *,
+    stored_count: int,
+    pending_tool_calls: Mapping[str, str],
+) -> AccountNeutralReplayProjection | None:
+    """Project one exact stale-anchor recovery after an abandoned agent call.
+
+    Codex may compact a retained input window so that it begins with a tool
+    output whose matching response-owned call is outside the retained window.
+    Such an orphan is valid only while the old ``previous_response_id`` still
+    supplies that call; forwarding it on an unanchored recovery request is
+    invalid. For the narrowly sealed abandoned-pending recovery path, omit a
+    leading run of those clipped outputs only when all of the following are
+    physically proven by the caller's exact durable-prefix binding:
+
+    * every omitted item is a canonical, account-neutral tool output;
+    * none names the abandoned pending call or reuses an id later in context;
+    * a later retained assistant output closes over the clipped history; and
+    * the remaining stored prefix has a complete direct call/output manifest.
+
+    No call is synthesized or executed. Non-leading or otherwise ambiguous
+    orphan outputs remain fail closed.
+    """
+
+    projection = project_responses_input_for_account_neutral_fresh_replay(
+        input_items,
+        stored_count=stored_count,
+        preserve_developer_message_ids=True,
+        preserve_response_owned_agent_message_ids=True,
+        omit_response_owned_agent_messages_from_stored_prefix=True,
+    )
+    if projection is None:
+        return None
+
+    prefix = projection.input_items[: projection.stored_prefix_count]
+    leading_output_count = 0
+    leading_call_ids: set[str] = set()
+    for item in prefix:
+        if not isinstance(item, dict):
+            break
+        item_type_value = item.get("type")
+        item_type = item_type_value if isinstance(item_type_value, str) else None
+        call_type = _TOOL_CALL_TYPE_BY_OUTPUT_TYPE.get(item_type or "")
+        if call_type is None:
+            break
+        call_id = item.get("call_id")
+        if (
+            not isinstance(call_id, str)
+            or not call_id
+            or call_id in leading_call_ids
+            or call_id in pending_tool_calls
+            or item.get("status") not in (None, "completed", "failed")
+            or not _internal_chat_message_metadata_is_account_neutral(item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD))
+            or not _input_item_has_only_known_fields(item, item_type)
+            or not _caller_is_self_contained(item)
+            or not _tool_output_is_self_contained(item_type or "", item)
+        ):
+            return None
+        leading_call_ids.add(call_id)
+        leading_output_count += 1
+
+    if leading_output_count == 0:
+        return projection
+
+    retained_prefix = prefix[leading_output_count:]
+    if not retained_prefix or not any(
+        isinstance(item, dict) and _is_retained_response_message(item) for item in retained_prefix
+    ):
+        return None
+    if any(
+        isinstance(item, dict) and item.get("call_id") in leading_call_ids
+        for item in projection.input_items[leading_output_count:]
+    ):
+        return None
+
+    projected_canonical_index = (
+        None
+        if projection.canonical_lite_developer_index is None
+        else projection.canonical_lite_developer_index - leading_output_count
+    )
+    if (
+        _direct_tool_call_prefix_state(
+            retained_prefix,
+            canonical_lite_developer_index=projected_canonical_index,
+        )
+        is None
+    ):
+        return None
+
+    return AccountNeutralReplayProjection(
+        input_items=[*retained_prefix, *projection.input_items[projection.stored_prefix_count :]],
+        stored_prefix_count=len(retained_prefix),
+        canonical_lite_developer_index=projected_canonical_index,
+    )
+
+
 def _is_canonical_lite_tool_bundle(item: JsonValue) -> bool:
     return (
         isinstance(item, dict)
@@ -288,6 +385,19 @@ def _project_account_neutral_replay_item(
         return item
     projected_item = dict(item)
     projected_item.pop("id")
+    metadata = projected_item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
+    if (
+        isinstance(metadata, dict)
+        and set(metadata) == _RESPONSE_OWNED_AGENT_MESSAGE_METADATA_FIELDS
+        and _is_nonblank_string(metadata.get("turn_id"))
+        and _is_finite_nonnegative_number(metadata.get("create_time"))
+    ):
+        # Codex persists response-owned calls, outputs, and assistant messages
+        # with the same creation timestamp bookkeeping as user messages. The
+        # timestamp belongs to the old response and is not replay authority;
+        # retain only the request-scoped turn id after the response-owned id
+        # has been removed.
+        projected_item[_INTERNAL_CHAT_MESSAGE_METADATA_FIELD] = {"turn_id": metadata["turn_id"]}
     return projected_item
 
 
@@ -558,12 +668,10 @@ def responses_input_suffix_proves_abandoned_pending_agent_boundary(
     for item in input_items:
         if isinstance(item, dict) and item.get("call_id") in pending_tool_calls:
             return False
-    replay_projection = project_responses_input_for_account_neutral_fresh_replay(
+    replay_projection = project_responses_input_for_abandoned_pending_fresh_replay(
         input_items,
         stored_count=stored_count,
-        preserve_developer_message_ids=True,
-        preserve_response_owned_agent_message_ids=True,
-        omit_response_owned_agent_messages_from_stored_prefix=True,
+        pending_tool_calls=pending_tool_calls,
     )
     if replay_projection is None:
         return False

@@ -15812,13 +15812,36 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
         },
         "content": [{"type": "input_text", "text": "historical inter-agent result"}],
     }
+    clipped_leading_output = {
+        "type": "custom_tool_call_output",
+        "id": "ctco_01a02b31-bc02-70b0-a09e-0dedbc2e2dab",
+        "call_id": "call_clipped_before_retained_window",
+        "output": "historical clipped result",
+        "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2dab",
+            "create_time": 1787431090.0,
+        },
+    }
+    historical_assistant_message = {
+        "type": "message",
+        "id": "msg_01a02b31-bc02-70b0-a09e-0dedbc2e2dac",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [{"type": "output_text", "text": "historical task completed"}],
+        "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2dac",
+            "create_time": 1787431110.0,
+        },
+    }
     historical_input = [
+        clipped_leading_output,
         response_owned_user_message(
             message_id="01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
             text="first question",
             create_time=1787431100.0,
         ),
         historical_agent_message,
+        historical_assistant_message,
     ]
     first = await async_client.post(
         "/v1/responses",
@@ -15919,6 +15942,15 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
                 "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
             },
         },
+        {
+            "type": "message",
+            "role": "assistant",
+            "phase": "final_answer",
+            "content": [{"type": "output_text", "text": "historical task completed"}],
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2dac",
+            },
+        },
         agent_message,
         {
             "type": "message",
@@ -15937,4 +15969,5 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
             },
         },
     ]
+    assert all(item.get("call_id") != "call_clipped_before_retained_window" for item in recovered_payload["input"])
     assert all(item.get("call_id") != "call_custom_shell" for item in recovered_payload["input"])
