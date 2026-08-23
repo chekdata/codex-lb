@@ -15975,7 +15975,7 @@ async def test_v1_responses_http_bridge_recovers_abandoned_pending_call_after_an
         pending_tool_calls=durable_lookup.latest_pending_tool_calls,
     )
     assert proof_projection is not None
-    assert http_bridge_streaming_module.responses_input_suffix_proves_abandoned_pending_agent_boundary(
+    assert replay_safety_module.responses_input_suffix_proves_abandoned_pending_agent_boundary(
         proof_input,
         stored_count=len(historical_input),
         pending_tool_calls=durable_lookup.latest_pending_tool_calls,

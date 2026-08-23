@@ -7,7 +7,7 @@ import re
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import cast
+from typing import Literal, cast
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -51,6 +51,21 @@ _TRANSPORT_RESPONSE_OWNED_USER_MESSAGE_FIELDS = frozenset({"content", "id", "rol
 # letters, digits, and underscores.  This is replay authority, so accepting a
 # merely path-shaped client string would be too broad.
 _AGENT_PATH_PATTERN = re.compile(r"^/root(?:/[a-z0-9_]+)*$")
+AbandonedPendingBoundaryRejectionReason = Literal[
+    "stored_prefix_invalid",
+    "pending_call_manifest_missing",
+    "boundary_reasoning_shape_invalid",
+    "boundary_agent_message_shape_invalid",
+    "followup_missing",
+    "followup_shape_invalid",
+    "developer_message_shape_invalid",
+    "developer_message_sequence_invalid",
+    "pending_call_conflict",
+    "projection_failed",
+    "direct_call_prefix_state_invalid",
+    "projected_boundary_invalid",
+    "projected_followup_invalid",
+]
 _ACCOUNT_NEUTRAL_INPUT_ITEM_TYPES = frozenset(
     {
         "additional_tools",
@@ -676,8 +691,28 @@ def responses_input_suffix_proves_abandoned_pending_agent_boundary(
     response event; this predicate alone never authorizes proactive replay.
     """
 
-    if stored_count <= 0 or len(input_items) <= stored_count or not pending_tool_calls:
-        return False
+    return (
+        abandoned_pending_agent_boundary_rejection_reason(
+            input_items,
+            stored_count=stored_count,
+            pending_tool_calls=pending_tool_calls,
+        )
+        is None
+    )
+
+
+def abandoned_pending_agent_boundary_rejection_reason(
+    input_items: list[JsonValue],
+    *,
+    stored_count: int,
+    pending_tool_calls: Mapping[str, str],
+) -> AbandonedPendingBoundaryRejectionReason | None:
+    """Return the first content-free failure branch for boundary proof."""
+
+    if stored_count <= 0 or len(input_items) <= stored_count:
+        return "stored_prefix_invalid"
+    if not pending_tool_calls:
+        return "pending_call_manifest_missing"
     raw_suffix = input_items[stored_count:]
     boundary_index = 0
     while boundary_index < len(raw_suffix) and isinstance(raw_suffix[boundary_index], dict):
@@ -685,46 +720,51 @@ def responses_input_suffix_proves_abandoned_pending_agent_boundary(
         if item.get("type") != "reasoning":
             break
         if not _is_response_owned_reasoning_boundary_item(item):
-            return False
+            return "boundary_reasoning_shape_invalid"
         boundary_index += 1
     if boundary_index >= len(raw_suffix):
-        return False
+        return "boundary_agent_message_shape_invalid"
     boundary = raw_suffix[boundary_index]
     if not isinstance(boundary, dict) or not _is_retained_agent_message(boundary):
-        return False
+        return "boundary_agent_message_shape_invalid"
     followups = raw_suffix[boundary_index + 1 :]
-    if not _abandoned_pending_followup_sequence_is_bounded(
+    followup_rejection = _abandoned_pending_followup_sequence_rejection_reason(
         followups,
         allow_response_owned_messages=True,
-    ):
-        return False
+    )
+    if followup_rejection is not None:
+        return followup_rejection
     for item in input_items:
         if isinstance(item, dict) and item.get("call_id") in pending_tool_calls:
-            return False
+            return "pending_call_conflict"
     replay_projection = project_responses_input_for_abandoned_pending_fresh_replay(
         input_items,
         stored_count=stored_count,
         pending_tool_calls=pending_tool_calls,
     )
     if replay_projection is None:
-        return False
+        return "projection_failed"
     prefix_state = _direct_tool_call_prefix_state(
         replay_projection.input_items[: replay_projection.stored_prefix_count],
         allow_exact_stored_developer_items=True,
         canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
     )
-    if prefix_state is None or prefix_state[0] or prefix_state[1] & pending_tool_calls.keys():
-        return False
+    if prefix_state is None or prefix_state[0]:
+        return "direct_call_prefix_state_invalid"
+    if prefix_state[1] & pending_tool_calls.keys():
+        return "pending_call_conflict"
     suffix = replay_projection.input_items[replay_projection.stored_prefix_count :]
     if len(suffix) < 2:
-        return False
+        return "followup_missing"
     first = suffix[0]
     if not isinstance(first, dict) or first.get("type") != "agent_message" or not _is_retained_agent_message(first):
-        return False
-    return _abandoned_pending_followup_sequence_is_bounded(
+        return "projected_boundary_invalid"
+    if not _abandoned_pending_followup_sequence_is_bounded(
         suffix[1:],
         allow_response_owned_messages=False,
-    )
+    ):
+        return "projected_followup_invalid"
+    return None
 
 
 def _abandoned_pending_followup_sequence_is_bounded(
@@ -734,14 +774,30 @@ def _abandoned_pending_followup_sequence_is_bounded(
 ) -> bool:
     """Require one bounded developer refresh between proven user followups."""
 
+    return (
+        _abandoned_pending_followup_sequence_rejection_reason(
+            input_items,
+            allow_response_owned_messages=allow_response_owned_messages,
+        )
+        is None
+    )
+
+
+def _abandoned_pending_followup_sequence_rejection_reason(
+    input_items: list[JsonValue],
+    *,
+    allow_response_owned_messages: bool,
+) -> AbandonedPendingBoundaryRejectionReason | None:
+    """Classify one bounded follow-up sequence without exposing content."""
+
     if not input_items:
-        return False
+        return "followup_missing"
     user_seen = False
     developer_seen = False
     user_after_developer_seen = False
     for item in input_items:
         if not isinstance(item, dict):
-            return False
+            return "followup_shape_invalid"
         is_user = _is_fresh_followup_input(item) or (
             allow_response_owned_messages and _is_response_owned_user_message(item)
         )
@@ -759,11 +815,17 @@ def _abandoned_pending_followup_sequence_is_bounded(
             continue
         if is_developer:
             if developer_seen or not user_seen:
-                return False
+                return "developer_message_sequence_invalid"
             developer_seen = True
             continue
-        return False
-    return user_seen and (not developer_seen or user_after_developer_seen)
+        if item.get("role") == "developer":
+            return "developer_message_shape_invalid"
+        return "followup_shape_invalid"
+    if not user_seen:
+        return "followup_missing"
+    if developer_seen and not user_after_developer_seen:
+        return "developer_message_sequence_invalid"
+    return None
 
 
 def _is_response_owned_reasoning_boundary_item(item: Mapping[str, JsonValue]) -> bool:

@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
+from pathlib import Path
+from typing import Any, cast
+from uuid import UUID
+
 import pytest
 
 from app.core.openai.requests import ResponsesRequest
@@ -9,6 +15,7 @@ from app.modules.proxy.continuity import (
     make_http_bridge_account_neutral_replay_key,
 )
 from app.modules.proxy.replay_safety import (
+    abandoned_pending_agent_boundary_rejection_reason,
     project_responses_input_for_abandoned_pending_fresh_replay,
     project_responses_input_for_account_neutral_fresh_replay,
     responses_input_suffix_matches_pending_tool_calls,
@@ -1830,6 +1837,212 @@ def _canonical_response_owned_developer_message() -> dict[str, JsonValue]:
     }
 
 
+def _rehydrate_sanitized_abandoned_pending_fixture() -> tuple[list[JsonValue], int, dict[str, str]]:
+    fixture_path = (
+        Path(__file__).parents[1] / "fixtures" / "http_responses" / "abandoned_pending_real_transport_shape_v1.json"
+    )
+    fixture_bytes = fixture_path.read_bytes()
+    assert (
+        hashlib.sha256(fixture_bytes).hexdigest() == "272d9d38876e409ca0ddf5e1c1990bd603347dffb3a33a3e43be5d82d77a9932"
+    )
+    fixture = json.loads(fixture_bytes)
+    assert fixture["schema"] == "qk_http_responses_sanitized_shape_fixture_v1"
+    assert fixture["provenance"] == {
+        "contains_call_ids": False,
+        "contains_credentials": False,
+        "contains_message_text": False,
+        "contains_raw_ids": False,
+        "sanitized": True,
+        "source_kind": "production_request_structure",
+    }
+    request = fixture["request"]
+    assert request["top_keys"] == [
+        "client_metadata",
+        "include",
+        "input",
+        "model",
+        "parallel_tool_calls",
+        "prompt_cache_key",
+        "reasoning",
+        "store",
+        "stream",
+        "text",
+        "tool_choice",
+    ]
+    catalog = request["item_shape_catalog"]
+    sequence = request["item_shape_sequence"]
+    assert len(sequence) == request["item_count"] == 143
+
+    items: list[JsonValue] = []
+    preceding_call_id: str | None = None
+    for index, shape_id in enumerate(sequence):
+        shape = catalog[shape_id]
+        item_type = shape["type"]
+        role = shape["role"]
+        item: dict[str, Any]
+        if item_type == "additional_tools":
+            item = {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "fixture_tool",
+                        "description": "fixture-only tool declaration",
+                        "format": {"type": "text"},
+                    }
+                ],
+            }
+        elif item_type == "reasoning":
+            item = {
+                "type": "reasoning",
+                "id": f"rs_fixture_{index}",
+                "content": None,
+                "encrypted_content": f"fixture-ciphertext-{index}",
+                "summary": [],
+            }
+        elif item_type == "agent_message":
+            item = {
+                "type": "agent_message",
+                "id": f"amsg_{UUID(int=index + 1)}",
+                "author": "/root/fixture_worker",
+                "recipient": "/root",
+                "content": [{"type": "input_text", "text": f"fixture-item-{index}-part-0"}],
+            }
+        elif item_type == "message":
+            content_types = shape["content_types"]
+            assert isinstance(content_types, list)
+            item = {
+                "type": "message",
+                "role": role,
+                "content": [
+                    {"type": content_type, "text": f"fixture-item-{index}-part-{part_index}"}
+                    for part_index, content_type in enumerate(content_types)
+                ],
+            }
+            if "id" in shape["known_keys"]:
+                item["id"] = f"msg_{UUID(int=index + 1)}"
+            if shape["phase"] is not None:
+                item["phase"] = shape["phase"]
+        elif item_type in {"function_call", "custom_tool_call"}:
+            preceding_call_id = f"fixture-call-{index}"
+            item = {
+                "type": item_type,
+                "id": f"fixture-call-item-{index}",
+                "call_id": preceding_call_id,
+                "name": "fixture_tool",
+            }
+            if item_type == "function_call":
+                item["namespace"] = "fixture_namespace"
+                item["arguments"] = "{}"
+            else:
+                item["input"] = f"fixture-input-{index}"
+            if shape["status"] is not None:
+                item["status"] = shape["status"]
+        elif item_type in {"function_call_output", "custom_tool_call_output"}:
+            assert preceding_call_id is not None
+            item = {
+                "type": item_type,
+                "id": f"fixture-output-item-{index}",
+                "call_id": preceding_call_id,
+                "output": f"fixture-output-{index}",
+            }
+            preceding_call_id = None
+        else:  # pragma: no cover - fixture schema is closed above
+            raise AssertionError(f"unknown sanitized shape: {item_type}")
+        assert set(item) == set(shape["known_keys"])
+        items.append(cast(JsonValue, item))
+
+    assert preceding_call_id is None
+    pending_tool_calls = {"fixture-call-undelivered": fixture["pending_tool_calls"]["types"][0]}
+    return items, request["stored_count"], pending_tool_calls
+
+
+def test_real_sanitized_transport_shape_recovers_once_without_duplicate_or_context_loss() -> None:
+    input_items, stored_count, pending_tool_calls = _rehydrate_sanitized_abandoned_pending_fixture()
+
+    # This exact production shape was rejected by the legacy proof because
+    # the HTTP transport retained response-owned IDs but stripped their
+    # internal metadata, and because one developer refresh followed the user
+    # retry run. The fixture intentionally contains neither message bodies nor
+    # raw production identifiers.
+    response_owned_suffix = input_items[stored_count:]
+    assert all(
+        not isinstance(item, dict) or "internal_chat_message_metadata_passthrough" not in item
+        for item in response_owned_suffix
+    )
+    assert any(isinstance(item, dict) and item.get("role") == "developer" for item in response_owned_suffix)
+    legacy_metadata_required_items = [input_items[index] for index in (111, 112, 113, 140)]
+    legacy_boundary_proof_would_accept = all(
+        isinstance(item, dict) and isinstance(item.get("internal_chat_message_metadata_passthrough"), dict)
+        for item in legacy_metadata_required_items
+    )
+    assert legacy_boundary_proof_would_accept is False
+
+    parsed_payload = ResponsesRequest.model_validate({"model": "gpt-5.4", "instructions": "", "input": input_items})
+    assert isinstance(parsed_payload.input, list)
+    parsed_input = parsed_payload.input
+    assert len(parsed_input) == 143
+    assert isinstance(parsed_input[140], dict) and parsed_input[140].get("role") == "developer"
+    assert (
+        abandoned_pending_agent_boundary_rejection_reason(
+            parsed_input,
+            stored_count=stored_count,
+            pending_tool_calls=pending_tool_calls,
+        )
+        is None
+    )
+    projection = project_responses_input_for_abandoned_pending_fresh_replay(
+        parsed_input,
+        stored_count=stored_count,
+        pending_tool_calls=pending_tool_calls,
+    )
+    assert projection is not None
+
+    def marker_sequence(items: list[JsonValue], *, roles: set[str]) -> list[str]:
+        markers: list[str] = []
+        for item in items:
+            if not isinstance(item, dict) or item.get("type") not in (None, "message") or item.get("role") not in roles:
+                continue
+            content = item.get("content")
+            assert isinstance(content, list)
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                text = part.get("text")
+                if isinstance(text, str):
+                    markers.append(text)
+        return markers
+
+    expected_message_markers = marker_sequence(parsed_input, roles={"assistant", "developer", "user"})
+    projected_message_markers = marker_sequence(
+        projection.input_items,
+        roles={"assistant", "developer", "user"},
+    )
+    assert projected_message_markers == expected_message_markers
+
+    expected_call_ids = [
+        item["call_id"]
+        for item in parsed_input[:stored_count]
+        if isinstance(item, dict) and item.get("type") in {"function_call", "custom_tool_call"}
+    ]
+    projected_call_ids = [
+        item["call_id"]
+        for item in projection.input_items
+        if isinstance(item, dict) and item.get("type") in {"function_call", "custom_tool_call"}
+    ]
+    projected_output_ids = [
+        item["call_id"]
+        for item in projection.input_items
+        if isinstance(item, dict) and item.get("type") in {"function_call_output", "custom_tool_call_output"}
+    ]
+    assert projected_call_ids == expected_call_ids
+    assert projected_output_ids == expected_call_ids
+    assert len(projected_call_ids) == len(set(projected_call_ids))
+    assert pending_tool_calls.keys().isdisjoint(projected_call_ids)
+    assert all(not isinstance(item, dict) or item.get("type") != "reasoning" for item in projection.input_items)
+
+
 def test_full_resend_exact_prefix_accepts_canonical_agent_message_before_user_retries() -> None:
     stored_input: list[JsonValue] = [{"role": "user", "content": "first question"}]
     full_input: list[JsonValue] = [
@@ -2186,6 +2399,132 @@ def test_abandoned_pending_boundary_accepts_exact_http_transport_normalized_book
         "role": "developer",
         "content": developer_followup["content"],
     }
+
+
+def test_abandoned_pending_boundary_reports_first_content_free_rejection_branch() -> None:
+    stored: list[JsonValue] = [{"role": "user", "content": "stored"}]
+    boundary = _canonical_agent_message()
+    followup: dict[str, JsonValue] = {"role": "user", "content": "follow-up"}
+    pending = {"call_undelivered": "custom_tool_call"}
+
+    assert (
+        abandoned_pending_agent_boundary_rejection_reason(
+            [*stored, boundary, followup],
+            stored_count=len(stored),
+            pending_tool_calls=pending,
+        )
+        is None
+    )
+    assert (
+        abandoned_pending_agent_boundary_rejection_reason(
+            [*stored, boundary, followup],
+            stored_count=0,
+            pending_tool_calls=pending,
+        )
+        == "stored_prefix_invalid"
+    )
+    assert (
+        abandoned_pending_agent_boundary_rejection_reason(
+            [*stored, boundary, followup],
+            stored_count=len(stored),
+            pending_tool_calls={},
+        )
+        == "pending_call_manifest_missing"
+    )
+    malformed_reasoning: dict[str, JsonValue] = {
+        "type": "reasoning",
+        "id": "rs_fixture",
+        "encrypted_content": "opaque",
+        "summary": [],
+        "extra": True,
+    }
+    assert (
+        abandoned_pending_agent_boundary_rejection_reason(
+            [*stored, malformed_reasoning, boundary, followup],
+            stored_count=len(stored),
+            pending_tool_calls=pending,
+        )
+        == "boundary_reasoning_shape_invalid"
+    )
+    assert (
+        abandoned_pending_agent_boundary_rejection_reason(
+            [*stored, {"role": "assistant", "content": "lookalike"}, followup],
+            stored_count=len(stored),
+            pending_tool_calls=pending,
+        )
+        == "boundary_agent_message_shape_invalid"
+    )
+    assert (
+        abandoned_pending_agent_boundary_rejection_reason(
+            [*stored, boundary],
+            stored_count=len(stored),
+            pending_tool_calls=pending,
+        )
+        == "followup_missing"
+    )
+    assert (
+        abandoned_pending_agent_boundary_rejection_reason(
+            [*stored, boundary, 7],
+            stored_count=len(stored),
+            pending_tool_calls=pending,
+        )
+        == "followup_shape_invalid"
+    )
+    assert (
+        abandoned_pending_agent_boundary_rejection_reason(
+            [*stored, boundary, followup, {"type": "message", "role": "developer", "content": 7}, followup],
+            stored_count=len(stored),
+            pending_tool_calls=pending,
+        )
+        == "developer_message_shape_invalid"
+    )
+    assert (
+        abandoned_pending_agent_boundary_rejection_reason(
+            [*stored, boundary, followup, _canonical_response_owned_developer_message()],
+            stored_count=len(stored),
+            pending_tool_calls=pending,
+        )
+        == "developer_message_sequence_invalid"
+    )
+    assert (
+        abandoned_pending_agent_boundary_rejection_reason(
+            [{"role": "user", "content": "stored", "call_id": "call_undelivered"}, boundary, followup],
+            stored_count=1,
+            pending_tool_calls=pending,
+        )
+        == "pending_call_conflict"
+    )
+    assert (
+        abandoned_pending_agent_boundary_rejection_reason(
+            [
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_orphan",
+                    "output": "orphaned",
+                },
+                boundary,
+                followup,
+            ],
+            stored_count=1,
+            pending_tool_calls=pending,
+        )
+        == "projection_failed"
+    )
+    unmatched_call: dict[str, JsonValue] = {
+        "type": "custom_tool_call",
+        "call_id": "call_historical_unmatched",
+        "name": "shell",
+        "input": "pwd",
+        "status": "completed",
+    }
+    assert (
+        abandoned_pending_agent_boundary_rejection_reason(
+            [unmatched_call, boundary, followup],
+            stored_count=1,
+            pending_tool_calls=pending,
+        )
+        == "direct_call_prefix_state_invalid"
+    )
 
 
 @pytest.mark.parametrize(

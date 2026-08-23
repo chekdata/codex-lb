@@ -9963,6 +9963,14 @@ def test_verified_abandoned_pending_agent_boundary_is_stale_anchor_only_and_stat
 
     # This proof is intentionally excluded from ordinary fresh replay.
     assert http_bridge_streaming_module._verify_durable_full_resend(payload, durable_lookup) is None
+    proof_with_reason, rejection_reason = (
+        http_bridge_streaming_module._verify_durable_abandoned_pending_full_resend_with_reason(
+            payload,
+            durable_lookup,
+        )
+    )
+    assert proof_with_reason is not None
+    assert rejection_reason is None
     proof = http_bridge_streaming_module._verify_durable_abandoned_pending_full_resend(
         payload,
         durable_lookup,
@@ -9980,6 +9988,78 @@ def test_verified_abandoned_pending_agent_boundary_is_stale_anchor_only_and_stat
         )
         is None
     )
+
+
+def test_abandoned_pending_full_resend_diagnostic_reports_reason_without_content(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret_marker = "never-log-this-message-body"
+    stored_input_items: list[proxy_service.JsonValue] = [
+        {"role": "user", "content": secret_marker},
+    ]
+    payload = proxy_service.ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.4",
+            "input": [
+                *stored_input_items,
+                {
+                    "type": "agent_message",
+                    "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea0",
+                    "author": "/root/fixture_worker",
+                    "recipient": "/root",
+                    "content": [{"type": "input_text", "text": secret_marker}],
+                },
+                {
+                    "type": "message",
+                    "id": "msg_01a02b33-3b30-7742-bdb3-091f07cf2ea2",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": secret_marker}],
+                },
+            ],
+        }
+    )
+    durable_lookup = proxy_service.DurableBridgeLookup(
+        session_id="sess-diagnostic",
+        canonical_kind="session_header",
+        canonical_key="sid-diagnostic",
+        api_key_scope="__anonymous__",
+        account_id="acc-proof",
+        owner_instance_id=None,
+        owner_epoch=3,
+        lease_expires_at=None,
+        state=HttpBridgeSessionState.CLOSED,
+        latest_turn_state="http_turn_diagnostic",
+        latest_response_id="resp-diagnostic",
+        latest_input_item_count=1,
+        latest_input_full_fingerprint=proxy_service._fingerprint_input_items(stored_input_items),
+        latest_pending_tool_calls={"call-undelivered": "custom_tool_call"},
+        model="gpt-5.4",
+    )
+
+    proof, reason_code = http_bridge_streaming_module._verify_durable_abandoned_pending_full_resend_with_reason(
+        payload,
+        durable_lookup,
+    )
+    assert proof is None
+    assert reason_code == "followup_missing"
+
+    caplog.set_level(logging.INFO, logger="app.modules.proxy.service")
+    http_bridge_streaming_module._log_abandoned_pending_full_resend_rejection(
+        bridge_session_key=proxy_service._HTTPBridgeSessionKey(
+            "session_header",
+            "sid-diagnostic",
+            None,
+        ),
+        payload=payload,
+        durable_lookup=durable_lookup,
+        reason_code=reason_code,
+        stage="unit_test",
+    )
+
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    assert "reason_code=followup_missing" in rendered
+    assert "suffix_shape=agent_message" in rendered
+    assert secret_marker not in rendered
 
 
 def test_verified_store_context_full_resend_proof_is_sealed_and_live_session_bound() -> None:

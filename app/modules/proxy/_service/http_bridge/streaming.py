@@ -228,10 +228,10 @@ from app.modules.proxy.helpers import (
     _normalize_error_code,
 )
 from app.modules.proxy.replay_safety import (
+    abandoned_pending_agent_boundary_rejection_reason,
     project_responses_input_for_abandoned_pending_fresh_replay,
     project_responses_input_for_account_neutral_fresh_replay,
     responses_input_suffix_matches_pending_tool_calls,
-    responses_input_suffix_proves_abandoned_pending_agent_boundary,
     responses_input_suffix_retains_prior_output,
     responses_payload_is_account_neutral_fresh_replay,
 )
@@ -283,6 +283,52 @@ def _full_resend_suffix_shape_for_observability(
     if len(input_items) - stored_count > 8:
         labels.append("more")
     return ">".join(labels) or "empty"
+
+
+def _log_abandoned_pending_full_resend_rejection(
+    *,
+    bridge_session_key: _HTTPBridgeSessionKey,
+    payload: ResponsesRequest,
+    durable_lookup: DurableBridgeLookup | None,
+    reason_code: str | None,
+    stage: str,
+) -> None:
+    """Log one bounded proof branch without request content or raw ids."""
+
+    if (
+        reason_code is None
+        or durable_lookup is None
+        or not durable_lookup.latest_pending_tool_calls
+        or not isinstance(payload.input, list)
+        or not _http_bridge_payload_looks_like_full_resend(payload)
+    ):
+        return
+    stored_count = durable_lookup.latest_input_item_count
+    if stored_count is None or stored_count < 0 or stored_count > len(payload.input):
+        stored_items = "invalid"
+        suffix_items = "invalid"
+        suffix_shape = "unavailable"
+    else:
+        stored_items = str(stored_count)
+        suffix_items = str(len(payload.input) - stored_count)
+        suffix_shape = _full_resend_suffix_shape_for_observability(
+            payload.input,
+            stored_count=stored_count,
+        )
+    _log_http_bridge_event(
+        "abandoned_pending_full_resend_proof_rejected",
+        bridge_session_key,
+        account_id=None,
+        model=payload.model,
+        detail=(
+            f"reason_code={reason_code},stage={stage},"
+            f"stored_items={stored_items},suffix_items={suffix_items},"
+            f"suffix_shape={suffix_shape}"
+        ),
+        cache_key_family=bridge_session_key.affinity_kind,
+        model_class=_extract_model_class(payload.model) if payload.model else None,
+        owner_check_applied=True,
+    )
 
 
 def _http_bridge_continuity_bound_without_safe_replay(request_state: _WebSocketRequestState) -> bool:
@@ -491,43 +537,63 @@ def _verify_durable_abandoned_pending_full_resend(
     before producing any response event.
     """
 
+    proof, _reason_code = _verify_durable_abandoned_pending_full_resend_with_reason(
+        payload,
+        durable_lookup,
+    )
+    return proof
+
+
+def _verify_durable_abandoned_pending_full_resend_with_reason(
+    payload: ResponsesRequest,
+    durable_lookup: DurableBridgeLookup | None,
+) -> tuple[_VerifiedDurableFullResend | None, str | None]:
+    """Return a sealed proof or its first content-free rejection branch."""
+
     if durable_lookup is None:
-        return None
+        return None, "durable_lookup_missing"
     owner_account_id = durable_lookup.account_id
     latest_response_id = durable_lookup.latest_response_id
     stored_count = durable_lookup.latest_input_item_count
     stored_fingerprint = durable_lookup.latest_input_full_fingerprint
     pending_tool_calls = durable_lookup.latest_pending_tool_calls
-    if (
-        owner_account_id is None
-        or latest_response_id is None
-        or stored_count is None
-        or stored_fingerprint is None
-        or not pending_tool_calls
-        or not _http_bridge_payload_looks_like_full_resend(payload)
-        or not isinstance(payload.input, list)
-        or not _input_prefix_matches_stored_context(
-            payload.input,
-            stored_count=stored_count,
-            stored_fingerprint=stored_fingerprint,
-        )
+    if owner_account_id is None:
+        return None, "durable_owner_missing"
+    if latest_response_id is None:
+        return None, "durable_anchor_missing"
+    if stored_count is None or stored_count <= 0 or stored_fingerprint is None:
+        return None, "stored_prefix_invalid"
+    if not pending_tool_calls:
+        return None, "pending_call_manifest_missing"
+    if not isinstance(payload.input, list):
+        return None, "payload_input_not_list"
+    if not _http_bridge_payload_looks_like_full_resend(payload):
+        return None, "payload_not_full_resend"
+    if not _input_prefix_matches_stored_context(
+        payload.input,
+        stored_count=stored_count,
+        stored_fingerprint=stored_fingerprint,
     ):
-        return None
+        return None, "stored_prefix_mismatch"
     input_items = cast(list[JsonValue], payload.input)
-    if not responses_input_suffix_proves_abandoned_pending_agent_boundary(
+    boundary_rejection = abandoned_pending_agent_boundary_rejection_reason(
         input_items,
         stored_count=stored_count,
         pending_tool_calls=pending_tool_calls,
-    ):
-        return None
-    return _VerifiedDurableFullResend._seal(
-        durable_session_id=durable_lookup.session_id,
-        owner_account_id=owner_account_id,
-        latest_response_id=latest_response_id,
-        stored_input_item_count=stored_count,
-        stored_input_fingerprint=stored_fingerprint,
-        full_input_fingerprint=_fingerprint_input_items(input_items),
-        pending_tool_calls=_pending_tool_calls_identity(pending_tool_calls),
+    )
+    if boundary_rejection is not None:
+        return None, boundary_rejection
+    return (
+        _VerifiedDurableFullResend._seal(
+            durable_session_id=durable_lookup.session_id,
+            owner_account_id=owner_account_id,
+            latest_response_id=latest_response_id,
+            stored_input_item_count=stored_count,
+            stored_input_fingerprint=stored_fingerprint,
+            full_input_fingerprint=_fingerprint_input_items(input_items),
+            pending_tool_calls=_pending_tool_calls_identity(pending_tool_calls),
+        ),
+        None,
     )
 
 
@@ -1571,10 +1637,21 @@ class _HTTPBridgeStreamingMixin:
         durable_recovery_attempt_session_id: str | None = None
         durable_recovery_attempt_owner_epoch: int | None = None
         durable_full_resend_proof = _verify_durable_full_resend(payload, durable_lookup)
-        durable_abandoned_pending_full_resend_proof = _verify_durable_abandoned_pending_full_resend(
+        (
+            durable_abandoned_pending_full_resend_proof,
+            durable_abandoned_pending_full_resend_rejection_reason,
+        ) = _verify_durable_abandoned_pending_full_resend_with_reason(
             payload,
             durable_lookup,
         )
+        if durable_full_resend_proof is None:
+            _log_abandoned_pending_full_resend_rejection(
+                bridge_session_key=bridge_session_key,
+                payload=payload,
+                durable_lookup=durable_lookup,
+                reason_code=durable_abandoned_pending_full_resend_rejection_reason,
+                stage="initial_lookup",
+            )
         durable_full_resend_fresh_bridge_proof: _VerifiedDurableFullResend | None = None
         force_local_recovery_creation = False
         payload_looks_like_full_resend = _http_bridge_payload_looks_like_full_resend(payload)
@@ -2464,12 +2541,21 @@ class _HTTPBridgeStreamingMixin:
                         else:
                             if _http_bridge_durable_lookup_allows_turn_state_takeover(fresh_turn_state_lookup):
                                 durable_lookup = fresh_turn_state_lookup
-                                durable_abandoned_pending_full_resend_proof = (
-                                    _verify_durable_abandoned_pending_full_resend(
-                                        payload,
-                                        fresh_turn_state_lookup,
-                                    )
+                                (
+                                    durable_abandoned_pending_full_resend_proof,
+                                    durable_abandoned_pending_full_resend_rejection_reason,
+                                ) = _verify_durable_abandoned_pending_full_resend_with_reason(
+                                    payload,
+                                    fresh_turn_state_lookup,
                                 )
+                                if _verify_durable_full_resend(payload, fresh_turn_state_lookup) is None:
+                                    _log_abandoned_pending_full_resend_rejection(
+                                        bridge_session_key=bridge_session_key,
+                                        payload=payload,
+                                        durable_lookup=fresh_turn_state_lookup,
+                                        reason_code=durable_abandoned_pending_full_resend_rejection_reason,
+                                        stage="takeover_lookup",
+                                    )
                                 if fresh_turn_state_lookup is None:
                                     durable_full_resend_anchor_count = None
                                     durable_full_resend_anchor_fingerprint = None
