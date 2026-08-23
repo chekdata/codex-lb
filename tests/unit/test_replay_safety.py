@@ -2064,9 +2064,13 @@ def test_abandoned_pending_boundary_drops_only_exact_leading_orphan_output() -> 
     )
     assert projection is not None
     assert projection.stored_prefix_count == len(stored_input) - 1
-    assert projection.input_items[0]["call_id"] == "call_retained"
-    assert projection.input_items[0]["internal_chat_message_metadata_passthrough"] == {"turn_id": "turn-retained"}
-    assert projection.input_items[1]["internal_chat_message_metadata_passthrough"] == {"turn_id": "turn-retained"}
+    projected_call = projection.input_items[0]
+    projected_output = projection.input_items[1]
+    assert isinstance(projected_call, dict)
+    assert isinstance(projected_output, dict)
+    assert projected_call["call_id"] == "call_retained"
+    assert projected_call["internal_chat_message_metadata_passthrough"] == {"turn_id": "turn-retained"}
+    assert projected_output["internal_chat_message_metadata_passthrough"] == {"turn_id": "turn-retained"}
     assert all(not isinstance(item, dict) or item.get("call_id") != orphan_call_id for item in projection.input_items)
 
 
