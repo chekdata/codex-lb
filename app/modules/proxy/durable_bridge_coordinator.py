@@ -21,6 +21,7 @@ from app.modules.proxy.durable_bridge_repository import (
     DurableBridgeRetryCircuitSnapshot,
     DurableBridgeSessionSnapshot,
     durable_bridge_api_key_scope,
+    durable_bridge_hash,
 )
 
 _DURABLE_TURN_STATE_ALIAS = "turn_state"
@@ -46,6 +47,10 @@ class DurableBridgeLookup:
     model: str | None = None
     latest_pending_tool_calls: dict[str, str] | None = None
     owner_process_epoch: str | None = None
+    recovery_required_anchor_hash: str | None = None
+    recovery_required_account_id: str | None = None
+    recovery_required_attempt_fingerprint: str | None = None
+    recovery_required_at: datetime | None = None
 
     def lease_is_active(self, *, now: datetime) -> bool:
         if self.owner_instance_id is None:
@@ -57,6 +62,14 @@ class DurableBridgeLookup:
         # UTC. Normalize both sides — comparing them raw raises TypeError
         # on the anchored-lookup hot path.
         return to_utc_naive(self.lease_expires_at) > to_utc_naive(now)
+
+    def recovery_is_required_for_latest_anchor(self) -> bool:
+        return bool(
+            self.latest_response_id is not None
+            and self.account_id is not None
+            and self.recovery_required_anchor_hash == durable_bridge_hash(self.latest_response_id)
+            and self.recovery_required_account_id == self.account_id
+        )
 
 
 class DurableBridgeSessionCoordinator:
@@ -417,6 +430,44 @@ class DurableBridgeSessionCoordinator:
             return None
         return _to_lookup(snapshot)
 
+    async def mark_live_session_recovery_required(
+        self,
+        *,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        account_id: str,
+        rejected_response_id: str,
+    ) -> bool:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).mark_recovery_required(
+                session_id=session_id,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+                account_id=account_id,
+                rejected_response_id=rejected_response_id,
+            )
+
+    async def claim_live_session_recovery_attempt(
+        self,
+        *,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        account_id: str,
+        rejected_response_id: str,
+        attempt_fingerprint: str,
+    ) -> bool:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).claim_recovery_required_attempt(
+                session_id=session_id,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+                account_id=account_id,
+                rejected_response_id=rejected_response_id,
+                attempt_fingerprint=attempt_fingerprint,
+            )
+
     async def record_recovery_attempt(
         self,
         *,
@@ -637,4 +688,8 @@ def _to_lookup(snapshot: DurableBridgeSessionSnapshot) -> DurableBridgeLookup:
         latest_input_full_fingerprint=snapshot.latest_input_full_fingerprint,
         model=snapshot.model,
         latest_pending_tool_calls=snapshot.latest_pending_tool_calls,
+        recovery_required_anchor_hash=snapshot.recovery_required_anchor_hash,
+        recovery_required_account_id=snapshot.recovery_required_account_id,
+        recovery_required_attempt_fingerprint=snapshot.recovery_required_attempt_fingerprint,
+        recovery_required_at=snapshot.recovery_required_at,
     )

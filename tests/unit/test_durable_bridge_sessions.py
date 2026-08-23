@@ -141,6 +141,190 @@ async def test_durable_bridge_lookup_prefers_turn_state_then_previous_response_t
 
 
 @pytest.mark.asyncio
+async def test_recovery_required_marker_is_owner_anchor_bound_durable_and_terminal_cleared(
+    coordinator: DurableBridgeSessionCoordinator,
+    async_session_factory: Callable[[], AsyncSession],
+) -> None:
+    claimed = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-recovery-required",
+        api_key_id="key-recovery-required",
+        instance_id="instance-a",
+        owner_process_epoch="process-a",
+        lease_ttl_seconds=120.0,
+        account_id="acc-recovery-required",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        latest_turn_state="turn-recovery-required",
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+    registered = await coordinator.register_previous_response_id(
+        session_id=claimed.session_id,
+        api_key_id="key-recovery-required",
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        response_id="resp-rejected-anchor",
+        lease_ttl_seconds=120.0,
+        input_item_count=4,
+        input_full_fingerprint="a" * 64,
+        pending_tool_calls={"call-pending": "custom_tool_call"},
+    )
+    assert registered == DurableBridgeAliasRegistration.REGISTERED
+
+    concurrent_marks = await asyncio.gather(
+        *(
+            coordinator.mark_live_session_recovery_required(
+                session_id=claimed.session_id,
+                instance_id="instance-a",
+                owner_epoch=claimed.owner_epoch,
+                account_id="acc-recovery-required",
+                rejected_response_id="resp-rejected-anchor",
+            )
+            for _ in range(2)
+        )
+    )
+    assert concurrent_marks == [True, True]
+    assert (
+        await coordinator.mark_live_session_recovery_required(
+            session_id=claimed.session_id,
+            instance_id="instance-a",
+            owner_epoch=claimed.owner_epoch,
+            account_id="acc-other",
+            rejected_response_id="resp-rejected-anchor",
+        )
+        is False
+    )
+    assert (
+        await coordinator.mark_live_session_recovery_required(
+            session_id=claimed.session_id,
+            instance_id="instance-a",
+            owner_epoch=claimed.owner_epoch,
+            account_id="acc-recovery-required",
+            rejected_response_id="resp-other-anchor",
+        )
+        is False
+    )
+
+    wire_fingerprints = ("c" * 64, "d" * 64)
+    concurrent_attempt_claims = await asyncio.gather(
+        *(
+            coordinator.claim_live_session_recovery_attempt(
+                session_id=claimed.session_id,
+                instance_id="instance-a",
+                owner_epoch=claimed.owner_epoch,
+                account_id="acc-recovery-required",
+                rejected_response_id="resp-rejected-anchor",
+                attempt_fingerprint=fingerprint,
+            )
+            for fingerprint in wire_fingerprints
+        )
+    )
+    assert sorted(concurrent_attempt_claims) == [False, True]
+    claimed_fingerprint = wire_fingerprints[concurrent_attempt_claims.index(True)]
+    rejected_fingerprint = next(fingerprint for fingerprint in wire_fingerprints if fingerprint != claimed_fingerprint)
+    crashed_attempt = await coordinator.record_recovery_attempt(
+        session_id=claimed.session_id,
+        api_key_id="key-recovery-required",
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        request_fingerprint=claimed_fingerprint,
+        request_id="request-before-process-loss",
+        account_id="acc-recovery-required",
+        model="gpt-5.6-sol",
+        replay_safe=True,
+    )
+    assert crashed_attempt is not None
+    assert crashed_attempt.state.value == "unknown"
+
+    async with async_session_factory() as session:
+        await session.execute(
+            update(HttpBridgeSessionRecord)
+            .where(HttpBridgeSessionRecord.id == claimed.session_id)
+            .values(
+                lease_expires_at=utcnow() - timedelta(seconds=1),
+                owner_process_epoch="expired-process",
+            )
+        )
+        await session.commit()
+
+    after_lease_expiry = await DurableBridgeSessionCoordinator(async_session_factory).lookup_request_targets(
+        session_key_kind="session_header",
+        session_key_value="sid-recovery-required",
+        api_key_id="key-recovery-required",
+        turn_state=None,
+        session_header="sid-recovery-required",
+        previous_response_id="resp-rejected-anchor",
+    )
+    assert after_lease_expiry is not None
+    assert after_lease_expiry.recovery_is_required_for_latest_anchor() is True
+    assert after_lease_expiry.recovery_required_account_id == "acc-recovery-required"
+    assert after_lease_expiry.recovery_required_anchor_hash is not None
+    assert after_lease_expiry.recovery_required_anchor_hash != "resp-rejected-anchor"
+    assert len(after_lease_expiry.recovery_required_anchor_hash) == 64
+    assert after_lease_expiry.recovery_required_attempt_fingerprint == claimed_fingerprint
+    assert after_lease_expiry.recovery_required_at is not None
+    replacement_coordinator = DurableBridgeSessionCoordinator(async_session_factory)
+    assert (
+        await replacement_coordinator.claim_live_session_recovery_attempt(
+            session_id=claimed.session_id,
+            instance_id="instance-a",
+            owner_epoch=claimed.owner_epoch,
+            account_id="acc-recovery-required",
+            rejected_response_id="resp-rejected-anchor",
+            attempt_fingerprint=claimed_fingerprint,
+        )
+        is True
+    )
+    assert (
+        await replacement_coordinator.claim_live_session_recovery_attempt(
+            session_id=claimed.session_id,
+            instance_id="instance-a",
+            owner_epoch=claimed.owner_epoch,
+            account_id="acc-recovery-required",
+            rejected_response_id="resp-rejected-anchor",
+            attempt_fingerprint=rejected_fingerprint,
+        )
+        is False
+    )
+    retained_unknown = await replacement_coordinator.lookup_recovery_attempt(
+        session_id=claimed.session_id,
+        request_fingerprint=claimed_fingerprint,
+    )
+    assert retained_unknown is not None
+    assert retained_unknown.state.value == "unknown"
+    assert retained_unknown.request_id == "request-before-process-loss"
+
+    replacement_registered = await coordinator.register_previous_response_id(
+        session_id=claimed.session_id,
+        api_key_id="key-recovery-required",
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        response_id="resp-replacement-anchor",
+        lease_ttl_seconds=120.0,
+        input_item_count=6,
+        input_full_fingerprint="b" * 64,
+        pending_tool_calls={},
+    )
+    assert replacement_registered == DurableBridgeAliasRegistration.REGISTERED
+    replacement = await coordinator.lookup_request_targets(
+        session_key_kind="session_header",
+        session_key_value="sid-recovery-required",
+        api_key_id="key-recovery-required",
+        turn_state=None,
+        session_header="sid-recovery-required",
+        previous_response_id="resp-replacement-anchor",
+    )
+    assert replacement is not None
+    assert replacement.latest_response_id == "resp-replacement-anchor"
+    assert replacement.recovery_is_required_for_latest_anchor() is False
+    assert replacement.recovery_required_anchor_hash is None
+    assert replacement.recovery_required_account_id is None
+    assert replacement.recovery_required_attempt_fingerprint is None
+    assert replacement.recovery_required_at is None
+
+
+@pytest.mark.asyncio
 async def test_missing_durable_bridge_tables_checks_current_postgres_schemas() -> None:
     captured_sql: list[str] = []
 
