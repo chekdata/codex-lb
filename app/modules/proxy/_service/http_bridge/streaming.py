@@ -454,22 +454,26 @@ class _VerifiedDurableFullResend:
         pending_tool_calls = durable_lookup.latest_pending_tool_calls
         if replay_projection is None:
             return None
-        safe_fresh_context = responses_input_suffix_retains_prior_output(
-            replay_projection.input_items,
-            stored_count=replay_projection.stored_prefix_count,
-            canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
-            # The prefix fingerprint matched the exact context previously
-            # completed by this same-account session. Only the new inter-agent
-            # boundary additionally requires an explicitly empty manifest.
-            exact_stored_prefix_without_pending_manifest=not pending_tool_calls,
-            allow_response_owned_agent_message=pending_tool_calls == {},
-        ) or (
-            pending_tool_calls is not None
-            and responses_input_suffix_matches_pending_tool_calls(
+        safe_fresh_context = (
+            False
+            if pending_tool_calls is None
+            else responses_input_suffix_matches_pending_tool_calls(
                 replay_projection.input_items,
                 stored_count=replay_projection.stored_prefix_count,
                 pending_tool_calls=pending_tool_calls,
                 canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+            )
+            if pending_tool_calls
+            else responses_input_suffix_retains_prior_output(
+                replay_projection.input_items,
+                stored_count=replay_projection.stored_prefix_count,
+                canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+                # The prefix fingerprint matched the exact context previously
+                # completed by this same-account session. Only the new
+                # inter-agent boundary additionally requires an explicitly
+                # empty manifest.
+                exact_stored_prefix_without_pending_manifest=True,
+                allow_response_owned_agent_message=pending_tool_calls == {},
             )
         )
         if not safe_fresh_context:
@@ -723,19 +727,22 @@ class _VerifiedStoreContextFullResend:
         pending_tool_calls = session.last_pending_tool_calls
         if replay_projection is None:
             return None
-        safe_fresh_context = responses_input_suffix_retains_prior_output(
-            replay_projection.input_items,
-            stored_count=replay_projection.stored_prefix_count,
-            canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
-            exact_stored_prefix_without_pending_manifest=not pending_tool_calls,
-            allow_response_owned_agent_message=pending_tool_calls == {},
-        ) or (
-            pending_tool_calls is not None
-            and responses_input_suffix_matches_pending_tool_calls(
+        safe_fresh_context = (
+            False
+            if pending_tool_calls is None
+            else responses_input_suffix_matches_pending_tool_calls(
                 replay_projection.input_items,
                 stored_count=replay_projection.stored_prefix_count,
                 pending_tool_calls=pending_tool_calls,
                 canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+            )
+            if pending_tool_calls
+            else responses_input_suffix_retains_prior_output(
+                replay_projection.input_items,
+                stored_count=replay_projection.stored_prefix_count,
+                canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+                exact_stored_prefix_without_pending_manifest=True,
+                allow_response_owned_agent_message=pending_tool_calls == {},
             )
         )
         if not safe_fresh_context:
@@ -1705,19 +1712,23 @@ class _HTTPBridgeStreamingMixin:
             )
             safe_fresh_context = False
             if replay_projection is not None:
-                safe_fresh_context = responses_input_suffix_retains_prior_output(
-                    replay_projection.input_items,
-                    stored_count=replay_projection.stored_prefix_count,
-                    canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
-                    exact_stored_prefix_without_pending_manifest=not lookup.latest_pending_tool_calls,
-                    allow_response_owned_agent_message=lookup.latest_pending_tool_calls == {},
-                ) or (
-                    lookup.latest_pending_tool_calls is not None
-                    and responses_input_suffix_matches_pending_tool_calls(
+                pending_tool_calls = lookup.latest_pending_tool_calls
+                safe_fresh_context = (
+                    False
+                    if pending_tool_calls is None
+                    else responses_input_suffix_matches_pending_tool_calls(
                         replay_projection.input_items,
                         stored_count=replay_projection.stored_prefix_count,
-                        pending_tool_calls=lookup.latest_pending_tool_calls,
+                        pending_tool_calls=pending_tool_calls,
                         canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+                    )
+                    if pending_tool_calls
+                    else responses_input_suffix_retains_prior_output(
+                        replay_projection.input_items,
+                        stored_count=replay_projection.stored_prefix_count,
+                        canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+                        exact_stored_prefix_without_pending_manifest=True,
+                        allow_response_owned_agent_message=pending_tool_calls == {},
                     )
                 )
             if not safe_fresh_context:

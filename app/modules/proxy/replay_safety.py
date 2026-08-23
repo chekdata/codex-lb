@@ -632,7 +632,14 @@ def responses_input_suffix_matches_pending_tool_calls(
     pending_tool_calls: Mapping[str, str],
     canonical_lite_developer_index: int | None = None,
 ) -> bool:
-    """Prove the suffix exactly settles the durable prior-response call manifest."""
+    """Prove the suffix exactly settles the durable prior-response call manifest.
+
+    A completed call/output manifest is the physical client-side settlement
+    proof.  Codex can retain bounded later user/inter-agent inputs after that
+    settlement in the same complete-context resend.  Those later inputs do
+    not weaken the proof, but another tool loop does: the latter could belong
+    to a different response and must never stand in for the durable manifest.
+    """
 
     if stored_count <= 0 or len(input_items) <= stored_count or not pending_tool_calls:
         return False
@@ -644,33 +651,74 @@ def responses_input_suffix_matches_pending_tool_calls(
     if prefix_state is None or prefix_state[0] or prefix_state[1] & pending_tool_calls.keys():
         return False
     suffix = input_items[stored_count:]
-    if (
-        len(suffix) == 3
-        and isinstance(suffix[1], dict)
-        and _fresh_developer_message_is_transparent(suffix[1])
-        and _fresh_developer_interleave_is_bounded(suffix, index=1)
-    ):
-        suffix = [suffix[0], suffix[2]]
-    if not all(
-        isinstance(item, dict)
-        and isinstance(item.get("type"), str)
-        and item.get("type") in (_TOOL_CALL_TYPES | _TOOL_CALL_TYPE_BY_OUTPUT_TYPE.keys())
-        for item in suffix
-    ):
+    settlement_end = _exact_pending_tool_call_settlement_prefix_length(
+        suffix,
+        pending_tool_calls=pending_tool_calls,
+    )
+    if settlement_end is None:
         return False
-    if not responses_input_items_are_self_contained_fresh_replay(suffix):
+    followups = suffix[settlement_end:]
+    if not followups:
+        return True
+    if any(isinstance(item, dict) and item.get("role") == "developer" for item in suffix[:settlement_end]):
+        # The historical one-call developer interleave exception is sealed to
+        # that exact three-item window. It is not authority for accepting a
+        # later turn boundary or user follow-up.
         return False
-    suffix_calls: dict[str, str] = {}
-    suffix_outputs: dict[str, str] = {}
-    for item in cast(list[dict[str, JsonValue]], suffix):
-        item_type = cast(str, item["type"])
-        call_id = cast(str, item["call_id"])
-        if item_type in _TOOL_CALL_TYPES:
-            suffix_calls[call_id] = item_type
-        else:
-            suffix_outputs[call_id] = _TOOL_CALL_TYPE_BY_OUTPUT_TYPE[item_type]
+    first = followups[0]
+    if isinstance(first, dict) and first.get("type") == "agent_message":
+        if not _is_retained_agent_message(first):
+            return False
+        followups = followups[1:]
+    return _abandoned_pending_followup_sequence_is_bounded(
+        followups,
+        allow_response_owned_messages=False,
+    )
+
+
+def _exact_pending_tool_call_settlement_prefix_length(
+    input_items: list[JsonValue],
+    *,
+    pending_tool_calls: Mapping[str, str],
+) -> int | None:
+    """Return the shortest prefix that exactly settles one durable manifest."""
+
     expected = dict(pending_tool_calls)
-    return suffix_calls == expected and suffix_outputs == expected
+    for end in range(1, len(input_items) + 1):
+        candidate = input_items[:end]
+        normalized = candidate
+        if (
+            len(candidate) == 3
+            and isinstance(candidate[1], dict)
+            and _fresh_developer_message_is_transparent(candidate[1])
+            and _fresh_developer_interleave_is_bounded(candidate, index=1)
+        ):
+            normalized = [candidate[0], candidate[2]]
+        if not all(
+            isinstance(item, dict)
+            and isinstance(item.get("type"), str)
+            and item.get("type") in (_TOOL_CALL_TYPES | _TOOL_CALL_TYPE_BY_OUTPUT_TYPE.keys())
+            for item in normalized
+        ):
+            # A bounded call/developer/output window becomes recognizable
+            # only when its output arrives. Keep scanning possible prefixes;
+            # an unrelated non-settlement item will remain in every later
+            # candidate and therefore can never satisfy this predicate.
+            continue
+        if not responses_input_items_are_self_contained_fresh_replay(normalized):
+            continue
+        suffix_calls: dict[str, str] = {}
+        suffix_outputs: dict[str, str] = {}
+        for item in cast(list[dict[str, JsonValue]], normalized):
+            item_type = cast(str, item["type"])
+            call_id = cast(str, item["call_id"])
+            if item_type in _TOOL_CALL_TYPES:
+                suffix_calls[call_id] = item_type
+            else:
+                suffix_outputs[call_id] = _TOOL_CALL_TYPE_BY_OUTPUT_TYPE[item_type]
+        if suffix_calls == expected and suffix_outputs == expected:
+            return end
+    return None
 
 
 def responses_input_suffix_proves_abandoned_pending_agent_boundary(

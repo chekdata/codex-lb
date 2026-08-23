@@ -1213,7 +1213,10 @@ class DurableBridgeRepository:
                         HttpBridgeSessionRecord.last_seen_at < ownerless_cutoff,
                     )
                 )
-            startup_purge_filter = or_(*purge_predicates)
+            startup_purge_filter = and_(
+                or_(*purge_predicates),
+                HttpBridgeSessionRecord.recovery_required_anchor_hash.is_(None),
+            )
             result = await self._session.execute(
                 select(
                     HttpBridgeSessionRecord.id,
@@ -1343,6 +1346,7 @@ class DurableBridgeRepository:
                 .where(
                     HttpBridgeSessionRecord.state == HttpBridgeSessionState.CLOSED,
                     HttpBridgeSessionRecord.last_seen_at < cutoff,
+                    HttpBridgeSessionRecord.recovery_required_anchor_hash.is_(None),
                 )
                 .order_by(HttpBridgeSessionRecord.last_seen_at.asc())
                 .limit(batch_size)
@@ -1358,6 +1362,7 @@ class DurableBridgeRepository:
                                 HttpBridgeSessionRecord.id.in_(session_ids),
                                 HttpBridgeSessionRecord.state == HttpBridgeSessionState.CLOSED,
                                 HttpBridgeSessionRecord.last_seen_at < cutoff,
+                                HttpBridgeSessionRecord.recovery_required_anchor_hash.is_(None),
                             )
                         )
                     )
@@ -1367,6 +1372,7 @@ class DurableBridgeRepository:
                     .where(HttpBridgeSessionRecord.id.in_(session_ids))
                     .where(HttpBridgeSessionRecord.state == HttpBridgeSessionState.CLOSED)
                     .where(HttpBridgeSessionRecord.last_seen_at < cutoff)
+                    .where(HttpBridgeSessionRecord.recovery_required_anchor_hash.is_(None))
                     .returning(HttpBridgeSessionRecord.id)
                 )
                 await self._session.commit()
@@ -1385,6 +1391,7 @@ class DurableBridgeRepository:
                     HttpBridgeSessionRecord.lease_expires_at < now,
                 ),
                 HttpBridgeSessionRecord.last_seen_at < cutoff,
+                HttpBridgeSessionRecord.recovery_required_anchor_hash.is_(None),
             )
             result = await self._session.execute(
                 select(HttpBridgeSessionRecord.id)

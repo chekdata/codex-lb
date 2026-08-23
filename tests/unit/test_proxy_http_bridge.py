@@ -9311,7 +9311,7 @@ async def test_stream_via_http_bridge_does_not_inject_durable_previous_response_
                 {"role": "assistant", "content": "hello back"},
                 {"role": "user", "content": "follow up"},
             ],
-            None,
+            {},
             True,
             False,
             id="retained-assistant-output",
@@ -9338,7 +9338,7 @@ async def test_stream_via_http_bridge_does_not_inject_durable_previous_response_
                     "content": [{"type": "input_text", "text": "new control message"}],
                 },
             ],
-            None,
+            {},
             True,
             False,
             id="retained-assistant-output-with-fresh-developer-followup",
@@ -9703,6 +9703,7 @@ def test_verified_durable_full_resend_proof_is_sealed_immutable_and_request_boun
         latest_response_id="resp-proof",
         latest_input_item_count=len(stored_input_items),
         latest_input_full_fingerprint=proxy_service._fingerprint_input_items(stored_input_items),
+        latest_pending_tool_calls={},
         model="gpt-5.4",
     )
 
@@ -21282,6 +21283,7 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
         latest_response_id="resp_completed_anchor",
         latest_input_item_count=len(historical_input),
         latest_input_full_fingerprint=proxy_service._fingerprint_input_items(historical_input),
+        latest_pending_tool_calls={},
         model=stored_model,
     )
     owner_unavailable = ProxyResponseError(

@@ -466,11 +466,34 @@ class _FakeBridgeUpstreamWebSocket:
 
 
 class _InterruptedCustomToolUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
-    """First response completes with an unresolved ``custom_tool_call``."""
+    """First response completes with an unresolved direct tool call."""
 
-    def __init__(self, response_id_prefix: str = "resp_bridge", *, emit_added: bool = False) -> None:
+    def __init__(
+        self,
+        response_id_prefix: str = "resp_bridge",
+        *,
+        emit_added: bool = False,
+        tool_call_type: str = "custom_tool_call",
+    ) -> None:
         super().__init__(response_id_prefix)
         self._emit_added = emit_added
+        self._tool_call_type = tool_call_type
+
+    def _pending_call_item(self, *, status: str) -> dict[str, Any]:
+        item: dict[str, Any] = {
+            "id": "ctc_shell",
+            "type": self._tool_call_type,
+            "status": status,
+            "call_id": "call_custom_shell",
+            "name": "shell",
+        }
+        if self._tool_call_type == "custom_tool_call":
+            item["input"] = "" if status == "in_progress" else "pwd"
+        elif self._tool_call_type == "function_call":
+            item["arguments"] = "" if status == "in_progress" else "{}"
+        else:  # pragma: no cover - test helper is closed to direct call types
+            raise AssertionError(f"unsupported pending call type: {self._tool_call_type}")
+        return item
 
     async def send_text(self, text: str) -> None:
         self.sent_text.append(text)
@@ -496,14 +519,7 @@ class _InterruptedCustomToolUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
                             {
                                 "type": "response.output_item.added",
                                 "response_id": response_id,
-                                "item": {
-                                    "id": "ctc_shell",
-                                    "type": "custom_tool_call",
-                                    "status": "in_progress",
-                                    "call_id": "call_custom_shell",
-                                    "name": "shell",
-                                    "input": "",
-                                },
+                                "item": self._pending_call_item(status="in_progress"),
                                 "output_index": 0,
                             },
                             separators=(",", ":"),
@@ -517,14 +533,7 @@ class _InterruptedCustomToolUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
                         {
                             "type": "response.output_item.done",
                             "response_id": response_id,
-                            "item": {
-                                "id": "ctc_shell",
-                                "type": "custom_tool_call",
-                                "status": "completed",
-                                "call_id": "call_custom_shell",
-                                "name": "shell",
-                                "input": "pwd",
-                            },
+                            "item": self._pending_call_item(status="completed"),
                             "output_index": 0,
                         },
                         separators=(",", ":"),
@@ -564,8 +573,8 @@ class _InterruptedCustomToolUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
 
 
 class _ClosingInterruptedCustomToolUpstreamWebSocket(_InterruptedCustomToolUpstreamWebSocket):
-    def __init__(self, response_id_prefix: str = "resp_bridge") -> None:
-        super().__init__(response_id_prefix, emit_added=True)
+    def __init__(self, response_id_prefix: str = "resp_bridge", *, tool_call_type: str = "custom_tool_call") -> None:
+        super().__init__(response_id_prefix, emit_added=True, tool_call_type=tool_call_type)
 
     async def send_text(self, text: str) -> None:
         await super().send_text(text)
@@ -15990,22 +15999,37 @@ async def test_v1_responses_http_bridge_quarantined_unproved_full_resend_remains
     assert fresh_upstream.sent_text == []
 
 
+@pytest.mark.parametrize(
+    ("case_id", "stored_count", "pending_type", "followup_kind"),
+    [
+        ("stored-85-custom-user", 85, "custom_tool_call", "user"),
+        ("stored-288-function-agent-user", 288, "function_call", "agent-user"),
+        ("stored-194-custom-terminal", 194, "custom_tool_call", "none"),
+    ],
+)
 @pytest.mark.asyncio
 async def test_v1_responses_http_bridge_persists_pending_resolution_and_blocks_scheduled_delta_before_connect(
     async_client,
     app_instance,
     monkeypatch,
+    case_id,
+    stored_count,
+    pending_type,
+    followup_kind,
 ):
     """A known stale pending-call anchor is not rediscovered every wake-up."""
 
     _install_bridge_settings(monkeypatch, enabled=True)
     account_id = await _import_account(
         async_client,
-        "acc_http_bridge_durable_recovery_required",
-        "http-bridge-durable-recovery-required@example.com",
+        f"acc_http_bridge_durable_recovery_required_{case_id}",
+        f"http-bridge-durable-recovery-required-{case_id}@example.com",
     )
     account = await _get_account(account_id)
-    source_upstream = _ClosingInterruptedCustomToolUpstreamWebSocket("resp_recovery_required_source")
+    source_upstream = _ClosingInterruptedCustomToolUpstreamWebSocket(
+        "resp_recovery_required_source",
+        tool_call_type=pending_type,
+    )
     stale_upstream = _RejectStalePreviousResponseUpstreamWebSocket("resp_bridge_custom_1")
     replacement_upstream = _FakeBridgeUpstreamWebSocket("resp_recovery_required_replacement")
     upstreams = [source_upstream, stale_upstream, replacement_upstream]
@@ -16038,20 +16062,16 @@ async def test_v1_responses_http_bridge_persists_pending_resolution_and_blocks_s
     monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
 
     headers = {
-        "x-codex-session-id": "durable-recovery-required",
-        "x-codex-turn-state": "durable-recovery-required-turn",
+        "x-codex-session-id": f"durable-recovery-required-{case_id}",
+        "x-codex-turn-state": f"durable-recovery-required-turn-{case_id}",
     }
     stored_input = [
         {
             "type": "message",
-            "role": "developer",
-            "content": [{"type": "input_text", "text": "stored policy"}],
-        },
-        {
-            "type": "message",
             "role": "user",
-            "content": [{"type": "input_text", "text": "initial task"}],
-        },
+            "content": [{"type": "input_text", "text": f"sanitized stored item {index}"}],
+        }
+        for index in range(stored_count)
     ]
     first = await async_client.post(
         "/v1/responses",
@@ -16088,7 +16108,7 @@ async def test_v1_responses_http_bridge_persists_pending_resolution_and_blocks_s
         previous_response_id="resp_bridge_custom_1",
     )
     assert durable_marker is not None
-    assert durable_marker.latest_pending_tool_calls == {"call_custom_shell": "custom_tool_call"}
+    assert durable_marker.latest_pending_tool_calls == {"call_custom_shell": pending_type}
     assert durable_marker.recovery_is_required_for_latest_anchor() is True
 
     # Simulate process-local quarantine loss.  The durable marker remains the
@@ -16123,22 +16143,56 @@ async def test_v1_responses_http_bridge_persists_pending_resolution_and_blocks_s
     assert connect_count == 2
     assert replacement_upstream.sent_text == []
 
+    call_item = {
+        "type": pending_type,
+        "call_id": "call_custom_shell",
+        "name": "shell",
+        ("input" if pending_type == "custom_tool_call" else "arguments"): (
+            "pwd" if pending_type == "custom_tool_call" else "{}"
+        ),
+    }
+    output_item = {
+        "type": f"{pending_type}_output",
+        "call_id": "call_custom_shell",
+        "output": "interrupted before client execution",
+    }
+    reasoning_item = {
+        "type": "reasoning",
+        "id": "rs_08639659bba14680016a8a0902e9a887d090946ff27b898f05",
+        "content": None,
+        "encrypted_content": "opaque",
+        "summary": [],
+    }
+    bounded_followups = []
+    if followup_kind == "agent-user":
+        bounded_followups.append(
+            {
+                "type": "agent_message",
+                "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea0",
+                "author": "/root/fixture_worker",
+                "recipient": "/root",
+                "content": [{"type": "input_text", "text": "sanitized agent output"}],
+            }
+        )
+    if followup_kind in {"user", "agent-user"}:
+        bounded_followups.append(
+            {
+                "type": "message",
+                "id": "msg_01a02c43-4980-7afb-97f5-2e2d30aa73de",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "sanitized followup"}],
+            }
+        )
     verified_full_resend = [
         *stored_input,
-        {
-            "type": "custom_tool_call",
-            "call_id": "call_custom_shell",
-            "name": "shell",
-            "input": "pwd",
-        },
-        {
-            "type": "custom_tool_call_output",
-            "call_id": "call_custom_shell",
-            "output": "interrupted before client execution",
-        },
+        reasoning_item,
+        call_item,
+        output_item,
+        *bounded_followups,
     ]
     peer_verified_full_resend = copy.deepcopy(verified_full_resend)
-    peer_verified_full_resend[-1]["output"] = "different but valid pending-call resolution"
+    peer_output = next(item for item in peer_verified_full_resend if item.get("type") == f"{pending_type}_output")
+    peer_output["output"] = "different but valid pending-call resolution"
     for candidate in (verified_full_resend, peer_verified_full_resend):
         candidate_payload = proxy_module.ResponsesRequest.model_validate(
             {
@@ -16213,6 +16267,21 @@ async def test_v1_responses_http_bridge_persists_pending_resolution_and_blocks_s
     ]
     assert replacement_payload["instructions"] == normalized_verified_payloads[0].instructions
     assert replacement_payload["input"] in [candidate.input for candidate in normalized_verified_payloads]
+    winning_normalized_payload = next(
+        candidate for candidate in normalized_verified_payloads if candidate.input == replacement_payload["input"]
+    )
+    assert isinstance(winning_normalized_payload.input, list)
+    expected_complete_input_fingerprint = proxy_module._fingerprint_input_items(
+        cast(list[proxy_module.JsonValue], winning_normalized_payload.input)
+    )
+    replacement_call_ids = [
+        item.get("call_id") for item in replacement_payload["input"] if item.get("type") == pending_type
+    ]
+    replacement_output_ids = [
+        item.get("call_id") for item in replacement_payload["input"] if item.get("type") == f"{pending_type}_output"
+    ]
+    assert replacement_call_ids == ["call_custom_shell"]
+    assert replacement_output_ids == ["call_custom_shell"]
 
     durable_replacement = await service._durable_bridge.lookup_request_targets(
         session_key_kind="turn_state_header",
@@ -16223,7 +16292,10 @@ async def test_v1_responses_http_bridge_persists_pending_resolution_and_blocks_s
         previous_response_id=recovered.json()["id"],
     )
     assert durable_replacement is not None
+    assert durable_replacement.account_id == account.id
     assert durable_replacement.latest_response_id == recovered.json()["id"]
+    assert durable_replacement.latest_input_item_count == len(verified_full_resend)
+    assert durable_replacement.latest_input_full_fingerprint == expected_complete_input_fingerprint
     assert durable_replacement.recovery_is_required_for_latest_anchor() is False
     assert durable_replacement.recovery_required_attempt_fingerprint is None
 
@@ -16240,6 +16312,7 @@ async def test_v1_responses_http_bridge_persists_pending_resolution_and_blocks_s
     assert len(attempts) == 1
     assert attempts[0].state == HttpBridgeRecoveryAttemptState.REPLAYED
     assert attempts[0].response_id == recovered.json()["id"]
+    assert len(source_upstream.sent_text) == 1
 
     followup = await async_client.post(
         "/v1/responses",

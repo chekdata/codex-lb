@@ -1837,6 +1837,241 @@ def _canonical_response_owned_developer_message() -> dict[str, JsonValue]:
     }
 
 
+def _rehydrate_sanitized_pending_settlement_shapes() -> list[tuple[list[JsonValue], int, dict[str, str]]]:
+    fixture_path = (
+        Path(__file__).parents[1] / "fixtures" / "http_responses" / "pending_settlement_real_transport_shapes_v1.json"
+    )
+    fixture_bytes = fixture_path.read_bytes()
+    assert (
+        hashlib.sha256(fixture_bytes).hexdigest() == "c9a5eedac589f973c30ed100cb429d60d8e2b9db439dd75f747b4081c09f2630"
+    )
+    fixture = json.loads(fixture_bytes)
+    assert fixture["schema"] == "qk_http_responses_pending_settlement_shape_fixture_v1"
+    assert fixture["provenance"] == {
+        "contains_call_ids": False,
+        "contains_credentials": False,
+        "contains_message_text": False,
+        "contains_raw_ids": False,
+        "sanitized": True,
+        "source_kind": "production_request_structure",
+    }
+    hydrated: list[tuple[list[JsonValue], int, dict[str, str]]] = []
+    for case_index, case in enumerate(fixture["cases"]):
+        stored_count = case["stored_count"]
+        input_items: list[JsonValue] = [
+            {"role": "user", "content": f"sanitized-stored-{index}"} for index in range(stored_count)
+        ]
+        call_id = f"fixture-pending-{case_index}"
+        for shape in case["suffix_shape"]:
+            if shape == "reasoning":
+                input_items.append(
+                    {
+                        "type": "reasoning",
+                        "id": f"rs_fixture_{case_index}",
+                        "content": None,
+                        "encrypted_content": "fixture-ciphertext",
+                        "summary": [],
+                    }
+                )
+            elif shape == "custom_tool_call":
+                input_items.append(
+                    {
+                        "type": "custom_tool_call",
+                        "id": f"ctc_fixture_{case_index}",
+                        "call_id": call_id,
+                        "name": "fixture_tool",
+                        "input": "fixture-input",
+                        "status": "completed",
+                    }
+                )
+            elif shape == "custom_tool_call_output":
+                input_items.append(
+                    {
+                        "type": "custom_tool_call_output",
+                        "id": f"ctco_fixture_{case_index}",
+                        "call_id": call_id,
+                        "output": "fixture-output",
+                    }
+                )
+            elif shape == "function_call":
+                input_items.append(
+                    {
+                        "type": "function_call",
+                        "id": f"fc_fixture_{case_index}",
+                        "call_id": call_id,
+                        "name": "fixture_tool",
+                        "arguments": "{}",
+                    }
+                )
+            elif shape == "function_call_output":
+                input_items.append(
+                    {
+                        "type": "function_call_output",
+                        "id": f"fco_fixture_{case_index}",
+                        "call_id": call_id,
+                        "output": "fixture-output",
+                    }
+                )
+            elif shape == "agent_message":
+                input_items.append(_canonical_agent_message())
+            elif shape == "user_message":
+                input_items.append(
+                    _canonical_response_owned_user_message(
+                        message_id=f"msg_{UUID(int=case_index + 100)}",
+                        turn_id=f"{UUID(int=case_index + 100)}",
+                        text="sanitized-followup",
+                    )
+                )
+            else:  # pragma: no cover - fixture schema is closed above
+                raise AssertionError(f"unknown pending-settlement fixture shape: {shape}")
+        hydrated.append((input_items, stored_count, {call_id: case["pending_type"]}))
+    return hydrated
+
+
+def test_real_sanitized_pending_settlement_shapes_accept_exact_manifest_then_bounded_followups() -> None:
+    cases = _rehydrate_sanitized_pending_settlement_shapes()
+
+    assert len(cases) == 3
+    for input_items, stored_count, pending_tool_calls in cases:
+        projection = project_responses_input_for_account_neutral_fresh_replay(
+            input_items,
+            stored_count=stored_count,
+            preserve_developer_message_ids=True,
+            preserve_response_owned_agent_message_ids=True,
+        )
+        assert projection is not None
+        assert responses_input_suffix_matches_pending_tool_calls(
+            projection.input_items,
+            stored_count=projection.stored_prefix_count,
+            pending_tool_calls=pending_tool_calls,
+        )
+
+
+def test_pending_settlement_followup_never_treats_unrelated_call_as_the_pending_call() -> None:
+    input_items, stored_count, pending_tool_calls = _rehydrate_sanitized_pending_settlement_shapes()[0]
+    pending_call_id = next(iter(pending_tool_calls))
+    output_index = next(
+        index
+        for index, item in enumerate(input_items)
+        if isinstance(item, dict)
+        and item.get("call_id") == pending_call_id
+        and str(item.get("type", "")).endswith("_output")
+    )
+    input_items[output_index] = {
+        "type": "custom_tool_call_output",
+        "call_id": "fixture-unrelated-call",
+        "output": "fixture-output",
+    }
+    projection = project_responses_input_for_account_neutral_fresh_replay(
+        input_items,
+        stored_count=stored_count,
+        preserve_developer_message_ids=True,
+        preserve_response_owned_agent_message_ids=True,
+    )
+
+    assert projection is not None
+    assert not responses_input_suffix_matches_pending_tool_calls(
+        projection.input_items,
+        stored_count=projection.stored_prefix_count,
+        pending_tool_calls=pending_tool_calls,
+    )
+
+
+def test_pending_settlement_followup_rejects_a_second_tool_loop_after_exact_settlement() -> None:
+    input_items, stored_count, pending_tool_calls = _rehydrate_sanitized_pending_settlement_shapes()[0]
+    input_items.extend(
+        [
+            {
+                "type": "custom_tool_call",
+                "call_id": "fixture-unrelated-call",
+                "name": "fixture_tool",
+                "input": "fixture-input",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "fixture-unrelated-call",
+                "output": "fixture-output",
+            },
+        ]
+    )
+    projection = project_responses_input_for_account_neutral_fresh_replay(
+        input_items,
+        stored_count=stored_count,
+        preserve_developer_message_ids=True,
+        preserve_response_owned_agent_message_ids=True,
+    )
+
+    assert projection is not None
+    assert not responses_input_suffix_matches_pending_tool_calls(
+        projection.input_items,
+        stored_count=projection.stored_prefix_count,
+        pending_tool_calls=pending_tool_calls,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing-output",
+        "duplicate-output",
+        "output-before-call",
+        "pending-type-drift",
+        "call-status-drift",
+        "malformed-agent-message",
+        "developer-before-user",
+    ],
+)
+def test_pending_settlement_followup_rejects_inexact_or_unbounded_shapes(mutation: str) -> None:
+    original, stored_count, original_manifest = _rehydrate_sanitized_pending_settlement_shapes()[0]
+    input_items = cast(list[JsonValue], json.loads(json.dumps(original)))
+    pending_tool_calls = dict(original_manifest)
+    call_id = next(iter(pending_tool_calls))
+    call_index = next(
+        index
+        for index, item in enumerate(input_items)
+        if isinstance(item, dict) and item.get("call_id") == call_id and item.get("type") == "custom_tool_call"
+    )
+    output_index = next(
+        index
+        for index, item in enumerate(input_items)
+        if isinstance(item, dict) and item.get("call_id") == call_id and item.get("type") == "custom_tool_call_output"
+    )
+    if mutation == "missing-output":
+        input_items.pop(output_index)
+    elif mutation == "duplicate-output":
+        input_items.insert(
+            output_index + 1, cast(JsonValue, dict(cast(dict[str, JsonValue], input_items[output_index])))
+        )
+    elif mutation == "output-before-call":
+        input_items[call_index], input_items[output_index] = input_items[output_index], input_items[call_index]
+    elif mutation == "pending-type-drift":
+        pending_tool_calls[call_id] = "function_call"
+    elif mutation == "call-status-drift":
+        cast(dict[str, JsonValue], input_items[call_index])["status"] = "in_progress"
+    elif mutation == "malformed-agent-message":
+        input_items[-1] = _canonical_agent_message()
+        cast(dict[str, JsonValue], input_items[-1])["extra"] = "unbound"
+        input_items.append({"role": "user", "content": "sanitized-followup"})
+    elif mutation == "developer-before-user":
+        input_items[-1] = {"role": "developer", "content": "sanitized-control"}
+        input_items.append({"role": "user", "content": "sanitized-followup"})
+    else:  # pragma: no cover - parametrization is closed above
+        raise AssertionError(mutation)
+    projection = project_responses_input_for_account_neutral_fresh_replay(
+        input_items,
+        stored_count=stored_count,
+        preserve_developer_message_ids=True,
+        preserve_response_owned_agent_message_ids=True,
+    )
+
+    assert projection is not None
+    assert not responses_input_suffix_matches_pending_tool_calls(
+        projection.input_items,
+        stored_count=projection.stored_prefix_count,
+        pending_tool_calls=pending_tool_calls,
+    )
+
+
 def _rehydrate_sanitized_abandoned_pending_fixture() -> tuple[list[JsonValue], int, dict[str, str]]:
     fixture_path = (
         Path(__file__).parents[1] / "fixtures" / "http_responses" / "abandoned_pending_real_transport_shape_v1.json"
