@@ -31,5 +31,6 @@
 - [x] Add negative shape tests and an end-to-end stale-anchor regression matching reasoning + agent message + repeated user follow-ups.
 - [x] Emit content-free proof-rejection shape diagnostics for future long-session incidents.
 - [x] Require an explicitly empty persisted tool manifest for inter-agent output boundaries and keep malformed diagnostic fields fail-closed.
+- [x] Add a stale-anchor-only proof for an undelivered pending call followed by a canonical inter-agent boundary; keep pending ids, malformed suffixes, and pre-rejection replay fail-closed.
 - [x] Validate the amended OpenSpec and rerun focused, unit, integration, lint, type, architecture, and diff gates.
 - [ ] Build and deploy the exact merged source image, then verify the previously failing long task and both operator windows remain healthy.

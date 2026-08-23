@@ -312,14 +312,30 @@ classification and MUST NOT fail on non-string item types.
 - **AND** the proxy keeps the continuity request owner-bound and fail-closed
 - **AND** it does not dispatch an unanchored replay
 
-#### Scenario: pending or unknown tool state rejects an inter-agent boundary
+#### Scenario: live, represented, or unknown tool state rejects an inter-agent boundary
 
 - **GIVEN** a full resend suffix contains a canonical completed `agent_message`
-- **AND** the durable or live owner has a nonempty or unavailable persisted
-  tool-call manifest
+- **AND** the durable or live owner has an unavailable persisted tool-call
+  manifest, the anchor has not been explicitly rejected, or the exact client
+  resend contains any pending call id
 - **WHEN** stale-anchor recovery is evaluated
 - **THEN** the inter-agent item does not satisfy retained-output proof
 - **AND** the existing continuity anchor remains attached
+
+#### Scenario: rejected orphan pending call yields to a later inter-agent boundary
+
+- **GIVEN** the durable owner has a nonempty pending client-side tool-call manifest
+- **AND** an exact-prefix full resend contains none of those pending call ids
+- **AND** its fresh suffix begins with one canonical response-owned
+  `agent_message` followed only by one or more new user inputs
+- **WHEN** upstream rejects the exact durable `previous_response_id` before
+  emitting any response event
+- **THEN** the bridge treats the pending call as never accepted or executed by
+  the client
+- **AND** retries the complete request exactly once without the stale anchor
+  on the same owning account
+- **AND** does not synthesize the orphan call or output into the unanchored replay
+- **AND** publishes a replacement anchor only after successful completion
 
 #### Scenario: malformed diagnostic fields remain fail-closed
 
@@ -402,6 +418,14 @@ any response event, the bridge MAY quarantine the rejected physical session
 and replay the proved complete request exactly once without the anchor on the
 same owning account. An incomplete, delta-only, owner-conflicting, or
 unproved explicit-anchor request remains fail-closed.
+
+A nonempty durable pending-tool manifest MAY satisfy this stale-anchor recovery
+only when the exact client resend contains none of its call ids, its fresh
+suffix begins with one canonical response-owned `agent_message` and then only
+new user input, and upstream first rejects the exact anchor before emitting any
+response event. This narrow condition proves that the client advanced without
+accepting or executing the orphan call. It MUST NOT make the request eligible
+for proactive, owner-unavailable, cross-account, or pre-rejection fresh replay.
 
 #### Scenario: proved complete request recovers in the same turn
 
