@@ -59,7 +59,7 @@ async def test_validate_codex_usage_identity_passes_resolved_route(monkeypatch: 
     async def fetch_usage(*args: object, **kwargs: object) -> None:
         calls["fetch_kwargs"] = kwargs
 
-    monkeypatch.setattr(auth_dependencies, "get_background_session", session_context)
+    monkeypatch.setattr(auth_dependencies, "get_request_session", session_context)
     monkeypatch.setattr(auth_dependencies, "AccountsRepository", Repo)
     monkeypatch.setattr(auth_dependencies, "resolve_upstream_route", resolve_route)
     monkeypatch.setattr(auth_dependencies, "fetch_usage", fetch_usage)
@@ -128,7 +128,7 @@ async def test_validate_codex_usage_identity_reresolves_route_for_workspace_acco
         assert kwargs["route"] is owner_route
         return UsagePayload(workspace_id="ws_1", workspace_label="Team")
 
-    monkeypatch.setattr(auth_dependencies, "get_background_session", session_context)
+    monkeypatch.setattr(auth_dependencies, "get_request_session", session_context)
     monkeypatch.setattr(auth_dependencies, "AccountsRepository", Repo)
     monkeypatch.setattr(auth_dependencies, "resolve_upstream_route", resolve_route)
     monkeypatch.setattr(auth_dependencies, "fetch_usage", fetch_usage)
@@ -195,7 +195,7 @@ async def test_validate_codex_usage_identity_reresolves_route_for_limited_worksp
         assert kwargs["route"] is owner_route
         return UsagePayload(workspace_id="ws_1", workspace_label="Team")
 
-    monkeypatch.setattr(auth_dependencies, "get_background_session", session_context)
+    monkeypatch.setattr(auth_dependencies, "get_request_session", session_context)
     monkeypatch.setattr(auth_dependencies, "AccountsRepository", Repo)
     monkeypatch.setattr(auth_dependencies, "resolve_upstream_route", resolve_route)
     monkeypatch.setattr(auth_dependencies, "fetch_usage", fetch_usage)
@@ -254,7 +254,7 @@ async def test_validate_codex_usage_identity_rejects_inactive_workspace_account(
         assert kwargs["route"] is owner_route
         return UsagePayload(workspace_id="ws_1", workspace_label="Team")
 
-    monkeypatch.setattr(auth_dependencies, "get_background_session", session_context)
+    monkeypatch.setattr(auth_dependencies, "get_request_session", session_context)
     monkeypatch.setattr(auth_dependencies, "AccountsRepository", Repo)
     monkeypatch.setattr(auth_dependencies, "resolve_upstream_route", resolve_route)
     monkeypatch.setattr(auth_dependencies, "fetch_usage", fetch_usage)
@@ -287,7 +287,7 @@ async def test_validate_codex_usage_identity_fails_closed_when_route_unavailable
     async def resolve_route(*args: object, **kwargs: object) -> ResolvedUpstreamRoute:
         raise UpstreamProxyRouteError("default_pool_unconfigured", account_id="acc_1")
 
-    monkeypatch.setattr(auth_dependencies, "get_background_session", session_context)
+    monkeypatch.setattr(auth_dependencies, "get_request_session", session_context)
     monkeypatch.setattr(auth_dependencies, "AccountsRepository", Repo)
     monkeypatch.setattr(auth_dependencies, "resolve_upstream_route", resolve_route)
 

@@ -15,8 +15,9 @@ from app.core.auth.guardian import AuthGuardianScheduler, build_auth_guardian_sc
 from app.core.auth.refresh import RefreshError
 from app.core.config import settings as settings_module
 from app.db.models import Account, AccountStatus, Base
-from app.db.session import close_session
+from app.db.session import close_session, detach_session_objects
 from app.modules.accounts.auth_manager import AuthManager
+from app.modules.accounts.background_repository import BackgroundAccountsRepository
 from app.modules.accounts.repository import AccountsRepository
 
 pytestmark = pytest.mark.unit
@@ -101,12 +102,23 @@ def test_select_auth_guardian_candidates_returns_stale_eligible_accounts_only() 
     assert [account.id for account in batched] == ["oldest-active", "stale-paused"]
 
 
-def test_default_auth_manager_factory_uses_owned_refresh_repo() -> None:
-    repo = _Repo([])
+def test_default_auth_manager_factory_uses_per_operation_background_repo() -> None:
+    candidate_repo = _Repo([])
 
-    manager = cast(AuthManager, guardian_module._default_auth_manager_factory(repo))
+    manager = cast(AuthManager, guardian_module._default_auth_manager_factory(candidate_repo))
 
+    assert isinstance(manager._repo, BackgroundAccountsRepository)
+    assert manager._repo is not candidate_repo
     assert manager._refresh_repo_factory is guardian_module._default_accounts_repo_factory
+
+
+@pytest.mark.asyncio
+async def test_default_accounts_repo_factory_returns_independent_background_repositories() -> None:
+    async with guardian_module._default_accounts_repo_factory() as first:
+        async with guardian_module._default_accounts_repo_factory() as second:
+            assert isinstance(first, BackgroundAccountsRepository)
+            assert isinstance(second, BackgroundAccountsRepository)
+            assert first is not second
 
 
 def test_build_auth_guardian_scheduler_allows_single_replica_without_leader_election(
@@ -303,6 +315,7 @@ async def test_auth_guardian_refresh_once_survives_candidate_session_close() -> 
             try:
                 yield AccountsRepository(session)
             finally:
+                detach_session_objects(session)
                 await close_session(session)
 
         calls: list[str] = []
@@ -640,7 +653,7 @@ async def test_auth_guardian_skips_backoff_before_batch_limit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_auth_guardian_waits_for_refresh_before_cancelled_candidate_exits() -> None:
+async def test_auth_guardian_exits_candidate_repo_before_waiting_for_cancelled_refresh() -> None:
     now = datetime(2026, 1, 2, 12, 0, 0)
     account = _account("stale-active", status=AccountStatus.ACTIVE, last_refresh=now - timedelta(hours=13))
     repo = _Repo([account])
@@ -654,6 +667,7 @@ async def test_auth_guardian_waits_for_refresh_before_cancelled_candidate_exits(
             nonlocal completed
             assert force is True
             assert account.id == "stale-active"
+            assert repo_exited is True
             started.set()
             await allow_finish.wait()
             completed = True
@@ -666,8 +680,7 @@ async def test_auth_guardian_waits_for_refresh_before_cancelled_candidate_exits(
         try:
             yield repo
         finally:
-            if started.is_set():
-                repo_exited = True
+            repo_exited = True
 
     scheduler = AuthGuardianScheduler(
         interval_seconds=21600,
@@ -690,7 +703,7 @@ async def test_auth_guardian_waits_for_refresh_before_cancelled_candidate_exits(
     await asyncio.sleep(0)
 
     assert completed is False
-    assert repo_exited is False
+    assert repo_exited is True
 
     allow_finish.set()
     with pytest.raises(asyncio.CancelledError):
