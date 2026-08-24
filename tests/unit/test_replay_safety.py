@@ -164,6 +164,7 @@ def test_account_neutral_fresh_replay_accepts_self_contained_payloads(
 def test_account_neutral_fresh_replay_accepts_identity_bound_responses_lite_0149_schema() -> None:
     task_id = "01a0322c-0c11-7780-b68e-061ace9161a4"
     payload: dict[str, JsonValue] = {
+        "reasoning": {"context": "all_turns", "effort": "high", "summary": "auto"},
         "input": [
             {
                 "type": "additional_tools",
@@ -251,6 +252,18 @@ def test_account_neutral_fresh_replay_accepts_identity_bound_responses_lite_0149
         payload,
         expected_session_identity=task_id,
         expected_task_identity="different-task",
+    )
+
+
+@pytest.mark.parametrize("context", [None, "", "last_turn", "ALL_TURNS", 7, {"mode": "all_turns"}])
+def test_account_neutral_responses_lite_rejects_noncanonical_reasoning_context(
+    context: JsonValue,
+) -> None:
+    assert not responses_payload_is_account_neutral_fresh_replay(
+        {
+            "input": [{"role": "user", "content": "Continue."}],
+            "reasoning": {"context": context, "effort": "high", "summary": "auto"},
+        }
     )
 
 

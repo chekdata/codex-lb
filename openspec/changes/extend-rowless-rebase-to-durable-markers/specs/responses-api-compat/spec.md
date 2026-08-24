@@ -97,6 +97,7 @@ same durable marker generation.
   carriers
 - **AND** an optional product-owned `workspace_kind` is a nonblank string of at
   most 128 bytes and has the same value in both carriers
+- **AND** a present Responses-Lite reasoning context is exactly `all_turns`
 - **AND** any flat root-turn, installation or window projection equals the
   canonical nested value
 - **AND** a bounded body-only tool namespace inventory may exceed the 16 KiB
@@ -116,7 +117,8 @@ same durable marker generation.
   metadata carriers, a direct carrier containing body-only tool inventory,
   drifting flat root-turn/installation/window projection, parent/subagent
   lineage, an empty, oversized or drifting `workspace_kind`, an unknown nested
-  metadata field,
+  metadata field, a null, blank, case-variant, `last_turn`, structured or
+  otherwise non-canonical reasoning context,
   a conversation or prompt reference, or file/container/vector-store state
 - **WHEN** recovery eligibility is evaluated
 - **THEN** the request remains non-neutral and cannot create or consume a

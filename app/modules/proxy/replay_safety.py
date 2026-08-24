@@ -148,7 +148,7 @@ _ACCOUNT_NEUTRAL_APPLY_PATCH_OPERATION_FIELDS = {
     "delete_file": frozenset({"path", "type"}),
     "update_file": frozenset({"diff", "path", "type"}),
 }
-_ACCOUNT_NEUTRAL_REASONING_CONFIG_FIELDS = frozenset({"effort", "summary"})
+_ACCOUNT_NEUTRAL_REASONING_CONFIG_FIELDS = frozenset({"context", "effort", "summary"})
 _ACCOUNT_NEUTRAL_CLIENT_METADATA_FIELDS = frozenset(
     {
         "ws_request_header_x_openai_internal_codex_responses_lite",
@@ -1661,11 +1661,11 @@ def responses_payload_is_account_neutral_fresh_replay(
 def _reasoning_config_is_account_neutral(reasoning: JsonValue | None) -> bool:
     if reasoning is None:
         return True
-    return (
-        isinstance(reasoning, dict)
-        and all(key in _ACCOUNT_NEUTRAL_REASONING_CONFIG_FIELDS for key in reasoning)
-        and all(value is None or isinstance(value, str) for value in reasoning.values())
-    )
+    if not isinstance(reasoning, dict) or not set(reasoning) <= _ACCOUNT_NEUTRAL_REASONING_CONFIG_FIELDS:
+        return False
+    if "context" in reasoning and reasoning["context"] != "all_turns":
+        return False
+    return all(value is None or isinstance(value, str) for key, value in reasoning.items() if key != "context")
 
 
 def _text_controls_are_account_neutral(text: JsonValue | None) -> bool:
