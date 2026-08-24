@@ -24,14 +24,27 @@ Normal Codex root-task requests also carry a fresh per-turn
 Marker-backed capture and dispatch therefore accept it only after durable lookup
 has resolved the alias to the exact hard session-header row that owns the active
 marker. The stable session ID, prompt-cache key and thread ID must still be equal,
-the optional client request ID must match, and conflicting session aliases remain
-rejected. Missing-row recovery and child-thread recovery retain their stricter
-no-turn-state identity gate.
+or, when an intermediary omits `thread-id`, the official Codex
+`x-client-request-id` must supply the same root-task identity. When both headers
+are present they must agree. A metadata session/thread ID, when present, is
+corroborating evidence only and must match; it cannot create authority by
+itself. Direct-header and body-nested turn-metadata carriers are parsed
+independently with a 16 KiB bound so merge precedence cannot hide a conflict.
+Malformed metadata, a non-turn request kind, or any explicit parent/subagent
+signal in headers or client metadata rejects the fallback. A
+child request remains ineligible because its client request/thread ID differs
+from the shared root session and prompt-cache key. Conflicting session aliases
+remain rejected. Missing-row recovery and child-thread recovery retain their
+stricter no-turn-state identity gate.
 
 The authority is an explicit `operator_acknowledged_semantic_rebase`. It does
 not assert that the pending call was never executed. The complete client
 checkpoint and trusted operator acknowledgement select the semantic state from
 which the task will continue.
+
+Identity rejection observability records only presence/equality and recovery
+predicate booleans. Optional capture-shape diagnosis is bounded to at most 512
+input items so repeated invalid requests cannot create unbounded projection work.
 
 ## One marker generation, one winner
 

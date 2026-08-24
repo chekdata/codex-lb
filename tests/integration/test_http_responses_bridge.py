@@ -819,10 +819,30 @@ async def test_rowless_stale_anchor_semantic_rebase_end_to_end(
     assert selection_count == 2
 
 
+@pytest.mark.parametrize(
+    "identity_case",
+    [
+        "child_both",
+        "client_only",
+        "explicit_subagent",
+        "metadata_subagent",
+        "metadata_session_drift",
+        "metadata_thread_drift",
+        "turn_metadata_subagent",
+        "turn_metadata_session_drift",
+        "turn_metadata_thread_drift",
+        "turn_metadata_header_conflict",
+        "turn_metadata_malformed",
+        "turn_metadata_non_turn",
+        "turn_metadata_oversized",
+        "turn_metadata_wrong_type",
+    ],
+)
 @pytest.mark.asyncio
 async def test_rowless_child_thread_sharing_root_bridge_identity_fails_closed_without_capture(
     async_client,
     monkeypatch,
+    identity_case,
 ):
     """A child thread cannot rebase through its root's durable bridge row."""
 
@@ -852,19 +872,64 @@ async def test_rowless_child_thread_sharing_root_bridge_identity_fails_closed_wi
     monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
     root_session = "root-task"
     child_thread = "child-task"
+    child_headers = {"session-id": root_session}
+    if identity_case == "child_both":
+        child_headers["thread-id"] = child_thread
+        child_headers["x-client-request-id"] = child_thread
+    elif identity_case == "client_only":
+        child_headers["x-client-request-id"] = child_thread
+    elif identity_case == "explicit_subagent":
+        child_headers["x-client-request-id"] = root_session
+        child_headers["x-openai-subagent"] = "reviewer"
+    else:
+        child_headers["x-client-request-id"] = root_session
+    request_json = {
+        "model": "gpt-5.1",
+        "previous_response_id": "resp_child_stale",
+        "prompt_cache_key": root_session,
+        "input": [{"role": "user", "content": "same-turn retry"}],
+    }
+    if identity_case == "metadata_subagent":
+        child_headers["x-client-request-id"] = root_session
+        request_json["client_metadata"] = {"x-openai-subagent": "reviewer"}
+    elif identity_case == "metadata_session_drift":
+        request_json["client_metadata"] = {"session_id": child_thread}
+    elif identity_case == "metadata_thread_drift":
+        child_headers["x-client-request-id"] = root_session
+        request_json["client_metadata"] = {"thread_id": child_thread}
+    elif identity_case == "turn_metadata_subagent":
+        request_json["client_metadata"] = {
+            "x-codex-turn-metadata": json.dumps(
+                {"thread_id": root_session, "parent_thread_id": root_session, "subagent_kind": "review"}
+            )
+        }
+    elif identity_case == "turn_metadata_session_drift":
+        request_json["client_metadata"] = {"x-codex-turn-metadata": json.dumps({"session_id": child_thread})}
+    elif identity_case == "turn_metadata_thread_drift":
+        request_json["client_metadata"] = {"x-codex-turn-metadata": json.dumps({"thread_id": child_thread})}
+    elif identity_case == "turn_metadata_header_conflict":
+        request_json["client_metadata"] = {
+            "x-codex-turn-metadata": json.dumps({"session_id": root_session, "thread_id": root_session})
+        }
+        child_headers["x-codex-turn-metadata"] = json.dumps(
+            {"session_id": root_session, "thread_id": child_thread, "parent_thread_id": root_session}
+        )
+    elif identity_case == "turn_metadata_malformed":
+        request_json["client_metadata"] = {"x-codex-turn-metadata": "not-json"}
+    elif identity_case == "turn_metadata_non_turn":
+        request_json["client_metadata"] = {
+            "x-codex-turn-metadata": json.dumps({"thread_id": root_session, "request_kind": "compact"})
+        }
+    elif identity_case == "turn_metadata_oversized":
+        request_json["client_metadata"] = {
+            "x-codex-turn-metadata": json.dumps({"thread_id": root_session, "padding": "x" * (17 * 1024)})
+        }
+    elif identity_case == "turn_metadata_wrong_type":
+        request_json["client_metadata"] = {"x-codex-turn-metadata": 7}
     response = await async_client.post(
         "/v1/responses",
-        headers={
-            "session-id": root_session,
-            "thread-id": child_thread,
-            "x-client-request-id": child_thread,
-        },
-        json={
-            "model": "gpt-5.1",
-            "previous_response_id": "resp_child_stale",
-            "prompt_cache_key": root_session,
-            "input": [{"role": "user", "content": "same-turn retry"}],
-        },
+        headers=child_headers,
+        json=request_json,
     )
     assert response.status_code == 502
     assert response.json()["error"]["code"] != "previous_response_recovery_authorization_required"
@@ -877,6 +942,8 @@ async def test_rowless_child_thread_sharing_root_bridge_identity_fails_closed_wi
     "resolution_mode",
     [
         "administrator",
+        "administrator_client_request_id_fallback",
+        "administrator_child_client_request_id",
         "automatic",
         "automatic_legacy_unknown",
         "automatic_legacy_consumed",
@@ -894,6 +961,8 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
     resolution_mode,
 ):
     """A retained marker admits exactly one safe recovery owner."""
+
+    administrator_mode = resolution_mode.startswith("administrator")
 
     _install_bridge_settings(monkeypatch, enabled=True)
     account_id = await _import_account(
@@ -1006,7 +1075,7 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
     from tests.unit.test_replay_safety import _rehydrate_sanitized_pending_settlement_shapes
 
     mismatched_complete_input = copy.deepcopy(_rehydrate_sanitized_pending_settlement_shapes()[1][0])
-    if resolution_mode == "administrator":
+    if administrator_mode:
         historical_output = next(
             item
             for item in mismatched_complete_input
@@ -1038,10 +1107,22 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
         "input": mismatched_complete_input,
     }
     recovery_headers = (
-        {**headers, "x-codex-turn-state": "turn-state-marker-rowless-capture"}
-        if resolution_mode == "administrator"
-        else headers
+        {**headers, "x-codex-turn-state": "turn-state-marker-rowless-capture"} if administrator_mode else headers
     )
+    if resolution_mode in {
+        "administrator_client_request_id_fallback",
+        "administrator_child_client_request_id",
+    }:
+        recovery_headers.pop("thread-id")
+    if resolution_mode == "administrator_client_request_id_fallback":
+        request["client_metadata"] = {
+            "x-codex-turn-metadata": json.dumps({"session_id": task_id, "thread_id": task_id, "request_kind": "turn"}),
+        }
+        recovery_headers["x-codex-turn-metadata"] = json.dumps(
+            {"session_id": task_id, "thread_id": task_id, "request_kind": "turn"}
+        )
+    if resolution_mode == "administrator_child_client_request_id":
+        recovery_headers["x-client-request-id"] = "child-task"
     request_model = proxy_module.ResponsesRequest.model_validate(request)
     request_affinity = proxy_module._sticky_key_for_responses_request(
         request_model,
@@ -1060,14 +1141,14 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
         request_id="marker-rowless-capture",
         explicit_prompt_cache_key=task_id,
     )
-    if resolution_mode == "administrator":
+    if administrator_mode:
         assert request_key.affinity_kind == "turn_state_header"
         assert request_key.affinity_key != marker.session_key_value
     else:
         assert request_key.affinity_kind == marker.session_key_kind
         assert request_key.affinity_key == marker.session_key_value
     service = get_proxy_service_for_app(app_instance)
-    if resolution_mode != "administrator":
+    if not administrator_mode:
         lookup = await service._durable_bridge.lookup_request_targets(
             session_key_kind=request_key.affinity_kind,
             session_key_value=request_key.affinity_key,
@@ -1081,12 +1162,25 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
         assert lookup.recovery_is_required_for_latest_anchor()
     captured = await async_client.post("/v1/responses", headers=recovery_headers, json=request)
     assert captured.status_code == 400, captured.text
+    if resolution_mode == "administrator_child_client_request_id":
+        assert captured.json()["error"]["code"] == "previous_response_pending_call_resolution_required"
+        assert connect_count == 2
+        assert selection_count == selection_count_after_marker
+        async with SessionLocal() as db_session:
+            assert list((await db_session.scalars(select(HttpBridgeRowlessRecoveryAuthority))).all()) == []
+            retained_marker = await db_session.get(HttpBridgeSessionRecord, marker_id)
+            assert retained_marker is not None
+            assert retained_marker.recovery_required_attempt_fingerprint is None
+        return
     assert captured.json()["error"]["code"] == "previous_response_recovery_authorization_required"
     assert captured.json()["error"]["action"] == "retry_same_turn_after_admin_approval"
     assert connect_count == 2
     assert selection_count == selection_count_after_marker
 
-    repeated_capture = await async_client.post("/v1/responses", headers=recovery_headers, json=request)
+    repeated_capture_headers = recovery_headers
+    if resolution_mode == "administrator_client_request_id_fallback":
+        repeated_capture_headers = {**recovery_headers, "thread-id": task_id}
+    repeated_capture = await async_client.post("/v1/responses", headers=repeated_capture_headers, json=request)
     assert repeated_capture.status_code == 400, repeated_capture.text
     assert repeated_capture.json()["error"]["code"] == "previous_response_recovery_authorization_required"
     assert connect_count == 2
@@ -1292,7 +1386,7 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
     recovered_wire = json.loads(recovered_upstream.sent_text[0])
     assert "previous_response_id" not in recovered_wire
     assert recovered_wire["input"] != stored_input
-    if resolution_mode == "administrator":
+    if administrator_mode:
         assert "encrypted_content" not in json.dumps(recovered_wire["input"])
         assert all(
             part != {"type": "input_text", "text": ""}
