@@ -218,7 +218,7 @@ def _make_bridge_session(
     )
 
 
-def test_http_bridge_account_neutral_replay_rejects_namespaced_tool_call_history() -> None:
+def test_http_bridge_account_neutral_replay_accepts_valid_namespaced_tool_call_history() -> None:
     payload = proxy_service.ResponsesRequest.model_validate(
         {
             "model": "gpt-5.6-sol",
@@ -238,6 +238,13 @@ def test_http_bridge_account_neutral_replay_rejects_namespaced_tool_call_history
         }
     )
 
+    assert http_bridge_streaming_module._http_bridge_payload_is_account_neutral_fresh_replay(payload) is True
+
+    function_call = cast(dict[str, Any], payload.input[1])
+    function_call["namespace"] = "   "
+    assert http_bridge_streaming_module._http_bridge_payload_is_account_neutral_fresh_replay(payload) is False
+
+    function_call["namespace"] = 7
     assert http_bridge_streaming_module._http_bridge_payload_is_account_neutral_fresh_replay(payload) is False
 
 

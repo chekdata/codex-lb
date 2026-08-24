@@ -17325,6 +17325,7 @@ async def test_v1_responses_http_bridge_persists_pending_resolution_and_blocks_s
     monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
     monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
 
+    service = get_proxy_service_for_app(app_instance)
     headers = {
         "x-codex-session-id": f"durable-recovery-required-{case_id}",
         "x-codex-turn-state": f"durable-recovery-required-turn-{case_id}",
@@ -17348,6 +17349,22 @@ async def test_v1_responses_http_bridge_persists_pending_resolution_and_blocks_s
     )
     assert first.status_code == 200, first.text
 
+    # ``response.completed`` can resolve the caller before the reader consumes
+    # the immediately queued clean-close frame.  Wait for the exact source
+    # bridge to retire so the follow-up deterministically exercises fresh
+    # stale-anchor reattach instead of racing a closed-but-registered socket.
+    source_bridge_retired = False
+    deadline = time.monotonic() + _TEST_SYNC_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        async with service._http_bridge_lock:
+            source_bridge_retired = all(
+                candidate.upstream is not source_upstream for candidate in service._http_bridge_sessions.values()
+            )
+        if source_bridge_retired:
+            break
+        await asyncio.sleep(0.01)
+    assert source_bridge_retired
+
     first_delta = await async_client.post(
         "/v1/responses",
         headers=headers,
@@ -17362,7 +17379,6 @@ async def test_v1_responses_http_bridge_persists_pending_resolution_and_blocks_s
     assert connect_count == 2
     assert json.loads(stale_upstream.sent_text[0])["previous_response_id"] == "resp_bridge_custom_1"
 
-    service = get_proxy_service_for_app(app_instance)
     durable_marker = await service._durable_bridge.lookup_request_targets(
         session_key_kind="turn_state_header",
         session_key_value=headers["x-codex-turn-state"],
