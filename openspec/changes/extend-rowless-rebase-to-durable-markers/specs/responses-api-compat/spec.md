@@ -42,6 +42,21 @@ same durable marker generation.
 - **AND** returns the stable authorization-required action
 - **AND** performs no additional account selection, WebSocket connect or upstream send.
 
+#### Scenario: A resolved root-task turn-state alias can use the durable marker
+
+- **GIVEN** a normal Codex root-task resend carries a fresh per-turn
+  `x-codex-turn-state` affinity value
+- **AND** durable lookup resolves that alias to the exact hard session-header,
+  account and active recovery marker
+- **AND** the stable session ID, prompt-cache key, thread ID and optional client
+  request ID still identify the same root task without a conflicting alias
+- **WHEN** automatic pending-manifest proof fails but the complete request is
+  otherwise eligible for marker-backed administrator recovery
+- **THEN** the service captures or consumes the one marker-bound authority
+  instead of rejecting the request solely because turn-state affinity is present
+- **AND** no-row recovery, child-thread recovery, unresolved aliases and task-ID
+  drift remain fail closed.
+
 #### Scenario: Rowless projection removes only semantics-free Codex transport artifacts
 
 - **GIVEN** a complete client checkpoint whose direct call ledger is fully settled

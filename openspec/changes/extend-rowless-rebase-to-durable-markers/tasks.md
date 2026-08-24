@@ -11,6 +11,7 @@
 - [x] Atomically settle automatic marker recovery before delivering terminal success.
 - [x] Defer cancellation through the physically-proven-unsent two-socket rollback.
 - [x] Canonicalize only exact empty-output and opaque agent transport artifacts in the rowless projection.
+- [x] Resolve normal per-turn turn-state affinity to the exact durable marker before capture or dispatch.
 - [x] Complete focused, migration, architecture, Ruff, format, type and strict OpenSpec gates.
 - [ ] Obtain exact-final-diff Fable5 audit and independent approval on the successor PR.
 - [ ] Build, mirror and verify the exact multi-platform image through normal GitOps.

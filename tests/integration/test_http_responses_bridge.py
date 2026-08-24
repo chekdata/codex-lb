@@ -1037,10 +1037,15 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
         "prompt_cache_key": task_id,
         "input": mismatched_complete_input,
     }
+    recovery_headers = (
+        {**headers, "x-codex-turn-state": "turn-state-marker-rowless-capture"}
+        if resolution_mode == "administrator"
+        else headers
+    )
     request_model = proxy_module.ResponsesRequest.model_validate(request)
     request_affinity = proxy_module._sticky_key_for_responses_request(
         request_model,
-        headers,
+        recovery_headers,
         codex_session_affinity=True,
         openai_cache_affinity=True,
         openai_cache_affinity_max_age_seconds=300,
@@ -1049,34 +1054,39 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
     )
     request_key = proxy_module._make_http_bridge_session_key(
         request_model,
-        headers=headers,
+        headers=recovery_headers,
         affinity=request_affinity,
         api_key=None,
         request_id="marker-rowless-capture",
         explicit_prompt_cache_key=task_id,
     )
-    assert request_key.affinity_kind == marker.session_key_kind
-    assert request_key.affinity_key == marker.session_key_value
+    if resolution_mode == "administrator":
+        assert request_key.affinity_kind == "turn_state_header"
+        assert request_key.affinity_key != marker.session_key_value
+    else:
+        assert request_key.affinity_kind == marker.session_key_kind
+        assert request_key.affinity_key == marker.session_key_value
     service = get_proxy_service_for_app(app_instance)
-    lookup = await service._durable_bridge.lookup_request_targets(
-        session_key_kind=request_key.affinity_kind,
-        session_key_value=request_key.affinity_key,
-        api_key_id=None,
-        turn_state=None,
-        session_header=task_id,
-        previous_response_id=None,
-    )
-    assert lookup is not None
-    assert lookup.session_id == marker_id
-    assert lookup.recovery_is_required_for_latest_anchor()
-    captured = await async_client.post("/v1/responses", headers=headers, json=request)
+    if resolution_mode != "administrator":
+        lookup = await service._durable_bridge.lookup_request_targets(
+            session_key_kind=request_key.affinity_kind,
+            session_key_value=request_key.affinity_key,
+            api_key_id=None,
+            turn_state=None,
+            session_header=task_id,
+            previous_response_id=None,
+        )
+        assert lookup is not None
+        assert lookup.session_id == marker_id
+        assert lookup.recovery_is_required_for_latest_anchor()
+    captured = await async_client.post("/v1/responses", headers=recovery_headers, json=request)
     assert captured.status_code == 400, captured.text
     assert captured.json()["error"]["code"] == "previous_response_recovery_authorization_required"
     assert captured.json()["error"]["action"] == "retry_same_turn_after_admin_approval"
     assert connect_count == 2
     assert selection_count == selection_count_after_marker
 
-    repeated_capture = await async_client.post("/v1/responses", headers=headers, json=request)
+    repeated_capture = await async_client.post("/v1/responses", headers=recovery_headers, json=request)
     assert repeated_capture.status_code == 400, repeated_capture.text
     assert repeated_capture.json()["error"]["code"] == "previous_response_recovery_authorization_required"
     assert connect_count == 2
@@ -1274,7 +1284,7 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
         )
         assert approved.state == HttpBridgeRowlessRecoveryState.APPROVED
 
-    recovered = await async_client.post("/v1/responses", headers=headers, json=request)
+    recovered = await async_client.post("/v1/responses", headers=recovery_headers, json=request)
     assert recovered.status_code == 200, recovered.text
     assert connect_count == 3
     assert selection_count == selection_count_after_marker + 1
