@@ -11580,6 +11580,7 @@ async def test_stream_via_http_bridge_preserves_context_after_owner_unavailable(
         latest_response_id="resp_latest",
         latest_input_item_count=len(prefix_items),
         latest_input_full_fingerprint=proxy_service._fingerprint_input_items(payload_prefix_items),
+        latest_pending_tool_calls={},
     )
     takeover_lookup = replace(
         durable_lookup,
