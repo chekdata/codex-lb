@@ -1278,6 +1278,11 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
         "input": mismatched_complete_input,
     }
     if resolution_mode == "administrator_responses_lite_0149":
+        request["reasoning"] = {
+            "context": "all_turns",
+            "effort": "high",
+            "summary": "auto",
+        }
         body_turn_metadata = {
             "installation_id": "installation-before-account-selection",
             "session_id": task_id,
