@@ -68,6 +68,13 @@ unknown field or explicit file/container/vector-store state. Calls without an
 expected verified identity continue to reject those identity keys. This is a
 schema-compatibility correction, not a general same-account exception: all
 three existing account-neutral capture, repository and approval gates remain.
+The 0.149.0-alpha.4.1 Desktop also supplies the product-owned
+`workspace_kind` string through `responsesapi_client_metadata`; Codex flattens
+that value into both nested turn-metadata carriers. Recovery accepts only that
+explicitly known extra as a nonblank UTF-8 string of at most 128 bytes. It
+remains part of the shared body/direct projection fingerprint, so omission or
+drift between carriers fails closed, while every other unknown flattened extra
+continues to be rejected.
 
 The authority is an explicit `operator_acknowledged_semantic_rebase`. It does
 not assert that the pending call was never executed. The complete client

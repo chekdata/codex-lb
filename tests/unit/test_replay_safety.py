@@ -234,6 +234,7 @@ def test_account_neutral_fresh_replay_accepts_identity_bound_responses_lite_0149
                     "turn_id": "019f-turn-id",
                     "root_turn_id": "019f-turn-id",
                     "window_id": "window-a",
+                    "workspace_kind": "projectless",
                     "request_kind": "turn",
                 }
             ),
@@ -476,6 +477,62 @@ def test_account_neutral_responses_lite_metadata_rejects_lineage_missing_identit
         },
         expected_session_identity="root-task",
         expected_task_identity="root-task",
+    )
+
+
+@pytest.mark.parametrize(
+    "workspace_kind",
+    [None, "", " " * 4, "x" * 129, "界" * 43, 7, {"kind": "projectless"}],
+)
+def test_account_neutral_responses_lite_metadata_rejects_invalid_workspace_kind(
+    workspace_kind: JsonValue,
+) -> None:
+    task_id = "root-task"
+    assert not responses_payload_is_account_neutral_fresh_replay(
+        {
+            "input": [{"role": "user", "content": "Continue."}],
+            "client_metadata": {
+                "session_id": task_id,
+                "thread_id": task_id,
+                "turn_id": "turn-1",
+                "x-codex-turn-metadata": json.dumps(
+                    {
+                        "session_id": task_id,
+                        "thread_id": task_id,
+                        "turn_id": "turn-1",
+                        "request_kind": "turn",
+                        "workspace_kind": workspace_kind,
+                    }
+                ),
+            },
+        },
+        expected_session_identity=task_id,
+        expected_task_identity=task_id,
+    )
+
+
+def test_account_neutral_responses_lite_metadata_accepts_workspace_kind_at_utf8_byte_limit() -> None:
+    task_id = "root-task"
+    assert responses_payload_is_account_neutral_fresh_replay(
+        {
+            "input": [{"role": "user", "content": "Continue."}],
+            "client_metadata": {
+                "session_id": task_id,
+                "thread_id": task_id,
+                "turn_id": "turn-1",
+                "x-codex-turn-metadata": json.dumps(
+                    {
+                        "session_id": task_id,
+                        "thread_id": task_id,
+                        "turn_id": "turn-1",
+                        "request_kind": "turn",
+                        "workspace_kind": "界" * 42 + "ab",
+                    }
+                ),
+            },
+        },
+        expected_session_identity=task_id,
+        expected_task_identity=task_id,
     )
 
 

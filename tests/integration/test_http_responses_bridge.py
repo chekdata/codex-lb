@@ -834,6 +834,9 @@ async def test_rowless_stale_anchor_semantic_rebase_end_to_end(
         "turn_metadata_header_conflict",
         "turn_metadata_header_conflict_with_explicit_thread",
         "turn_metadata_projection_conflict_with_explicit_thread",
+        "turn_metadata_workspace_kind_conflict_with_explicit_thread",
+        "turn_metadata_workspace_kind_missing_body_with_explicit_thread",
+        "turn_metadata_workspace_kind_missing_direct_with_explicit_thread",
         "turn_metadata_malformed",
         "turn_metadata_non_turn",
         "turn_metadata_oversized",
@@ -897,6 +900,12 @@ async def test_rowless_child_thread_sharing_root_bridge_identity_fails_closed_wi
     if identity_case == "turn_metadata_oversized_with_explicit_thread":
         child_headers["thread-id"] = root_session
     if identity_case == "turn_metadata_projection_conflict_with_explicit_thread":
+        child_headers["thread-id"] = root_session
+    if identity_case in {
+        "turn_metadata_workspace_kind_conflict_with_explicit_thread",
+        "turn_metadata_workspace_kind_missing_body_with_explicit_thread",
+        "turn_metadata_workspace_kind_missing_direct_with_explicit_thread",
+    }:
         child_headers["thread-id"] = root_session
     request_json = {
         "model": "gpt-5.1",
@@ -976,6 +985,34 @@ async def test_rowless_child_thread_sharing_root_bridge_identity_fails_closed_wi
                 "request_kind": "turn",
             }
         )
+    elif identity_case in {
+        "turn_metadata_workspace_kind_conflict_with_explicit_thread",
+        "turn_metadata_workspace_kind_missing_body_with_explicit_thread",
+        "turn_metadata_workspace_kind_missing_direct_with_explicit_thread",
+    }:
+        body_metadata = {
+            "session_id": root_session,
+            "thread_id": root_session,
+            "turn_id": "turn-root",
+            "request_kind": "turn",
+            "workspace_kind": "projectless",
+        }
+        direct_metadata = {
+            **body_metadata,
+            "workspace_kind": "project",
+        }
+        if identity_case == "turn_metadata_workspace_kind_missing_body_with_explicit_thread":
+            body_metadata.pop("workspace_kind")
+            direct_metadata["workspace_kind"] = "projectless"
+        elif identity_case == "turn_metadata_workspace_kind_missing_direct_with_explicit_thread":
+            direct_metadata.pop("workspace_kind")
+        request_json["client_metadata"] = {
+            "session_id": root_session,
+            "thread_id": root_session,
+            "turn_id": "turn-root",
+            "x-codex-turn-metadata": json.dumps(body_metadata),
+        }
+        child_headers["x-codex-turn-metadata"] = json.dumps(direct_metadata)
     elif identity_case == "turn_metadata_malformed":
         request_json["client_metadata"] = {"x-codex-turn-metadata": "not-json"}
     elif identity_case == "turn_metadata_non_turn":
@@ -1005,6 +1042,9 @@ async def test_rowless_child_thread_sharing_root_bridge_identity_fails_closed_wi
         "turn_metadata_header_conflict_with_explicit_thread",
         "turn_metadata_oversized_with_explicit_thread",
         "turn_metadata_projection_conflict_with_explicit_thread",
+        "turn_metadata_workspace_kind_conflict_with_explicit_thread",
+        "turn_metadata_workspace_kind_missing_body_with_explicit_thread",
+        "turn_metadata_workspace_kind_missing_direct_with_explicit_thread",
     }:
         assert response.status_code == 400
         assert response.json()["error"]["code"] == "rowless_recovery_identity_metadata_invalid"
@@ -1245,6 +1285,7 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
             "turn_id": "019f-turn-id",
             "root_turn_id": "019f-turn-id",
             "window_id": "window-a",
+            "workspace_kind": "projectless",
             "request_kind": "turn",
             "tool_namespaces_info": {
                 "functions": {
@@ -1287,6 +1328,7 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
                 "turn_id": "019f-turn-id",
                 "root_turn_id": "019f-turn-id",
                 "window_id": "window-a",
+                "workspace_kind": "projectless",
                 "request_kind": "turn",
             },
             separators=(",", ":"),
