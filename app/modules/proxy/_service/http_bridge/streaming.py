@@ -2183,6 +2183,7 @@ class _HTTPBridgeStreamingMixin:
                 # resend objects above may suppress the anchor.
                 fresh_reattach_can_use_durable_anchor = False
                 fresh_reattach_anchor_suppressed_quarantined = True
+                effective_payload = _http_bridge_payload_without_previous_response_id(payload)
                 durable_full_resend_fresh_bridge_proof = (
                     durable_full_resend_proof
                     if verified_quarantine_full_resend
@@ -2389,7 +2390,8 @@ class _HTTPBridgeStreamingMixin:
                 effective_payload = effective_payload.model_copy(update={"input": trimmed_input_items})
         request_state, text_data = prepare_bridge_request(effective_payload)
         if (
-            task_authority_digest is not None
+            not durable_marker_verified_recovery
+            and task_authority_digest is not None
             and rowless_api_key_scope is not None
             and rowless_strong_hash is not None
             and rowless_dispatch_identity_eligible
@@ -2410,7 +2412,12 @@ class _HTTPBridgeStreamingMixin:
                 session_identity=official_session_id,
                 facts=rowless_capture_facts,
             )
-        if task_authority_digest is not None and rowless_api_key_scope is not None and rowless_strong_hash is not None:
+        if (
+            not durable_marker_verified_recovery
+            and task_authority_digest is not None
+            and rowless_api_key_scope is not None
+            and rowless_strong_hash is not None
+        ):
             if rowless_authority is None:
                 async with SessionLocal() as rowless_session:
                     rowless_repository = RowlessRecoveryRepository(rowless_session)

@@ -836,13 +836,15 @@ async def test_rowless_child_thread_sharing_root_bridge_identity_fails_closed_wi
     assert authorities == []
 
 
+@pytest.mark.parametrize("resolution_mode", ["administrator", "automatic"])
 @pytest.mark.asyncio
 async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_without_clearing_fence(
     async_client,
     app_instance,
     monkeypatch,
+    resolution_mode,
 ):
-    """A retained stale-anchor marker needs one explicit admin semantic rebase."""
+    """A retained marker admits exactly one safe recovery owner."""
 
     _install_bridge_settings(monkeypatch, enabled=True)
     account_id = await _import_account(
@@ -994,13 +996,72 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
     assert selection_count == selection_count_after_marker
 
     async with SessionLocal() as db_session:
-        repository = RowlessRecoveryRepository(db_session)
         authorities = list((await db_session.scalars(select(HttpBridgeRowlessRecoveryAuthority))).all())
         assert len(authorities) == 1
         authority = authorities[0]
         assert authority is not None
         assert authority.state == HttpBridgeRowlessRecoveryState.CAPTURED
         assert authority.origin_marker_session_id == marker_id
+
+    if resolution_mode == "automatic":
+        automatic_full_resend = [
+            *stored_input,
+            {
+                "type": "reasoning",
+                "id": "rs_08639659bba14680016a8a0902e9a887d090946ff27b898f05",
+                "content": None,
+                "encrypted_content": "opaque",
+                "summary": [],
+            },
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_custom_shell",
+                "name": "shell",
+                "input": "pwd",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_custom_shell",
+                "output": "verified pending-call settlement",
+            },
+        ]
+        automatic_recovery = await async_client.post(
+            "/v1/responses",
+            headers=headers,
+            json={
+                "model": "gpt-5.1",
+                "instructions": "Return exactly OK.",
+                "previous_response_id": "resp_bridge_custom_1",
+                "prompt_cache_key": task_id,
+                "input": automatic_full_resend,
+            },
+        )
+        assert automatic_recovery.status_code == 200, automatic_recovery.text
+        assert connect_count == 3
+        assert selection_count == selection_count_after_marker + 1
+        assert len(recovered_upstream.sent_text) == 1
+        automatic_wire = json.loads(recovered_upstream.sent_text[0])
+        assert "previous_response_id" not in automatic_wire
+        async with SessionLocal() as db_session:
+            retained_authority = await db_session.get(HttpBridgeRowlessRecoveryAuthority, authority.id)
+            marker = await db_session.get(HttpBridgeSessionRecord, marker_id)
+            assert retained_authority is not None
+            assert retained_authority.state == HttpBridgeRowlessRecoveryState.CAPTURED
+            assert marker is not None
+            assert marker.latest_response_id == automatic_recovery.json()["id"]
+            assert marker.recovery_required_anchor_hash is None
+            assert marker.recovery_required_attempt_fingerprint is None
+            attempt = await db_session.scalar(
+                select(HttpBridgeRecoveryAttemptRecord).where(HttpBridgeRecoveryAttemptRecord.session_id == marker_id)
+            )
+            assert attempt is not None
+            assert attempt.state == HttpBridgeRecoveryAttemptState.REPLAYED
+        return
+
+    async with SessionLocal() as db_session:
+        repository = RowlessRecoveryRepository(db_session)
+        authority = await db_session.get(HttpBridgeRowlessRecoveryAuthority, authority.id)
+        assert authority is not None
         challenge = await repository.issue_challenge(
             authority_id=authority.id,
             generation=authority.generation,
