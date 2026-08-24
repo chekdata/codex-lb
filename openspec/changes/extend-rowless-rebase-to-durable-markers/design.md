@@ -10,13 +10,23 @@ not-yet-dispatched APPROVED authority bound to the exact current marker. A
 pre-marker or different-marker UNKNOWN/CONSUMED tombstone remains fail-closed.
 The conflict lookup is bound to API-key scope plus the rejected anchor and is
 therefore independent of optional incoming routing headers such as `thread-id`;
-those headers remain mandatory for creating or dispatching administrator authority.
+the stable root-task identity headers remain mandatory for creating or dispatching
+administrator authority.
 Only when automatic proof fails may the service capture an administrator
 authority. Capture locks the origin `http_bridge_sessions` row and verifies its
 exact API-key scope, account, recovery-required account, latest response hash,
 marker anchor hash and empty marker-attempt claim. The new authority stores the
 origin durable session ID without a cascading foreign key so its consumed
 no-replay tombstone survives later bridge cleanup.
+
+Normal Codex root-task requests also carry a fresh per-turn
+`x-codex-turn-state`. That value is routing affinity, not durable task identity.
+Marker-backed capture and dispatch therefore accept it only after durable lookup
+has resolved the alias to the exact hard session-header row that owns the active
+marker. The stable session ID, prompt-cache key and thread ID must still be equal,
+the optional client request ID must match, and conflicting session aliases remain
+rejected. Missing-row recovery and child-thread recovery retain their stricter
+no-turn-state identity gate.
 
 The authority is an explicit `operator_acknowledged_semantic_rebase`. It does
 not assert that the pending call was never executed. The complete client

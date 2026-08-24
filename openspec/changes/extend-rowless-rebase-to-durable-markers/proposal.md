@@ -27,6 +27,9 @@ another automatic replay.
   final serialized wire.
 - Keep capture local: it performs no new account selection, WebSocket connect
   or upstream send and returns the existing administrator-authorization action.
+- Accept the normal per-turn Codex turn-state affinity only after durable lookup
+  resolves it to the exact hard session-header row and active marker; preserve
+  the stricter identity gate for missing-row and child-thread recovery.
 - Make administrator and automatic recovery attempts compete for the same
   marker generation. The administrator claim uses a domain-separated digest
   over authority ID, generation and wire fingerprint so legacy equal-wire

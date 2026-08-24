@@ -1759,6 +1759,7 @@ class _HTTPBridgeStreamingMixin:
             else None
         )
         rowless_authority = None
+        marker_rowless_dispatch_identity_eligible = False
         automatic_marker_supersedes_rowless_authority = False
         payload_looks_like_full_resend = _http_bridge_payload_looks_like_full_resend(payload)
         # Set when the quarantine check below suppresses the durable-anchor
@@ -2040,6 +2041,20 @@ class _HTTPBridgeStreamingMixin:
                 )
             )
             if durable_recovery_marker_active and not verified_marker_full_resend:
+                # Codex sends a fresh turn-state affinity value on ordinary root-task
+                # turns. The durable lookup above has already resolved that alias
+                # back to this exact hard session-header marker, so marker-backed
+                # recovery can accept it without weakening rowless/no-row identity.
+                marker_rowless_dispatch_identity_eligible = (
+                    rowless_lookup_identity_eligible
+                    and bridge_session_key.strength == "hard"
+                    and bridge_session_key.affinity_kind == "session_header"
+                    and not conflicting_session_alias
+                    and (
+                        rowless_client_request_identity is None
+                        or rowless_client_request_identity == rowless_task_identity
+                    )
+                )
                 if (
                     task_authority_digest is not None
                     and rowless_api_key_scope is not None
@@ -2064,7 +2079,7 @@ class _HTTPBridgeStreamingMixin:
                                 )
                             if (
                                 rowless_authority is None
-                                and rowless_dispatch_identity_eligible
+                                and marker_rowless_dispatch_identity_eligible
                                 and rowless_capture_facts is not None
                                 and rowless_capture_facts.unresolved_count == 0
                                 and rowless_capture_facts.self_contained
@@ -2573,7 +2588,13 @@ class _HTTPBridgeStreamingMixin:
                             error_type="invalid_request_error",
                         ),
                     )
-                if not rowless_dispatch_identity_eligible:
+                if not (
+                    rowless_dispatch_identity_eligible
+                    or (
+                        rowless_authority.origin_marker_session_id is not None
+                        and marker_rowless_dispatch_identity_eligible
+                    )
+                ):
                     raise ProxyResponseError(
                         400,
                         openai_error(
