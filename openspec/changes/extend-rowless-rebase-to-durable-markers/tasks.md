@@ -13,6 +13,7 @@
 - [x] Canonicalize only exact empty-output and opaque agent transport artifacts in the rowless projection.
 - [x] Resolve normal per-turn turn-state affinity to the exact durable marker before capture or dispatch.
 - [x] Accept the official client request ID as the root-task identity only when `thread-id` is omitted and preserve child-task isolation.
+- [x] Accept only the closed official Responses-Lite 0.149 namespace/tool-search schema and identity-bound client metadata.
 - [x] Complete focused, migration, architecture, Ruff, format, type and strict OpenSpec gates.
 - [ ] Obtain exact-final-diff Fable5 audit and independent approval on the successor PR.
 - [ ] Build, mirror and verify the exact multi-platform image through normal GitOps.

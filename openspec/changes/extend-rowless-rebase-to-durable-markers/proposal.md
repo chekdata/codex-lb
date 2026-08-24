@@ -30,6 +30,10 @@ another automatic replay.
 - Accept the normal per-turn Codex turn-state affinity only after durable lookup
   resolves it to the exact hard session-header row and active marker; preserve
   the stricter identity gate for missing-row and child-thread recovery.
+- Treat the official Codex 0.149 Responses-Lite namespace/tool-search envelope
+  as account neutral only when its schema is closed and stateless. Accept the
+  new session/thread/turn metadata keys only when session and thread values
+  exactly match the already verified root-task identity.
 - Make administrator and automatic recovery attempts compete for the same
   marker generation. The administrator claim uses a domain-separated digest
   over authority ID, generation and wire fingerprint so legacy equal-wire
@@ -47,3 +51,5 @@ another automatic replay.
 - Relaxing pending call ID/type matching or PR #19's ambiguous-receive no-replay rule.
 - Clearing an old anchor, marker or journal as an operational shortcut.
 - Recovering multiple affected tasks concurrently.
+- Treating arbitrary namespace tools, metadata drift, conversation/prompt
+  references, or file/container/vector-store state as account neutral.

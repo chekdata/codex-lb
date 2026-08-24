@@ -27,10 +27,14 @@ _ACCOUNT_NEUTRAL_REPLAY_OMITTED_ITEM_TYPES = frozenset(
 )
 _INTERNAL_CHAT_MESSAGE_METADATA_FIELD = "internal_chat_message_metadata_passthrough"
 _ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS = frozenset({"turn_id"})
-_ACCOUNT_NEUTRAL_TOOL_TYPES = frozenset({"custom", "function", "web_search", "web_search_preview"})
+_ACCOUNT_NEUTRAL_TOOL_TYPES = frozenset(
+    {"custom", "function", "namespace", "tool_search", "web_search", "web_search_preview"}
+)
 _ACCOUNT_NEUTRAL_TOOL_DECLARATION_FIELDS = {
-    "custom": frozenset({"description", "format", "name", "type"}),
-    "function": frozenset({"description", "name", "parameters", "strict", "type"}),
+    "custom": frozenset({"defer_loading", "description", "format", "name", "type"}),
+    "function": frozenset({"defer_loading", "description", "name", "parameters", "strict", "type"}),
+    "namespace": frozenset({"description", "name", "tools", "type"}),
+    "tool_search": frozenset({"description", "execution", "parameters", "type"}),
     "web_search": frozenset({"filters", "search_context_size", "type", "user_location"}),
     "web_search_preview": frozenset({"filters", "search_context_size", "type", "user_location"}),
 }
@@ -148,6 +152,10 @@ _ACCOUNT_NEUTRAL_REASONING_CONFIG_FIELDS = frozenset({"effort", "summary"})
 _ACCOUNT_NEUTRAL_CLIENT_METADATA_FIELDS = frozenset(
     {
         "ws_request_header_x_openai_internal_codex_responses_lite",
+        "root_turn_id",
+        "session_id",
+        "thread_id",
+        "turn_id",
         "x-codex-installation-id",
         "x-codex-parent-thread-id",
         "x-codex-turn-metadata",
@@ -155,6 +163,36 @@ _ACCOUNT_NEUTRAL_CLIENT_METADATA_FIELDS = frozenset(
         "x-openai-subagent",
     }
 )
+# Codex deliberately omits the potentially large tool namespace inventory
+# from the compatibility header while retaining it in the request body. Keep
+# the header within conventional proxy limits, but permit a bounded body
+# carrier that has already passed the request-size gate and the closed schema
+# validation below.
+_ACCOUNT_NEUTRAL_TURN_METADATA_DIRECT_MAX_BYTES = 16 * 1024
+_ACCOUNT_NEUTRAL_TURN_METADATA_BODY_MAX_BYTES = 1024 * 1024
+_ACCOUNT_NEUTRAL_TURN_METADATA_FIELDS = frozenset(
+    {
+        "agent_name",
+        "auto_review_enabled",
+        "forked_from_thread_id",
+        "installation_id",
+        "node_repl_auto_review_required",
+        "node_repl_disabled",
+        "request_kind",
+        "root_turn_id",
+        "sandbox",
+        "sandbox_mode",
+        "session_id",
+        "thread_id",
+        "thread_source",
+        "tool_namespaces_info",
+        "turn_id",
+        "turn_started_at_unix_ms",
+        "window_id",
+        "workspaces",
+    }
+)
+_ACCOUNT_NEUTRAL_TURN_METADATA_LINEAGE_FIELDS = frozenset({"parent_thread_id", "parent_turn_id", "subagent_kind"})
 _ACCOUNT_SCOPED_HOSTED_INPUT_TYPES = frozenset(
     {
         "code_interpreter_call",
@@ -203,6 +241,17 @@ class AccountNeutralReplayProjection:
     position fail-closed, so projection can never make a non-adjacent
     developer message look canonical.
     """
+
+
+@dataclass(frozen=True, slots=True)
+class AccountNeutralCodexTurnMetadataEvidence:
+    session_identity: str
+    task_identity: str
+    turn_identity: str
+    root_turn_identity: str | None
+    installation_identity: str | None
+    window_identity: str | None
+    shared_projection_fingerprint: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1549,7 +1598,12 @@ def _is_nonblank_string(value: JsonValue | None) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
-def responses_payload_is_account_neutral_fresh_replay(payload: Mapping[str, JsonValue]) -> bool:
+def responses_payload_is_account_neutral_fresh_replay(
+    payload: Mapping[str, JsonValue],
+    *,
+    expected_session_identity: str | None = None,
+    expected_task_identity: str | None = None,
+) -> bool:
     """Return whether a full request can move accounts without stored upstream state."""
 
     if payload.get("conversation") not in (None, ""):
@@ -1566,7 +1620,11 @@ def responses_payload_is_account_neutral_fresh_replay(payload: Mapping[str, Json
         return False
     if not _text_controls_are_account_neutral(payload.get("text")):
         return False
-    if not _client_metadata_is_account_neutral(payload.get("client_metadata")):
+    if not _client_metadata_is_account_neutral(
+        payload.get("client_metadata"),
+        expected_session_identity=expected_session_identity,
+        expected_task_identity=expected_task_identity,
+    ):
         return False
 
     input_value = payload.get("input")
@@ -1640,19 +1698,246 @@ def _text_controls_are_account_neutral(text: JsonValue | None) -> bool:
     )
 
 
-def _client_metadata_is_account_neutral(client_metadata: JsonValue | None) -> bool:
+def _client_metadata_is_account_neutral(
+    client_metadata: JsonValue | None,
+    *,
+    expected_session_identity: str | None,
+    expected_task_identity: str | None,
+) -> bool:
     if client_metadata is None:
         return True
     if not isinstance(client_metadata, dict) or not set(client_metadata) <= _ACCOUNT_NEUTRAL_CLIENT_METADATA_FIELDS:
         return False
-    return (
-        all(_is_nonblank_string(value) for value in client_metadata.values())
-        and client_metadata.get(
+    if not all(_is_nonblank_string(value) for value in client_metadata.values()):
+        return False
+    if "x-codex-parent-thread-id" in client_metadata or "x-openai-subagent" in client_metadata:
+        return False
+    if (
+        client_metadata.get(
             "ws_request_header_x_openai_internal_codex_responses_lite",
             "true",
         )
-        == "true"
+        != "true"
+    ):
+        return False
+    session_id = client_metadata.get("session_id")
+    thread_id = client_metadata.get("thread_id")
+    turn_id = client_metadata.get("turn_id")
+    root_turn_id = client_metadata.get("root_turn_id")
+    if session_id is not None or thread_id is not None or turn_id is not None or root_turn_id is not None:
+        if (
+            expected_session_identity is None
+            or expected_task_identity is None
+            or session_id != expected_session_identity
+            or thread_id != expected_task_identity
+            or not _is_nonblank_string(turn_id)
+            or (root_turn_id is not None and root_turn_id != turn_id)
+        ):
+            return False
+    turn_metadata = client_metadata.get("x-codex-turn-metadata")
+    if turn_metadata is None:
+        return root_turn_id is None and session_id is None and thread_id is None and turn_id is None
+    if session_id is None or thread_id is None or turn_id is None:
+        return False
+    evidence = account_neutral_codex_turn_metadata_identity(
+        turn_metadata,
+        carrier="body",
+        expected_session_identity=expected_session_identity,
+        expected_task_identity=expected_task_identity,
+        expected_turn_identity=cast(str | None, turn_id),
     )
+    if evidence is None:
+        return False
+    return (
+        (root_turn_id is None or evidence.root_turn_identity == root_turn_id)
+        and (
+            "x-codex-installation-id" not in client_metadata
+            or evidence.installation_identity == client_metadata["x-codex-installation-id"]
+        )
+        and (
+            "x-codex-window-id" not in client_metadata
+            or evidence.window_identity == client_metadata["x-codex-window-id"]
+        )
+    )
+
+
+def account_neutral_codex_turn_metadata_identity(
+    raw_turn_metadata: JsonValue,
+    *,
+    carrier: Literal["body", "direct"],
+    expected_session_identity: str | None,
+    expected_task_identity: str | None,
+    expected_turn_identity: str | None,
+) -> AccountNeutralCodexTurnMetadataEvidence | None:
+    """Validate a canonical, root-task Codex 0.149 turn-metadata carrier."""
+
+    max_bytes = (
+        _ACCOUNT_NEUTRAL_TURN_METADATA_BODY_MAX_BYTES
+        if carrier == "body"
+        else _ACCOUNT_NEUTRAL_TURN_METADATA_DIRECT_MAX_BYTES
+    )
+    if (
+        not isinstance(raw_turn_metadata, str)
+        or not raw_turn_metadata.strip()
+        or len(raw_turn_metadata.encode("utf-8")) > max_bytes
+        or expected_session_identity is None
+        or expected_task_identity is None
+    ):
+        return None
+    try:
+        decoded = json.loads(raw_turn_metadata)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not isinstance(decoded, dict)
+        or not set(decoded) <= _ACCOUNT_NEUTRAL_TURN_METADATA_FIELDS
+        or any(field in decoded for field in _ACCOUNT_NEUTRAL_TURN_METADATA_LINEAGE_FIELDS)
+        or _contains_explicit_account_scoped_metadata_state(decoded)
+        or (carrier == "direct" and "tool_namespaces_info" in decoded)
+    ):
+        return None
+
+    session_id = decoded.get("session_id")
+    thread_id = decoded.get("thread_id")
+    turn_id = decoded.get("turn_id")
+    if (
+        session_id != expected_session_identity
+        or thread_id != expected_task_identity
+        or not _is_nonblank_string(turn_id)
+        or (expected_turn_identity is not None and turn_id != expected_turn_identity)
+        or decoded.get("request_kind") != "turn"
+    ):
+        return None
+    for key in ("agent_name", "forked_from_thread_id", "installation_id", "sandbox", "sandbox_mode", "window_id"):
+        if key in decoded and not _is_nonblank_string(decoded[key]):
+            return None
+    root_turn_id = decoded.get("root_turn_id")
+    if root_turn_id is not None and root_turn_id != turn_id:
+        return None
+    if "thread_source" in decoded and not _root_thread_source_is_account_neutral(decoded["thread_source"]):
+        return None
+    for key in ("auto_review_enabled", "node_repl_auto_review_required", "node_repl_disabled"):
+        if key in decoded and not isinstance(decoded[key], bool):
+            return None
+    started_at = decoded.get("turn_started_at_unix_ms")
+    if started_at is not None and (not isinstance(started_at, int) or isinstance(started_at, bool)):
+        return None
+    if "workspaces" in decoded and not _turn_metadata_workspaces_are_account_neutral(decoded["workspaces"]):
+        return None
+    if "tool_namespaces_info" in decoded and not _turn_tool_namespaces_info_is_account_neutral(
+        decoded["tool_namespaces_info"]
+    ):
+        return None
+    shared_projection = dict(decoded)
+    shared_projection.pop("tool_namespaces_info", None)
+    shared_projection_fingerprint = sha256(
+        json.dumps(
+            shared_projection,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return AccountNeutralCodexTurnMetadataEvidence(
+        session_identity=cast(str, session_id),
+        task_identity=cast(str, thread_id),
+        turn_identity=cast(str, turn_id),
+        root_turn_identity=cast(str | None, root_turn_id),
+        installation_identity=cast(str | None, decoded.get("installation_id")),
+        window_identity=cast(str | None, decoded.get("window_id")),
+        shared_projection_fingerprint=shared_projection_fingerprint,
+    )
+
+
+def _root_thread_source_is_account_neutral(value: JsonValue) -> bool:
+    if isinstance(value, str):
+        return value.lower() != "subagent" and bool(value.strip())
+    if not isinstance(value, dict) or len(value) != 1:
+        return False
+    key, nested = next(iter(value.items()))
+    return key.lower() != "subagent" and _is_nonblank_string(nested)
+
+
+def _turn_metadata_workspaces_are_account_neutral(value: JsonValue) -> bool:
+    if not isinstance(value, dict):
+        return False
+    for workspace, metadata in value.items():
+        if (
+            not _is_nonblank_string(workspace)
+            or not isinstance(metadata, dict)
+            or not set(metadata)
+            <= {
+                "associated_remote_urls",
+                "has_changes",
+                "latest_git_commit_hash",
+            }
+        ):
+            return False
+        urls = metadata.get("associated_remote_urls")
+        if urls is not None and not (
+            isinstance(urls, dict)
+            and all(_is_nonblank_string(key) and _is_nonblank_string(url) for key, url in urls.items())
+        ):
+            return False
+        if metadata.get("latest_git_commit_hash") is not None and not _is_nonblank_string(
+            metadata["latest_git_commit_hash"]
+        ):
+            return False
+        if metadata.get("has_changes") is not None and not isinstance(metadata["has_changes"], bool):
+            return False
+    return True
+
+
+def _turn_tool_namespaces_info_is_account_neutral(value: JsonValue) -> bool:
+    if not isinstance(value, dict):
+        return False
+    for effective_name, namespace in value.items():
+        if (
+            not _is_nonblank_string(effective_name)
+            or not isinstance(namespace, dict)
+            or set(namespace) != {"functions", "name"}
+            or not _is_nonblank_string(namespace.get("name"))
+            or not isinstance(namespace.get("functions"), dict)
+            or not namespace.get("functions")
+        ):
+            return False
+        for function_name, function in cast(dict[str, JsonValue], namespace["functions"]).items():
+            if (
+                not _is_nonblank_string(function_name)
+                or not isinstance(function, dict)
+                or set(function) != {"code_mode_name", "deferred", "direct", "name", "source"}
+                or not _is_nonblank_string(function.get("name"))
+                or not isinstance(function.get("direct"), bool)
+                or not isinstance(function.get("deferred"), bool)
+                or (
+                    function.get("code_mode_name") is not None
+                    and not _is_nonblank_string(function.get("code_mode_name"))
+                )
+                or not _turn_tool_source_is_account_neutral(function.get("source"))
+            ):
+                return False
+    return True
+
+
+def _turn_tool_source_is_account_neutral(value: JsonValue | None) -> bool:
+    if not isinstance(value, dict) or value.get("kind") not in {"harness", "mcp"}:
+        return False
+    if value["kind"] == "harness":
+        return set(value) == {"kind"}
+    return set(value) == {"kind", "server_name"} and _is_nonblank_string(value.get("server_name"))
+
+
+def _contains_explicit_account_scoped_metadata_state(value: JsonValue) -> bool:
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            if _mapping_has_account_scoped_reference(current):
+                return True
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+    return False
 
 
 def _tools_are_account_neutral(tools: JsonValue) -> bool:
@@ -1667,11 +1952,37 @@ def _tool_declaration_is_account_neutral(tool: Mapping[str, JsonValue]) -> bool:
         return False
     if any(key not in _ACCOUNT_NEUTRAL_TOOL_DECLARATION_FIELDS[tool_type] for key in tool):
         return False
+    if tool_type == "namespace":
+        nested_tools = tool.get("tools")
+        return (
+            set(tool) == _ACCOUNT_NEUTRAL_TOOL_DECLARATION_FIELDS["namespace"]
+            and _is_nonblank_string(tool.get("name"))
+            and isinstance(tool.get("description"), str)
+            and isinstance(nested_tools, list)
+            and bool(nested_tools)
+            and all(
+                isinstance(nested_tool, dict) and _responses_lite_namespace_tool_is_account_neutral(nested_tool)
+                for nested_tool in nested_tools
+            )
+        )
+    if tool_type == "tool_search":
+        return (
+            set(tool) == _ACCOUNT_NEUTRAL_TOOL_DECLARATION_FIELDS["tool_search"]
+            and tool.get("execution") == "client"
+            and _is_nonblank_string(tool.get("description"))
+            and _responses_lite_tool_search_schema_is_account_neutral(tool.get("parameters"))
+        )
     if _contains_account_scoped_tool_state(tool):
         return False
     if tool_type in {"custom", "function"} and not _is_nonblank_string(tool.get("name")):
         return False
     if tool.get("description") is not None and not isinstance(tool.get("description"), str):
+        return False
+    if (
+        tool_type in {"custom", "function"}
+        and tool.get("defer_loading") is not None
+        and not isinstance(tool.get("defer_loading"), bool)
+    ):
         return False
     if tool_type == "function":
         return (tool.get("parameters") is None or isinstance(tool.get("parameters"), dict)) and (
@@ -1680,6 +1991,73 @@ def _tool_declaration_is_account_neutral(tool: Mapping[str, JsonValue]) -> bool:
     if tool_type == "custom":
         return _custom_tool_format_is_account_neutral(tool.get("format"))
     return _web_search_tool_options_are_account_neutral(tool_type, tool)
+
+
+def _responses_lite_namespace_tool_is_account_neutral(tool: Mapping[str, JsonValue]) -> bool:
+    tool_type = tool.get("type")
+    if tool_type == "function":
+        required_fields = {"description", "name", "parameters", "strict", "type"}
+        if not required_fields <= set(tool) or not set(tool) <= _ACCOUNT_NEUTRAL_TOOL_DECLARATION_FIELDS["function"]:
+            return False
+        return (
+            _is_nonblank_string(tool.get("name"))
+            and isinstance(tool.get("description"), str)
+            and isinstance(tool.get("strict"), bool)
+            and isinstance(tool.get("parameters"), dict)
+            and tool.get("defer_loading", True) is True
+        )
+    if tool_type == "custom":
+        required_fields = {"description", "format", "name", "type"}
+        if not required_fields <= set(tool) or not set(tool) <= _ACCOUNT_NEUTRAL_TOOL_DECLARATION_FIELDS["custom"]:
+            return False
+        return (
+            _is_nonblank_string(tool.get("name"))
+            and isinstance(tool.get("description"), str)
+            and _responses_lite_custom_tool_format_is_account_neutral(tool.get("format"))
+            and tool.get("defer_loading", True) is True
+        )
+    return False
+
+
+def _responses_lite_custom_tool_format_is_account_neutral(format_value: JsonValue | None) -> bool:
+    """Validate the non-null FreeformToolFormat emitted inside a 0.149 namespace."""
+
+    return (
+        isinstance(format_value, dict)
+        and format_value.get("type") == "grammar"
+        and _custom_tool_format_is_account_neutral(format_value)
+    )
+
+
+def _responses_lite_tool_search_schema_is_account_neutral(value: JsonValue | None) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "additionalProperties",
+        "properties",
+        "required",
+        "type",
+    }:
+        return False
+    properties = value.get("properties")
+    if (
+        value.get("type") != "object"
+        or value.get("required") != ["query"]
+        or value.get("additionalProperties") is not False
+        or not isinstance(properties, dict)
+        or set(properties) != {"limit", "query"}
+    ):
+        return False
+    query = properties.get("query")
+    limit = properties.get("limit")
+    return (
+        isinstance(query, dict)
+        and set(query) == {"description", "type"}
+        and query.get("type") == "string"
+        and _is_nonblank_string(query.get("description"))
+        and isinstance(limit, dict)
+        and set(limit) == {"description", "type"}
+        and limit.get("type") == "number"
+        and _is_nonblank_string(limit.get("description"))
+    )
 
 
 def _web_search_tool_options_are_account_neutral(

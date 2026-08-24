@@ -134,6 +134,9 @@ def _contains_transformable_external_image(value: JsonValue) -> bool:
 
 def build_rowless_recovery_capture_facts(
     payload: ResponsesRequest,
+    *,
+    expected_session_identity: str | None = None,
+    expected_task_identity: str | None = None,
 ) -> RowlessRecoveryCaptureFacts | None:
     if not isinstance(payload.input, list) or not payload.input:
         return None
@@ -173,7 +176,11 @@ def build_rowless_recovery_capture_facts(
         self_contained=self_contained,
         account_neutral=(
             self_contained
-            and responses_payload_is_account_neutral_fresh_replay(account_neutral_payload.to_replay_safety_payload())
+            and responses_payload_is_account_neutral_fresh_replay(
+                account_neutral_payload.to_replay_safety_payload(),
+                expected_session_identity=expected_session_identity,
+                expected_task_identity=expected_task_identity,
+            )
         ),
     )
 

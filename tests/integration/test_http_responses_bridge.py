@@ -832,9 +832,12 @@ async def test_rowless_stale_anchor_semantic_rebase_end_to_end(
         "turn_metadata_session_drift",
         "turn_metadata_thread_drift",
         "turn_metadata_header_conflict",
+        "turn_metadata_header_conflict_with_explicit_thread",
+        "turn_metadata_projection_conflict_with_explicit_thread",
         "turn_metadata_malformed",
         "turn_metadata_non_turn",
         "turn_metadata_oversized",
+        "turn_metadata_oversized_with_explicit_thread",
         "turn_metadata_wrong_type",
     ],
 )
@@ -854,9 +857,13 @@ async def test_rowless_child_thread_sharing_root_bridge_identity_fails_closed_wi
     )
     account = await _get_account(account_id)
     upstream = _RejectStalePreviousResponseUpstreamWebSocket("resp_child_stale")
+    selection_count = 0
+    connect_count = 0
 
     async def fake_select_account_with_budget(self, deadline, **kwargs):
+        nonlocal selection_count
         del self, deadline, kwargs
+        selection_count += 1
         return AccountSelection(account=account, error_message=None, error_code=None)
 
     async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
@@ -864,7 +871,9 @@ async def test_rowless_child_thread_sharing_root_bridge_identity_fails_closed_wi
         return target
 
     async def fake_connect_responses_websocket(*args, **kwargs):
+        nonlocal connect_count
         del args, kwargs
+        connect_count += 1
         return upstream
 
     monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
@@ -883,6 +892,12 @@ async def test_rowless_child_thread_sharing_root_bridge_identity_fails_closed_wi
         child_headers["x-openai-subagent"] = "reviewer"
     else:
         child_headers["x-client-request-id"] = root_session
+    if identity_case == "turn_metadata_header_conflict_with_explicit_thread":
+        child_headers["thread-id"] = root_session
+    if identity_case == "turn_metadata_oversized_with_explicit_thread":
+        child_headers["thread-id"] = root_session
+    if identity_case == "turn_metadata_projection_conflict_with_explicit_thread":
+        child_headers["thread-id"] = root_session
     request_json = {
         "model": "gpt-5.1",
         "previous_response_id": "resp_child_stale",
@@ -907,12 +922,59 @@ async def test_rowless_child_thread_sharing_root_bridge_identity_fails_closed_wi
         request_json["client_metadata"] = {"x-codex-turn-metadata": json.dumps({"session_id": child_thread})}
     elif identity_case == "turn_metadata_thread_drift":
         request_json["client_metadata"] = {"x-codex-turn-metadata": json.dumps({"thread_id": child_thread})}
-    elif identity_case == "turn_metadata_header_conflict":
+    elif identity_case in {
+        "turn_metadata_header_conflict",
+        "turn_metadata_header_conflict_with_explicit_thread",
+    }:
         request_json["client_metadata"] = {
-            "x-codex-turn-metadata": json.dumps({"session_id": root_session, "thread_id": root_session})
+            "x-codex-turn-metadata": json.dumps(
+                {
+                    "session_id": root_session,
+                    "thread_id": root_session,
+                    "turn_id": "turn-root",
+                    "request_kind": "turn",
+                }
+            )
         }
         child_headers["x-codex-turn-metadata"] = json.dumps(
-            {"session_id": root_session, "thread_id": child_thread, "parent_thread_id": root_session}
+            {
+                "session_id": root_session,
+                "thread_id": child_thread,
+                "turn_id": "turn-child",
+                "request_kind": "turn",
+                "parent_thread_id": root_session,
+            }
+        )
+    elif identity_case == "turn_metadata_projection_conflict_with_explicit_thread":
+        request_json["client_metadata"] = {
+            "session_id": root_session,
+            "thread_id": root_session,
+            "turn_id": "turn-root",
+            "root_turn_id": "turn-root",
+            "x-codex-installation-id": "installation-body",
+            "x-codex-window-id": "window-body",
+            "x-codex-turn-metadata": json.dumps(
+                {
+                    "installation_id": "installation-body",
+                    "session_id": root_session,
+                    "thread_id": root_session,
+                    "turn_id": "turn-root",
+                    "root_turn_id": "turn-root",
+                    "window_id": "window-body",
+                    "request_kind": "turn",
+                }
+            ),
+        }
+        child_headers["x-codex-turn-metadata"] = json.dumps(
+            {
+                "installation_id": "installation-direct",
+                "session_id": root_session,
+                "thread_id": root_session,
+                "turn_id": "turn-root",
+                "root_turn_id": "turn-root",
+                "window_id": "window-direct",
+                "request_kind": "turn",
+            }
         )
     elif identity_case == "turn_metadata_malformed":
         request_json["client_metadata"] = {"x-codex-turn-metadata": "not-json"}
@@ -920,10 +982,18 @@ async def test_rowless_child_thread_sharing_root_bridge_identity_fails_closed_wi
         request_json["client_metadata"] = {
             "x-codex-turn-metadata": json.dumps({"thread_id": root_session, "request_kind": "compact"})
         }
-    elif identity_case == "turn_metadata_oversized":
-        request_json["client_metadata"] = {
-            "x-codex-turn-metadata": json.dumps({"thread_id": root_session, "padding": "x" * (17 * 1024)})
+    elif identity_case in {"turn_metadata_oversized", "turn_metadata_oversized_with_explicit_thread"}:
+        oversized_metadata = {
+            "session_id": root_session,
+            "thread_id": root_session,
+            "turn_id": "turn-root",
+            "request_kind": "turn",
+            "padding": "x" * (17 * 1024),
         }
+        if identity_case == "turn_metadata_oversized_with_explicit_thread":
+            child_headers["x-codex-turn-metadata"] = json.dumps(oversized_metadata)
+        else:
+            request_json["client_metadata"] = {"x-codex-turn-metadata": json.dumps(oversized_metadata)}
     elif identity_case == "turn_metadata_wrong_type":
         request_json["client_metadata"] = {"x-codex-turn-metadata": 7}
     response = await async_client.post(
@@ -931,6 +1001,20 @@ async def test_rowless_child_thread_sharing_root_bridge_identity_fails_closed_wi
         headers=child_headers,
         json=request_json,
     )
+    if identity_case in {
+        "turn_metadata_header_conflict_with_explicit_thread",
+        "turn_metadata_oversized_with_explicit_thread",
+        "turn_metadata_projection_conflict_with_explicit_thread",
+    }:
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "rowless_recovery_identity_metadata_invalid"
+        assert selection_count == 0
+        assert connect_count == 0
+        assert upstream.sent_text == []
+        async with SessionLocal() as db_session:
+            authorities = list((await db_session.scalars(select(HttpBridgeRowlessRecoveryAuthority))).all())
+        assert authorities == []
+        return
     assert response.status_code == 502
     assert response.json()["error"]["code"] != "previous_response_recovery_authorization_required"
     async with SessionLocal() as db_session:
@@ -943,6 +1027,7 @@ async def test_rowless_child_thread_sharing_root_bridge_identity_fails_closed_wi
     [
         "administrator",
         "administrator_client_request_id_fallback",
+        "administrator_responses_lite_0149",
         "administrator_child_client_request_id",
         "automatic",
         "automatic_legacy_unknown",
@@ -1100,15 +1185,112 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
         )
         if historical_function_call is not None:
             historical_function_call["namespace"] = "collaboration"
+    if resolution_mode == "administrator_responses_lite_0149":
+        mismatched_complete_input = [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "functions",
+                        "description": "",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "lookup",
+                                "description": "Lookup a fixture.",
+                                "strict": False,
+                                "defer_loading": True,
+                                "parameters": {"type": "object", "properties": {}},
+                            }
+                        ],
+                    },
+                    {
+                        "type": "tool_search",
+                        "execution": "client",
+                        "description": "Search deferred tools.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "Search query for deferred tools.",
+                                },
+                                "limit": {
+                                    "type": "number",
+                                    "description": "Maximum number of tools to return. Defaults to 8.",
+                                },
+                            },
+                            "required": ["query"],
+                            "additionalProperties": False,
+                        },
+                    },
+                ],
+            },
+            {"role": "developer", "content": "Use the declared tools."},
+            *mismatched_complete_input,
+        ]
     request = {
         "model": "gpt-5.1",
         "instructions": "Return exactly OK.",
         "prompt_cache_key": task_id,
         "input": mismatched_complete_input,
     }
+    if resolution_mode == "administrator_responses_lite_0149":
+        body_turn_metadata = {
+            "installation_id": "installation-before-account-selection",
+            "session_id": task_id,
+            "thread_id": task_id,
+            "turn_id": "019f-turn-id",
+            "root_turn_id": "019f-turn-id",
+            "window_id": "window-a",
+            "request_kind": "turn",
+            "tool_namespaces_info": {
+                "functions": {
+                    "name": "functions",
+                    "functions": {
+                        f"tool_{index:03d}": {
+                            "name": f"tool_{index:03d}",
+                            "direct": False,
+                            "code_mode_name": None,
+                            "deferred": True,
+                            "source": {"kind": "harness"},
+                        }
+                        for index in range(160)
+                    },
+                }
+            },
+        }
+        body_turn_metadata_json = json.dumps(body_turn_metadata, separators=(",", ":"))
+        assert len(body_turn_metadata_json.encode()) > 16 * 1024
+        request["client_metadata"] = {
+            "session_id": task_id,
+            "thread_id": task_id,
+            "turn_id": "019f-turn-id",
+            "root_turn_id": "019f-turn-id",
+            "x-codex-installation-id": "installation-before-account-selection",
+            "x-codex-window-id": "window-a",
+            "x-codex-turn-metadata": body_turn_metadata_json,
+        }
     recovery_headers = (
         {**headers, "x-codex-turn-state": "turn-state-marker-rowless-capture"} if administrator_mode else headers
     )
+    if resolution_mode == "administrator_responses_lite_0149":
+        recovery_headers["x-codex-installation-id"] = "installation-before-account-selection"
+        recovery_headers["x-codex-window-id"] = "window-a"
+        recovery_headers["x-codex-turn-metadata"] = json.dumps(
+            {
+                "installation_id": "installation-before-account-selection",
+                "session_id": task_id,
+                "thread_id": task_id,
+                "turn_id": "019f-turn-id",
+                "root_turn_id": "019f-turn-id",
+                "window_id": "window-a",
+                "request_kind": "turn",
+            },
+            separators=(",", ":"),
+        )
     if resolution_mode in {
         "administrator_client_request_id_fallback",
         "administrator_child_client_request_id",
@@ -1116,10 +1298,25 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
         recovery_headers.pop("thread-id")
     if resolution_mode == "administrator_client_request_id_fallback":
         request["client_metadata"] = {
-            "x-codex-turn-metadata": json.dumps({"session_id": task_id, "thread_id": task_id, "request_kind": "turn"}),
+            "session_id": task_id,
+            "thread_id": task_id,
+            "turn_id": "turn-fallback",
+            "x-codex-turn-metadata": json.dumps(
+                {
+                    "session_id": task_id,
+                    "thread_id": task_id,
+                    "turn_id": "turn-fallback",
+                    "request_kind": "turn",
+                }
+            ),
         }
         recovery_headers["x-codex-turn-metadata"] = json.dumps(
-            {"session_id": task_id, "thread_id": task_id, "request_kind": "turn"}
+            {
+                "session_id": task_id,
+                "thread_id": task_id,
+                "turn_id": "turn-fallback",
+                "request_kind": "turn",
+            }
         )
     if resolution_mode == "administrator_child_client_request_id":
         recovery_headers["x-client-request-id"] = "child-task"
@@ -1193,6 +1390,7 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
         assert authority is not None
         assert authority.state == HttpBridgeRowlessRecoveryState.CAPTURED
         assert authority.origin_marker_session_id == marker_id
+        assert authority.request_account_neutral
 
     if resolution_mode.startswith("automatic"):
         if resolution_mode.startswith("automatic_legacy_"):
