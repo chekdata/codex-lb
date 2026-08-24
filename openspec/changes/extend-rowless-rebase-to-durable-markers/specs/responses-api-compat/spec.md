@@ -42,6 +42,19 @@ same durable marker generation.
 - **AND** returns the stable authorization-required action
 - **AND** performs no additional account selection, WebSocket connect or upstream send.
 
+#### Scenario: Rowless projection removes only semantics-free Codex transport artifacts
+
+- **GIVEN** a complete client checkpoint whose direct call ledger is fully settled
+- **AND** a tool output contains one exact empty `input_text` transport tail
+- **AND** a canonical response-owned agent delivery contains one readable `input_text`
+  followed by one opaque `encrypted_content` transport sibling
+- **WHEN** the marker-backed rowless authority is captured
+- **THEN** the original item count and full-input fingerprint bind the unchanged client request
+- **AND** the separately fingerprinted rowless projection removes only those exact
+  semantics-free parts while retaining function namespaces and all non-empty output
+- **AND** reordered parts, extra fields, missing readable delivery, or any non-canonical
+  variant remains fail closed before account selection or upstream send.
+
 #### Scenario: Administrator and automatic claims are mutually exclusive
 
 - **GIVEN** one approved administrator authority for an active marker

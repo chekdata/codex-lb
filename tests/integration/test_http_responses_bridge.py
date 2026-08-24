@@ -191,7 +191,7 @@ async def test_rowless_stale_anchor_semantic_rebase_end_to_end(
     process_session_id = task_id
     from tests.unit.test_replay_safety import _rehydrate_sanitized_pending_settlement_shapes
 
-    agent_message_input = _rehydrate_sanitized_pending_settlement_shapes()[incident_shape_index][0]
+    agent_message_input = copy.deepcopy(_rehydrate_sanitized_pending_settlement_shapes()[incident_shape_index][0])
     headers = {
         "session-id": process_session_id,
         "thread-id": task_id,
@@ -715,7 +715,11 @@ async def test_rowless_stale_anchor_semantic_rebase_end_to_end(
         stored_count=len(request["input"]),
     )
     assert expected_projection is not None
-    assert recovered_wire["input"] == expected_projection.input_items
+    expected_rowless_input = replay_safety_module.normalize_responses_input_for_rowless_replay(
+        expected_projection.input_items
+    )
+    assert expected_rowless_input is not None
+    assert recovered_wire["input"] == expected_rowless_input
 
     async with SessionLocal() as db_session:
         authority = await db_session.scalar(select(HttpBridgeRowlessRecoveryAuthority))
@@ -1001,7 +1005,32 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
 
     from tests.unit.test_replay_safety import _rehydrate_sanitized_pending_settlement_shapes
 
-    mismatched_complete_input = _rehydrate_sanitized_pending_settlement_shapes()[1][0]
+    mismatched_complete_input = copy.deepcopy(_rehydrate_sanitized_pending_settlement_shapes()[1][0])
+    if resolution_mode == "administrator":
+        historical_output = next(
+            item
+            for item in mismatched_complete_input
+            if isinstance(item, dict) and item.get("type") in {"custom_tool_call_output", "function_call_output"}
+        )
+        historical_output["output"] = [
+            {"type": "input_text", "text": "settled fixture output"},
+            {"type": "input_text", "text": ""},
+        ]
+        historical_agent = next(
+            item for item in mismatched_complete_input if isinstance(item, dict) and item.get("type") == "agent_message"
+        )
+        historical_agent_content = cast(list[object], historical_agent["content"])
+        historical_agent_content.append({"type": "encrypted_content", "encrypted_content": "opaque-response-state"})
+        historical_function_call = next(
+            (
+                item
+                for item in mismatched_complete_input
+                if isinstance(item, dict) and item.get("type") == "function_call"
+            ),
+            None,
+        )
+        if historical_function_call is not None:
+            historical_function_call["namespace"] = "collaboration"
     request = {
         "model": "gpt-5.1",
         "instructions": "Return exactly OK.",
@@ -1253,6 +1282,14 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
     recovered_wire = json.loads(recovered_upstream.sent_text[0])
     assert "previous_response_id" not in recovered_wire
     assert recovered_wire["input"] != stored_input
+    if resolution_mode == "administrator":
+        assert "encrypted_content" not in json.dumps(recovered_wire["input"])
+        assert all(
+            part != {"type": "input_text", "text": ""}
+            for item in recovered_wire["input"]
+            if isinstance(item, dict) and isinstance(item.get("output"), list)
+            for part in item["output"]
+        )
 
     async with SessionLocal() as db_session:
         authority = await db_session.scalar(select(HttpBridgeRowlessRecoveryAuthority))

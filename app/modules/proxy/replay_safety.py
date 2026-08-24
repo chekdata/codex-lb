@@ -122,7 +122,17 @@ _ACCOUNT_NEUTRAL_INPUT_ITEM_FIELDS = {
         {"call_id", "caller", "id", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD, "output", "status", "type"}
     ),
     "function_call": frozenset(
-        {"arguments", "call_id", "caller", "id", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD, "name", "status", "type"}
+        {
+            "arguments",
+            "call_id",
+            "caller",
+            "id",
+            _INTERNAL_CHAT_MESSAGE_METADATA_FIELD,
+            "name",
+            "namespace",
+            "status",
+            "type",
+        }
     ),
     "function_call_output": frozenset(
         {"call_id", "caller", "id", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD, "output", "status", "type"}
@@ -565,7 +575,8 @@ def responses_input_items_are_self_contained_rowless_replay(
             pending_calls.discard(call_id)
         if item_type != "agent_message":
             continue
-        if pending_calls or not _is_retained_agent_message(item):
+        normalized_agent = _normalized_rowless_agent_message(item)
+        if pending_calls or normalized_agent is None or not _is_retained_agent_message(normalized_agent):
             return False
         agent_indexes.append(index)
         if not any(isinstance(later, dict) and later.get("role") == "user" for later in original_items[index + 1 :]):
@@ -611,6 +622,86 @@ def responses_input_items_are_self_contained_rowless_replay(
         ):
             return False
     return responses_input_items_are_self_contained_fresh_replay(projected_without_agents)
+
+
+def normalize_responses_input_for_rowless_replay(
+    projected_items: list[JsonValue],
+) -> list[JsonValue] | None:
+    """Drop only canonical, semantics-free response transport artifacts.
+
+    Codex can persist an empty ``input_text`` tail in a direct tool output and
+    an opaque ``encrypted_content`` sibling beside the delivered text of an
+    inter-agent message.  Neither item carries replayable conversation
+    semantics.  Keep the original request fingerprint unchanged, but remove
+    those exact shapes from the separately fingerprinted rowless projection.
+    Any drift in fields, ordering, multiplicity, or non-empty text remains
+    fail closed.
+    """
+
+    normalized_items: list[JsonValue] = []
+    for item in projected_items:
+        if not isinstance(item, dict):
+            normalized_items.append(item)
+            continue
+
+        if item.get("type") == "agent_message":
+            normalized = _normalized_rowless_agent_message(item)
+            if normalized is None:
+                return None
+            normalized_items.append(normalized)
+            continue
+
+        item_type = item.get("type")
+        if item_type in _TOOL_CALL_TYPE_BY_OUTPUT_TYPE and isinstance(item.get("output"), list):
+            output = cast(list[JsonValue], item["output"])
+            filtered_output = [part for part in output if not _is_exact_empty_input_text_part(part)]
+            if len(filtered_output) != len(output):
+                if not filtered_output:
+                    return None
+                normalized_item = dict(item)
+                normalized_item["output"] = filtered_output
+                normalized_items.append(normalized_item)
+                continue
+
+        normalized_items.append(item)
+    return normalized_items
+
+
+def _is_exact_empty_input_text_part(part: JsonValue) -> bool:
+    return (
+        isinstance(part, dict)
+        and set(part) == {"text", "type"}
+        and part.get("type") == "input_text"
+        and part.get("text") == ""
+    )
+
+
+def _normalized_rowless_agent_message(item: Mapping[str, JsonValue]) -> dict[str, JsonValue] | None:
+    content = item.get("content")
+    if not isinstance(content, list):
+        return None
+    input_parts = [
+        part
+        for part in content
+        if isinstance(part, dict)
+        and part.get("type") == "input_text"
+        and _input_content_part_is_self_contained(part, allow_output=False)
+    ]
+    encrypted_parts = [
+        part
+        for part in content
+        if isinstance(part, dict)
+        and set(part) == {"encrypted_content", "type"}
+        and part.get("type") == "encrypted_content"
+        and _is_nonblank_string(part.get("encrypted_content"))
+    ]
+    if len(input_parts) != 1 or len(encrypted_parts) > 1 or len(input_parts) + len(encrypted_parts) != len(content):
+        return None
+    if encrypted_parts and content != [input_parts[0], encrypted_parts[0]]:
+        return None
+    normalized = dict(item)
+    normalized["content"] = [input_parts[0]]
+    return normalized
 
 
 def _internal_chat_message_metadata_is_account_neutral(value: JsonValue | None) -> bool:
@@ -1383,7 +1474,11 @@ def _tool_call_is_self_contained(item_type: str, item: Mapping[str, JsonValue]) 
     if item.get("status") not in (None, "completed"):
         return False
     if item_type == "function_call":
-        return _is_nonblank_string(item.get("name")) and isinstance(item.get("arguments"), str)
+        return (
+            _is_nonblank_string(item.get("name"))
+            and isinstance(item.get("arguments"), str)
+            and (item.get("namespace") is None or _is_nonblank_string(item.get("namespace")))
+        )
     if item_type == "custom_tool_call":
         return _is_nonblank_string(item.get("name")) and isinstance(item.get("input"), str)
     operation = item.get("operation")
