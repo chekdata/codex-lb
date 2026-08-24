@@ -2235,6 +2235,59 @@ class _HTTPBridgeUpstreamEventsMixin:
                     alias_registered = True
                 else:
                     alias_registered = False
+            elif matched_request_state.marker_recovery_terminal_settlement_required:
+                marker_session_id = matched_request_state.recovery_attempt_session_id
+                marker_owner_epoch = matched_request_state.recovery_attempt_owner_epoch
+                marker_fingerprint = matched_request_state.recovery_attempt_fingerprint
+                marker_settled = False
+                if (
+                    marker_session_id is not None
+                    and marker_owner_epoch is not None
+                    and marker_fingerprint is not None
+                    and matched_request_state.input_item_count > 0
+                    and matched_request_state.input_full_fingerprint is not None
+                    and completed_pending_tool_call_manifest is not None
+                ):
+                    try:
+                        marker_settled = await self._durable_bridge.settle_marker_recovery_completed(
+                            session_id=marker_session_id,
+                            api_key_id=session.key.api_key_id,
+                            instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+                            owner_epoch=marker_owner_epoch,
+                            account_id=session.account.id,
+                            request_fingerprint=marker_fingerprint,
+                            request_id=matched_request_state.request_id,
+                            response_id=response_id,
+                            input_item_count=matched_request_state.input_item_count,
+                            input_full_fingerprint=matched_request_state.input_full_fingerprint,
+                            pending_tool_calls=completed_pending_tool_call_manifest,
+                            lease_ttl_seconds=_http_bridge_durable_lease_ttl_seconds(),
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to atomically settle durable-marker recovery",
+                            exc_info=True,
+                        )
+                matched_request_state.recovery_attempt_event_observed = True
+                if marker_settled:
+                    live_alias_registered = await self._register_http_bridge_previous_response_id(
+                        session,
+                        response_id,
+                        input_item_count=matched_request_state.input_item_count,
+                        input_full_fingerprint=matched_request_state.input_full_fingerprint,
+                        pending_tool_calls=completed_pending_tool_call_manifest,
+                    )
+                    if not live_alias_registered:
+                        # The durable transaction is authoritative. Retire a
+                        # stale in-memory view, but keep the successful
+                        # completed response available through its durable
+                        # replacement alias on the next request.
+                        session.closed = True
+                        session.upstream_control.reconnect_requested = True
+                        session.upstream_control.retire_after_drain = True
+                    alias_registered = True
+                else:
+                    alias_registered = False
             else:
                 alias_registered = await self._register_http_bridge_previous_response_id(
                     session,
@@ -2251,6 +2304,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                 )
             if not alias_registered and (
                 matched_request_state.rowless_recovery_authority_id is not None
+                or matched_request_state.marker_recovery_terminal_settlement_required
                 or is_http_bridge_account_neutral_replay(
                     kind=session.key.affinity_kind,
                     key=session.key.affinity_key,
@@ -2293,6 +2347,7 @@ class _HTTPBridgeUpstreamEventsMixin:
             and matched_request_state.recovery_attempt_fingerprint is not None
             and recovery_attempt_session_id is not None
             and recovery_attempt_owner_epoch is not None
+            and not matched_request_state.marker_recovery_terminal_settlement_required
             and (event_type == "response.completed" or not matched_request_state.recovery_attempt_event_observed)
         ):
             settlement_marked = False

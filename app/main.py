@@ -802,9 +802,9 @@ async def _ensure_bridge_durable_schema_ready(settings) -> bool:
         return True
     missing = ", ".join(missing_tables)
     if settings.database_migrations_fail_fast:
-        raise RuntimeError(f"HTTP bridge durable schema is missing required tables: {missing}")
+        raise RuntimeError(f"HTTP bridge durable schema is missing required items: {missing}")
     logger.warning(
-        "HTTP bridge durable schema is missing required tables but startup fail-fast is disabled",
+        "HTTP bridge durable schema is missing required items but startup fail-fast is disabled",
         extra={"missing_tables": missing_tables},
     )
     return False

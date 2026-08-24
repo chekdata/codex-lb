@@ -61,6 +61,7 @@ from app.core.utils.request_id import (
     set_request_id,
 )
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
+from app.db.models import HttpBridgeRowlessRecoveryState
 from app.db.session import SessionLocal
 from app.modules.api_keys.service import (
     ApiKeyData,
@@ -1223,6 +1224,7 @@ class _HTTPBridgeRequestSubmitMixin:
                                     "The recovery checkpoint was consumed before dispatch; retry the request.",
                                 ),
                             )
+                    rowless_wire_fingerprint: str | None = None
                     if request_state.rowless_recovery_authority_id is not None:
                         if (
                             request_state.rowless_recovery_generation is None
@@ -1249,6 +1251,16 @@ class _HTTPBridgeRequestSubmitMixin:
                                 model=request_state.model,
                                 task_authority_digest=request_state.rowless_recovery_task_authority_digest,
                             )
+                    async with session.pending_lock:
+                        session.pending_requests.append(request_state)
+                        session.admission_waiter_count = max(0, session.admission_waiter_count - 1)
+                        admission_waiter_registered = False
+                    request_enqueued = True
+                    if rowless_wire_fingerprint is not None:
+                        assert request_state.rowless_recovery_authority_id is not None
+                        assert request_state.rowless_recovery_generation is not None
+                        async with SessionLocal() as rowless_session:
+                            rowless_repository = RowlessRecoveryRepository(rowless_session)
                             send_started = await rowless_repository.mark_dispatch_send_started(
                                 authority_id=request_state.rowless_recovery_authority_id,
                                 generation=request_state.rowless_recovery_generation,
@@ -1263,16 +1275,14 @@ class _HTTPBridgeRequestSubmitMixin:
                                     "The semantic-rebase send fence could not be persisted.",
                                 ),
                             )
-                    async with session.pending_lock:
-                        session.pending_requests.append(request_state)
-                        session.admission_waiter_count = max(0, session.admission_waiter_count - 1)
-                        admission_waiter_registered = False
-                    request_enqueued = True
+                        request_state.rowless_recovery_send_primitive_reached = True
                     upstream_send_started = True
                     try:
                         await _send_http_bridge_request_text_with_archive_id(session, request_state, text_data)
                     except UpstreamWebSocketTransportError as exc:
                         if exc.error_code == UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE:
+                            if request_state.rowless_recovery_authority_id is not None:
+                                request_state.rowless_recovery_first_send_proven_unsent = True
                             _log_http_bridge_event(
                                 "retry_pre_dispatch_closed",
                                 session.key,
@@ -1319,16 +1329,13 @@ class _HTTPBridgeRequestSubmitMixin:
                                     and request_state.rowless_recovery_generation is not None
                                     and request_state.rowless_recovery_wire_fingerprint is not None
                                 ):
-                                    async with SessionLocal() as rowless_session:
-                                        rolled_back_rowless = await RowlessRecoveryRepository(
-                                            rowless_session
-                                        ).rollback_physically_unsent_after_send_marker(
-                                            authority_id=request_state.rowless_recovery_authority_id,
-                                            generation=request_state.rowless_recovery_generation,
-                                            request_id=request_state.request_id,
-                                            wire_request_fingerprint=(request_state.rowless_recovery_wire_fingerprint),
-                                            transport_proof_code=retry_exc.error_code,
-                                        )
+                                    rowless_rollback_task = asyncio.create_task(
+                                        self._rollback_rowless_cancelled_before_fresh_send(request_state)
+                                    )
+                                    (
+                                        rolled_back_rowless,
+                                        rowless_rollback_cancellation,
+                                    ) = await _await_task_deferring_cancellation(rowless_rollback_task)
                                     if not rolled_back_rowless:
                                         raise ProxyResponseError(
                                             502,
@@ -1337,6 +1344,8 @@ class _HTTPBridgeRequestSubmitMixin:
                                                 "The proven-unsent semantic rebase could not be restored safely.",
                                             ),
                                         ) from retry_exc
+                                else:
+                                    rowless_rollback_cancellation = None
                                 if second_pre_dispatch_close and recovery_receipt is not None:
                                     # Both physical sockets rejected the send
                                     # before any bytes were dispatched. The
@@ -1384,6 +1393,8 @@ class _HTTPBridgeRequestSubmitMixin:
                                         ) from retry_exc
                                     if rollback_cancellation is not None:
                                         raise rollback_cancellation
+                                if rowless_rollback_cancellation is not None:
+                                    raise rowless_rollback_cancellation
                                 if retry_exc.error_code == UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE:
                                     session.claim_liveness_settlement()
                                 raise
@@ -1441,6 +1452,30 @@ class _HTTPBridgeRequestSubmitMixin:
                                         ) from exc
                                     if rollback_cancellation is not None:
                                         raise rollback_cancellation
+                                if (
+                                    not request_state.fresh_upstream_send_primitive_reached
+                                    and request_state.rowless_recovery_authority_id is not None
+                                    and request_state.rowless_recovery_generation is not None
+                                    and request_state.rowless_recovery_wire_fingerprint is not None
+                                ):
+                                    async with SessionLocal() as rowless_session:
+                                        rolled_back_rowless = await RowlessRecoveryRepository(
+                                            rowless_session
+                                        ).rollback_physically_unsent_after_send_marker(
+                                            authority_id=request_state.rowless_recovery_authority_id,
+                                            generation=request_state.rowless_recovery_generation,
+                                            request_id=request_state.request_id,
+                                            wire_request_fingerprint=(request_state.rowless_recovery_wire_fingerprint),
+                                            transport_proof_code=UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE,
+                                        )
+                                    if not rolled_back_rowless:
+                                        raise ProxyResponseError(
+                                            502,
+                                            openai_error(
+                                                "bridge_continuity_persistence_failed",
+                                                "The proven-unsent semantic rebase could not be restored safely.",
+                                            ),
+                                        ) from exc
                                 raise
                         else:
                             request_state.recovery_attempt_dispatched = True
@@ -1501,6 +1536,32 @@ class _HTTPBridgeRequestSubmitMixin:
                                     session_id=request_state.session_id,
                                     upstream_error_code="bridge_continuity_persistence_failed",
                                 )
+                    rowless_retry_is_proven_unsent = (
+                        upstream_send_started
+                        and request_state.rowless_recovery_first_send_proven_unsent
+                        and not request_state.fresh_upstream_send_primitive_reached
+                        and request_state.rowless_recovery_authority_id is not None
+                    )
+                    if rowless_retry_is_proven_unsent:
+                        rowless_rollback_task = asyncio.create_task(
+                            self._rollback_rowless_cancelled_before_fresh_send(request_state)
+                        )
+                        try:
+                            rolled_back_rowless, _ = await _await_task_deferring_cancellation(rowless_rollback_task)
+                        except Exception:
+                            rolled_back_rowless = False
+                            logger.warning(
+                                "Failed to roll back cancelled rowless recovery before fresh send",
+                                exc_info=True,
+                            )
+                        if not rolled_back_rowless:
+                            _record_continuity_fail_closed(
+                                surface="http_bridge",
+                                reason="rowless_cancelled_fresh_send_rollback_failed",
+                                previous_response_id=request_state.previous_response_id,
+                                session_id=request_state.session_id,
+                                upstream_error_code="bridge_continuity_persistence_failed",
+                            )
                     raise
         except ProxyResponseError:
             await self._cleanup_http_bridge_submit_interruption(
@@ -1836,6 +1897,7 @@ class _HTTPBridgeRequestSubmitMixin:
         counted_in_queue: bool,
         admission_waiter_registered: bool = False,
     ) -> None:
+        await self._rollback_rowless_preflight_setup_failure_if_unbound(request_state)
         retire_closed_session = False
         async with session.pending_lock:
             if request_enqueued and request_state in session.pending_requests:
@@ -1874,6 +1936,71 @@ class _HTTPBridgeRequestSubmitMixin:
                 ),
             )
         await self._maybe_release_idle_http_bridge_session_lease(session)
+
+    async def _rollback_rowless_preflight_setup_failure_if_unbound(
+        self,
+        request_state: _WebSocketRequestState,
+    ) -> None:
+        authority_id = request_state.rowless_recovery_authority_id
+        generation = request_state.rowless_recovery_generation
+        wire_request_fingerprint = request_state.rowless_recovery_wire_fingerprint
+        if authority_id is None or generation is None or wire_request_fingerprint is None:
+            return
+        if request_state.rowless_recovery_send_primitive_reached:
+            return
+        async with SessionLocal() as rowless_session:
+            repository = RowlessRecoveryRepository(rowless_session)
+            authority = await repository.get(authority_id)
+            if (
+                authority is None
+                or authority.state != HttpBridgeRowlessRecoveryState.UNKNOWN
+                or authority.dispatch_request_id != request_state.request_id
+                or authority.wire_request_fingerprint != wire_request_fingerprint
+            ):
+                return
+            if authority.replacement_session_id is None:
+                if authority.dispatch_send_started_at is not None:
+                    restored = False
+                else:
+                    restored = await repository.rollback_preflight_setup_failure(
+                        authority_id=authority_id,
+                        generation=generation,
+                        request_id=request_state.request_id,
+                        wire_request_fingerprint=wire_request_fingerprint,
+                    )
+            else:
+                restored = await repository.rollback_before_send_primitive(
+                    authority_id=authority_id,
+                    generation=generation,
+                    request_id=request_state.request_id,
+                    wire_request_fingerprint=wire_request_fingerprint,
+                )
+        if not restored:
+            raise ProxyResponseError(
+                502,
+                openai_error(
+                    "bridge_continuity_persistence_failed",
+                    "The unsent semantic-rebase preflight could not be restored safely.",
+                ),
+            )
+
+    async def _rollback_rowless_cancelled_before_fresh_send(
+        self,
+        request_state: _WebSocketRequestState,
+    ) -> bool:
+        authority_id = request_state.rowless_recovery_authority_id
+        generation = request_state.rowless_recovery_generation
+        wire_request_fingerprint = request_state.rowless_recovery_wire_fingerprint
+        if authority_id is None or generation is None or wire_request_fingerprint is None:
+            return False
+        async with SessionLocal() as rowless_session:
+            return await RowlessRecoveryRepository(rowless_session).rollback_physically_unsent_after_send_marker(
+                authority_id=authority_id,
+                generation=generation,
+                request_id=request_state.request_id,
+                wire_request_fingerprint=wire_request_fingerprint,
+                transport_proof_code=UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE,
+            )
 
     async def _ensure_http_bridge_session_stream_lease_locked(
         self: Any,
@@ -2266,6 +2393,7 @@ class _HTTPBridgeRequestSubmitMixin:
                     request_state.previous_response_id = None
                     request_state.proxy_injected_previous_response_id = False
                     request_state.request_text = retry_text_data
+                request_state.rowless_recovery_first_send_proven_unsent = False
                 request_state.fresh_upstream_send_primitive_reached = True
                 await _send_http_bridge_request_text_with_archive_id(session, request_state, retry_text_data)
             _clear_websocket_request_error_overrides(request_state)

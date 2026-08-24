@@ -797,6 +797,14 @@ class _WebSocketRequestState:
     # may roll back a reversible recovery alias; cancellation after this point
     # is ambiguous and must retain the alias/fail closed.
     fresh_upstream_send_primitive_reached: bool = False
+    # Set immediately before the initial rowless semantic-rebase send helper
+    # is invoked. Cleanup may restore the durable attempt only while this is
+    # false; after the helper is entered, cancellation is ambiguous.
+    rowless_recovery_send_primitive_reached: bool = False
+    # True only after the initial rowless send returned the transport's exact
+    # closed-before-send proof. Generic socket-only reconnects must never set
+    # this bit: replay_count alone is not physical non-delivery evidence.
+    rowless_recovery_first_send_proven_unsent: bool = False
     bridge_queue_wait_started_at: float | None = None
     # Monotonic deadline of the original bridge request budget. Retry and
     # recovery paths re-prepare request states with a fresh started_at, so
@@ -892,6 +900,11 @@ class _WebSocketRequestState:
     # claimed recovery journal; an attempted send must remain consumed.
     recovery_attempt_dispatched: bool = False
     recovery_attempt_event_observed: bool = False
+    # True only for the proof-gated automatic recovery of an active durable
+    # rejected-anchor marker. Its response.completed checkpoint must publish
+    # the replacement anchor, alias, marker clear, and recovery journal in one
+    # durable transaction before downstream success is delivered.
+    marker_recovery_terminal_settlement_required: bool = False
     # Responses-Lite model advertised by ``fresh_upstream_request_text``. A
     # fresh replay built from a trusted marker-only frame has the reserved
     # marker stripped, so swapping to the fresh body must also swap this onto

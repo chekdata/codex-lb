@@ -1957,6 +1957,7 @@ class HttpBridgeRowlessRecoveryAuthority(Base):
     settled_direct_call_ledger_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     projected_payload_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     actual_wire_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    origin_marker_session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     settled_direct_call_unresolved_count: Mapped[int] = mapped_column(Integer, nullable=False)
     selected_account_intent: Mapped[str] = mapped_column(String, nullable=False)
     captured_task_identity_hash: Mapped[str] = mapped_column(String(64), nullable=False)

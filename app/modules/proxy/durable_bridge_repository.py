@@ -40,6 +40,9 @@ REQUIRED_DURABLE_BRIDGE_TABLES = (
     "http_bridge_recovery_attempts",
     "http_bridge_rowless_recovery_authorities",
 )
+REQUIRED_DURABLE_BRIDGE_COLUMNS = {
+    "http_bridge_rowless_recovery_authorities": ("origin_marker_session_id",),
+}
 DURABLE_BRIDGE_RETRY_CIRCUIT_STATE_TTL_SECONDS = 3600.0
 _PURGE_CLOSED_BATCH_SIZE = 500
 _SESSION_ID_LOOKUP_CHUNK_SIZE = 500
@@ -1554,6 +1557,88 @@ class DurableBridgeRepository:
             await self._session.commit()
         return DurableBridgeAliasRegistration.REGISTERED
 
+    async def settle_marker_recovery_completed(
+        self,
+        *,
+        session_id: str,
+        api_key_scope: str,
+        instance_id: str,
+        owner_epoch: int,
+        account_id: str,
+        request_fingerprint: str,
+        request_id: str,
+        response_id: str,
+        input_item_count: int,
+        input_full_fingerprint: str,
+        pending_tool_calls: Mapping[str, str],
+        lease_ttl_seconds: float,
+    ) -> bool:
+        """Atomically publish a proof-gated durable-marker recovery checkpoint."""
+
+        async with sqlite_writer_section():
+            marker = await self._session.scalar(
+                select(HttpBridgeSessionRecord)
+                .where(
+                    HttpBridgeSessionRecord.id == session_id,
+                    HttpBridgeSessionRecord.api_key_scope == api_key_scope,
+                    HttpBridgeSessionRecord.owner_instance_id == instance_id,
+                    HttpBridgeSessionRecord.owner_epoch == owner_epoch,
+                    HttpBridgeSessionRecord.account_id == account_id,
+                )
+                .with_for_update()
+            )
+            journal = await self._session.scalar(
+                select(HttpBridgeRecoveryAttemptRecord)
+                .where(
+                    HttpBridgeRecoveryAttemptRecord.session_id == session_id,
+                    HttpBridgeRecoveryAttemptRecord.request_fingerprint == request_fingerprint,
+                    HttpBridgeRecoveryAttemptRecord.request_id == request_id,
+                )
+                .with_for_update()
+            )
+            if (
+                marker is None
+                or marker.latest_response_id is None
+                or marker.recovery_required_anchor_hash != durable_bridge_hash(marker.latest_response_id)
+                or marker.recovery_required_account_id != account_id
+                or marker.recovery_required_attempt_fingerprint != request_fingerprint
+                or journal is None
+                or journal.account_id != account_id
+                or journal.state != HttpBridgeRecoveryAttemptState.UNKNOWN
+                or journal.response_id is not None
+            ):
+                await self._session.rollback()
+                return False
+
+            marker.latest_response_id = response_id
+            marker.latest_input_item_count = input_item_count
+            marker.latest_input_full_fingerprint = input_full_fingerprint
+            marker.latest_pending_tool_calls_json = _encode_pending_tool_calls(
+                response_id,
+                pending_tool_calls,
+            )
+            marker.recovery_required_anchor_hash = None
+            marker.recovery_required_account_id = None
+            marker.recovery_required_attempt_fingerprint = None
+            marker.recovery_required_at = None
+            now = utcnow()
+            marker.last_seen_at = now
+            marker.lease_expires_at = now + timedelta(seconds=max(1.0, lease_ttl_seconds))
+            registered = await self._execute_alias_upsert(
+                session_id=session_id,
+                alias_kind="previous_response_id",
+                alias_value=response_id,
+                api_key_scope=api_key_scope,
+                target_account_neutral_replay=False,
+            )
+            if not registered:
+                await self._session.rollback()
+                return False
+            journal.state = HttpBridgeRecoveryAttemptState.REPLAYED
+            journal.response_id = response_id
+            await self._session.commit()
+            return True
+
     async def register_reversible_turn_state_alias(
         self,
         *,
@@ -1917,7 +2002,25 @@ async def missing_durable_bridge_tables(session: AsyncSession) -> tuple[str, ...
             )
         )
     present = {str(row[0]) for row in result.fetchall()}
-    return tuple(sorted(expected - present))
+    missing = set(expected - present)
+    rowless_table = "http_bridge_rowless_recovery_authorities"
+    if rowless_table in present:
+        if dialect == "sqlite":
+            column_result = await session.execute(text(f"PRAGMA table_info({rowless_table})"))
+            present_columns = {str(row[1]) for row in column_result.fetchall()}
+        else:
+            column_result = await session.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = ANY (current_schemas(false)) "
+                    "AND table_name = 'http_bridge_rowless_recovery_authorities'"
+                )
+            )
+            present_columns = {str(row[0]) for row in column_result.fetchall()}
+        for column in REQUIRED_DURABLE_BRIDGE_COLUMNS[rowless_table]:
+            if column not in present_columns:
+                missing.add(f"{rowless_table}.{column}")
+    return tuple(sorted(missing))
 
 
 _SNAPSHOT_COLUMNS = (

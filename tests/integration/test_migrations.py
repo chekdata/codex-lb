@@ -63,7 +63,8 @@ async def test_rowless_recovery_authority_migration_round_trip(tmp_path):
 
     db_url = f"sqlite+aiosqlite:///{tmp_path / 'rowless-recovery.sqlite'}"
     parent_revision = "20260823_000000_add_http_bridge_recovery_required_marker"
-    revision = "20260824_000000_add_http_bridge_rowless_recovery_authorities"
+    authority_revision = "20260824_000000_add_http_bridge_rowless_recovery_authorities"
+    revision = "20260824_010000_bind_rowless_authority_to_recovery_marker"
     table = "http_bridge_rowless_recovery_authorities"
 
     def schema_state(sync_conn):
@@ -83,7 +84,7 @@ async def test_rowless_recovery_authority_migration_round_trip(tmp_path):
         async with engine.connect() as conn:
             assert not (await conn.run_sync(schema_state))["has_table"]
 
-        await to_thread.run_sync(lambda: run_upgrade(db_url, revision, bootstrap_legacy=False))
+        await to_thread.run_sync(lambda: run_upgrade(db_url, authority_revision, bootstrap_legacy=False))
         async with engine.connect() as conn:
             state = await conn.run_sync(schema_state)
         assert state["has_table"]
@@ -99,6 +100,17 @@ async def test_rowless_recovery_authority_migration_round_trip(tmp_path):
         assert "uq_http_bridge_rowless_recovery_authority" in state["uniques"]
         assert "uq_http_bridge_rowless_recovery_task_contract" in state["uniques"]
         assert "idx_http_bridge_rowless_recovery_state" in state["indexes"]
+        assert "origin_marker_session_id" not in state["columns"]
+
+        await to_thread.run_sync(lambda: run_upgrade(db_url, revision, bootstrap_legacy=False))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(schema_state)
+        assert "origin_marker_session_id" in state["columns"]
+
+        await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), authority_revision))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(schema_state)
+        assert "origin_marker_session_id" not in state["columns"]
 
         await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), parent_revision))
         async with engine.connect() as conn:
@@ -119,13 +131,27 @@ async def test_rowless_recovery_authority_migration_round_trip(tmp_path):
                     "settled_direct_call_unresolved_count,selected_account_intent,"
                     "captured_task_identity_hash,captured_session_identity_hash,"
                     "captured_task_authority_digest,request_self_contained,request_account_neutral,"
-                    "created_at,updated_at) VALUES ("
+                    "origin_marker_session_id,created_at,updated_at) VALUES ("
                     ":id,:scope,'session_header',:hash,:hash,1,:nonce,'consumed',1,"
-                    ":hash,:hash,:hash,:hash,:hash,0,'account-a',:hash,:hash,:hash,1,1,"
+                    ":hash,:hash,:hash,:hash,:hash,0,'account-a',:hash,:hash,:hash,1,1,:origin,"
                     "CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
                 ),
-                {"id": str(uuid4()), "scope": "scope", "hash": "a" * 64, "nonce": "b" * 64},
+                {
+                    "id": str(uuid4()),
+                    "scope": "scope",
+                    "hash": "a" * 64,
+                    "nonce": "b" * 64,
+                    "origin": str(uuid4()),
+                },
             )
+        with pytest.raises(RuntimeError, match="durable marker replay fences exist"):
+            await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), authority_revision))
+        async with engine.connect() as conn:
+            assert "origin_marker_session_id" in (await conn.run_sync(schema_state))["columns"]
+
+        async with engine.begin() as conn:
+            await conn.execute(text(f"UPDATE {table} SET origin_marker_session_id = NULL"))
+        await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), authority_revision))
         with pytest.raises(RuntimeError, match="replay fences exist"):
             await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), parent_revision))
         async with engine.connect() as conn:

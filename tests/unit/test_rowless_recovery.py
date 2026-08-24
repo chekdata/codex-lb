@@ -21,11 +21,12 @@ from app.db.models import (
     AuditLog,
     Base,
     HttpBridgeRecoveryAttemptRecord,
+    HttpBridgeRecoveryAttemptState,
     HttpBridgeRowlessRecoveryAuthority,
     HttpBridgeRowlessRecoveryState,
     HttpBridgeSessionRecord,
 )
-from app.modules.proxy.durable_bridge_repository import DurableBridgeRepository
+from app.modules.proxy.durable_bridge_repository import DurableBridgeRepository, durable_bridge_hash
 from app.modules.proxy.rowless_recovery import (
     ROWLESS_SEMANTIC_REBASE_ACKNOWLEDGEMENT,
     RowlessRecoveryCaptureFacts,
@@ -133,6 +134,8 @@ async def _capture_and_challenge(
     *,
     task_id: str,
     input_count: int,
+    stale_anchor_hash: str | None = None,
+    origin_marker_session_id: str | None = None,
 ) -> tuple[RowlessRecoveryRepository, RowlessRecoveryAuthoritySnapshot, str]:
     repository = RowlessRecoveryRepository(session)
     task_authority_digest = rowless_task_authority_digest(
@@ -145,12 +148,13 @@ async def _capture_and_challenge(
         api_key_scope="key-scope",
         session_key_kind="session_header",
         strong_session_hash=strong_hash,
-        stale_anchor_hash=canonical_json_sha256({"anchor": task_id}),
+        stale_anchor_hash=stale_anchor_hash or canonical_json_sha256({"anchor": task_id}),
         selected_account_intent="account-a",
         task_identity=task_id,
         session_identity=task_id,
         task_authority_digest=task_authority_digest,
         facts=_facts(input_count=input_count),
+        origin_marker_session_id=origin_marker_session_id,
     )
     challenge = await repository.issue_challenge(
         authority_id=captured.id,
@@ -407,6 +411,325 @@ async def test_rowless_dispatch_binds_replacement_session_and_send_started_fence
         assert restored.state == HttpBridgeRowlessRecoveryState.APPROVED
         assert restored.dispatch_send_started_at is None
         assert await session.scalar(select(HttpBridgeRecoveryAttemptRecord)) is None
+
+
+@pytest.mark.asyncio
+async def test_marker_backed_admin_and_automatic_recovery_claims_are_mutually_exclusive(
+    async_session_factory: Callable[[], AsyncSession],
+) -> None:
+    rejected_anchor = "resp-marker-exclusive"
+    task_id = "task-marker-exclusive"
+    task_authority_digest = rowless_task_authority_digest(
+        session_id=task_id,
+        prompt_cache_key=task_id,
+        thread_id=task_id,
+    )
+    strong_hash = rowless_strong_session_hash("task_authority", task_authority_digest)
+    admin_wire_fingerprint = "a" * 64
+    # Use the exact same raw wire fingerprint to cover the prior bug: the
+    # marker's legacy idempotency rule treated equal fingerprints as the same
+    # winner even when one belonged to the admin semantic-rebase authority.
+    automatic_wire_fingerprint = admin_wire_fingerprint
+
+    async with async_session_factory() as session:
+        marker = HttpBridgeSessionRecord(
+            session_key_kind="session_header",
+            session_key_value=task_id,
+            session_key_hash=canonical_json_sha256(task_id),
+            api_key_scope="key-scope",
+            account_id="account-a",
+            owner_instance_id="instance-a",
+            owner_epoch=7,
+            latest_response_id=rejected_anchor,
+            recovery_required_anchor_hash=durable_bridge_hash(rejected_anchor),
+            recovery_required_account_id="account-a",
+            recovery_required_at=datetime.now(timezone.utc),
+        )
+        session.add(marker)
+        await session.commit()
+        marker_id = marker.id
+
+        repository = RowlessRecoveryRepository(session)
+        captured = await repository.capture(
+            api_key_scope="key-scope",
+            session_key_kind="session_header",
+            strong_session_hash=strong_hash,
+            stale_anchor_hash=durable_bridge_hash(rejected_anchor),
+            selected_account_intent="account-a",
+            task_identity=task_id,
+            session_identity=task_id,
+            task_authority_digest=task_authority_digest,
+            facts=_facts(input_count=85),
+            origin_marker_session_id=marker_id,
+        )
+        challenge = await repository.issue_challenge(
+            authority_id=captured.id,
+            generation=captured.generation,
+        )
+        receipt = _receipt(
+            task_id=task_id,
+            strong_session_hash=strong_hash,
+            full_ledger_pairs=93,
+        )
+        approved = await repository.approve(
+            authority_id=captured.id,
+            generation=captured.generation,
+            challenge=challenge.challenge,
+            declared_receipt_sha256=receipt.sha256(),
+            receipt=receipt,
+            acknowledgement=ROWLESS_SEMANTIC_REBASE_ACKNOWLEDGEMENT,
+            approved_actor="dashboard-admin",
+            request_id="approval-request",
+        )
+        assert approved.state == HttpBridgeRowlessRecoveryState.APPROVED
+
+        await repository.claim_dispatch_preflight(
+            authority_id=captured.id,
+            generation=captured.generation,
+            request_id="admin-dispatch",
+            wire_request_fingerprint=admin_wire_fingerprint,
+            task_authority_digest=task_authority_digest,
+        )
+        await session.refresh(marker)
+        assert marker.recovery_required_attempt_fingerprint is not None
+        assert marker.recovery_required_attempt_fingerprint != admin_wire_fingerprint
+        assert not await DurableBridgeRepository(session).claim_recovery_required_attempt(
+            session_id=marker_id,
+            instance_id="instance-a",
+            owner_epoch=7,
+            account_id="account-a",
+            rejected_response_id=rejected_anchor,
+            attempt_fingerprint=automatic_wire_fingerprint,
+        )
+        assert await repository.rollback_preflight_setup_failure(
+            authority_id=captured.id,
+            generation=captured.generation,
+            request_id="admin-dispatch",
+            wire_request_fingerprint=admin_wire_fingerprint,
+        )
+        await session.refresh(marker)
+        assert marker.recovery_required_attempt_fingerprint is None
+
+        await repository.claim_dispatch_preflight(
+            authority_id=captured.id,
+            generation=captured.generation,
+            request_id="admin-journal",
+            wire_request_fingerprint=admin_wire_fingerprint,
+            task_authority_digest=task_authority_digest,
+        )
+        await repository.claim_dispatch(
+            authority_id=captured.id,
+            generation=captured.generation,
+            replacement_session_id=marker_id,
+            request_id="admin-journal",
+            wire_request_fingerprint=admin_wire_fingerprint,
+            model="gpt-5.6",
+            task_authority_digest=task_authority_digest,
+        )
+        assert await repository.rollback_proven_unsent(
+            authority_id=captured.id,
+            generation=captured.generation,
+            request_id="admin-journal",
+            wire_request_fingerprint=admin_wire_fingerprint,
+        )
+        await session.refresh(marker)
+        assert marker.recovery_required_attempt_fingerprint is None
+        assert await session.scalar(select(HttpBridgeRecoveryAttemptRecord)) is None
+
+        await repository.claim_dispatch_preflight(
+            authority_id=captured.id,
+            generation=captured.generation,
+            request_id="admin-cancelled-before-send",
+            wire_request_fingerprint=admin_wire_fingerprint,
+            task_authority_digest=task_authority_digest,
+        )
+        await repository.claim_dispatch(
+            authority_id=captured.id,
+            generation=captured.generation,
+            replacement_session_id=marker_id,
+            request_id="admin-cancelled-before-send",
+            wire_request_fingerprint=admin_wire_fingerprint,
+            model="gpt-5.6",
+            task_authority_digest=task_authority_digest,
+        )
+        assert await repository.mark_dispatch_send_started(
+            authority_id=captured.id,
+            generation=captured.generation,
+            request_id="admin-cancelled-before-send",
+            wire_request_fingerprint=admin_wire_fingerprint,
+        )
+        assert await repository.rollback_before_send_primitive(
+            authority_id=captured.id,
+            generation=captured.generation,
+            request_id="admin-cancelled-before-send",
+            wire_request_fingerprint=admin_wire_fingerprint,
+        )
+        await session.refresh(marker)
+        assert marker.recovery_required_attempt_fingerprint is None
+        assert await session.scalar(select(HttpBridgeRecoveryAttemptRecord)) is None
+
+        await repository.claim_dispatch_preflight(
+            authority_id=captured.id,
+            generation=captured.generation,
+            request_id="admin-send-marker",
+            wire_request_fingerprint=admin_wire_fingerprint,
+            task_authority_digest=task_authority_digest,
+        )
+        await repository.claim_dispatch(
+            authority_id=captured.id,
+            generation=captured.generation,
+            replacement_session_id=marker_id,
+            request_id="admin-send-marker",
+            wire_request_fingerprint=admin_wire_fingerprint,
+            model="gpt-5.6",
+            task_authority_digest=task_authority_digest,
+        )
+        assert await repository.mark_dispatch_send_started(
+            authority_id=captured.id,
+            generation=captured.generation,
+            request_id="admin-send-marker",
+            wire_request_fingerprint=admin_wire_fingerprint,
+        )
+        assert not await repository.rollback_physically_unsent_after_send_marker(
+            authority_id=captured.id,
+            generation=captured.generation,
+            request_id="admin-send-marker",
+            wire_request_fingerprint=admin_wire_fingerprint,
+            transport_proof_code="stream_incomplete",
+        )
+        await session.refresh(marker)
+        assert marker.recovery_required_attempt_fingerprint is not None
+        ambiguous_authority = await repository.get(captured.id)
+        assert ambiguous_authority is not None
+        assert ambiguous_authority.state == HttpBridgeRowlessRecoveryState.UNKNOWN
+        ambiguous_attempt = await session.scalar(select(HttpBridgeRecoveryAttemptRecord))
+        assert ambiguous_attempt is not None
+        assert ambiguous_attempt.state == HttpBridgeRecoveryAttemptState.UNKNOWN
+        assert await repository.rollback_physically_unsent_after_send_marker(
+            authority_id=captured.id,
+            generation=captured.generation,
+            request_id="admin-send-marker",
+            wire_request_fingerprint=admin_wire_fingerprint,
+            transport_proof_code=UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE,
+        )
+        await session.refresh(marker)
+        assert marker.recovery_required_attempt_fingerprint is None
+        assert await session.scalar(select(HttpBridgeRecoveryAttemptRecord)) is None
+
+        assert await DurableBridgeRepository(session).claim_recovery_required_attempt(
+            session_id=marker_id,
+            instance_id="instance-a",
+            owner_epoch=7,
+            account_id="account-a",
+            rejected_response_id=rejected_anchor,
+            attempt_fingerprint=automatic_wire_fingerprint,
+        )
+        with pytest.raises(RowlessRecoveryStateError, match="approved_generation_preflight_fence_rejected"):
+            await repository.claim_dispatch_preflight(
+                authority_id=captured.id,
+                generation=captured.generation,
+                request_id="admin-loser",
+                wire_request_fingerprint=admin_wire_fingerprint,
+                task_authority_digest=task_authority_digest,
+            )
+        await session.refresh(marker)
+        assert marker.recovery_required_attempt_fingerprint == automatic_wire_fingerprint
+
+        await session.delete(marker)
+        await session.commit()
+        with pytest.raises(RowlessRecoveryStateError, match="approved_generation_preflight_fence_rejected"):
+            await repository.claim_dispatch_preflight(
+                authority_id=captured.id,
+                generation=captured.generation,
+                request_id="admin-missing-origin",
+                wire_request_fingerprint=admin_wire_fingerprint,
+                task_authority_digest=task_authority_digest,
+            )
+
+
+@pytest.mark.asyncio
+async def test_marker_admin_and_automatic_claims_have_one_concurrent_winner(
+    async_session_factory: Callable[[], AsyncSession],
+) -> None:
+    rejected_anchor = "resp-marker-concurrent-mixed"
+    task_id = "task-marker-concurrent-mixed"
+    task_authority_digest = rowless_task_authority_digest(
+        session_id=task_id,
+        prompt_cache_key=task_id,
+        thread_id=task_id,
+    )
+    wire_fingerprint = "d" * 64
+    async with async_session_factory() as session:
+        marker = HttpBridgeSessionRecord(
+            session_key_kind="session_header",
+            session_key_value=task_id,
+            session_key_hash=canonical_json_sha256(task_id),
+            api_key_scope="key-scope",
+            account_id="account-a",
+            owner_instance_id="instance-a",
+            owner_epoch=9,
+            latest_response_id=rejected_anchor,
+            recovery_required_anchor_hash=durable_bridge_hash(rejected_anchor),
+            recovery_required_account_id="account-a",
+            recovery_required_at=datetime.now(timezone.utc),
+        )
+        session.add(marker)
+        await session.commit()
+        marker_id = marker.id
+        repository, captured, challenge = await _capture_and_challenge(
+            session,
+            task_id=task_id,
+            input_count=85,
+            stale_anchor_hash=durable_bridge_hash(rejected_anchor),
+            origin_marker_session_id=marker_id,
+        )
+        receipt = _receipt(
+            task_id=task_id,
+            strong_session_hash=captured.strong_session_hash,
+            full_ledger_pairs=93,
+        )
+        await repository.approve(
+            authority_id=captured.id,
+            generation=captured.generation,
+            challenge=challenge,
+            declared_receipt_sha256=receipt.sha256(),
+            receipt=receipt,
+            acknowledgement=ROWLESS_SEMANTIC_REBASE_ACKNOWLEDGEMENT,
+            approved_actor="dashboard-admin",
+            request_id="approval-request",
+        )
+
+    async def claim_admin() -> bool:
+        async with async_session_factory() as session:
+            try:
+                await RowlessRecoveryRepository(session).claim_dispatch_preflight(
+                    authority_id=captured.id,
+                    generation=captured.generation,
+                    request_id="admin-concurrent",
+                    wire_request_fingerprint=wire_fingerprint,
+                    task_authority_digest=task_authority_digest,
+                )
+            except RowlessRecoveryStateError:
+                return False
+            return True
+
+    async def claim_automatic() -> bool:
+        async with async_session_factory() as session:
+            return await DurableBridgeRepository(session).claim_recovery_required_attempt(
+                session_id=marker_id,
+                instance_id="instance-a",
+                owner_epoch=9,
+                account_id="account-a",
+                rejected_response_id=rejected_anchor,
+                attempt_fingerprint=wire_fingerprint,
+            )
+
+    winners = await asyncio.gather(claim_admin(), claim_automatic())
+    assert winners.count(True) == 1
+    async with async_session_factory() as session:
+        marker = await session.get(HttpBridgeSessionRecord, marker_id)
+        assert marker is not None
+        assert marker.recovery_required_attempt_fingerprint is not None
 
 
 @pytest.mark.asyncio
@@ -988,10 +1311,29 @@ async def test_rowless_terminal_persistence_failure_rolls_back_anchor_and_consum
     monkeypatch,
 ) -> None:
     async with async_session_factory() as session:
+        rejected_anchor = "resp-terminal-stale"
+        replacement = HttpBridgeSessionRecord(
+            session_key_kind="session_header",
+            session_key_value="task-terminal-rollback",
+            session_key_hash=canonical_json_sha256("task-terminal-rollback"),
+            api_key_scope="key-scope",
+            account_id="account-a",
+            owner_instance_id="instance-a",
+            owner_epoch=7,
+            latest_response_id=rejected_anchor,
+            recovery_required_anchor_hash=durable_bridge_hash(rejected_anchor),
+            recovery_required_account_id="account-a",
+            recovery_required_at=datetime.now(timezone.utc),
+        )
+        session.add(replacement)
+        await session.commit()
+        replacement_id = replacement.id
         repository, captured, challenge = await _capture_and_challenge(
             session,
             task_id="task-terminal-rollback",
             input_count=85,
+            stale_anchor_hash=durable_bridge_hash(rejected_anchor),
+            origin_marker_session_id=replacement_id,
         )
         receipt = _receipt(
             task_id="task-terminal-rollback",
@@ -1008,18 +1350,6 @@ async def test_rowless_terminal_persistence_failure_rolls_back_anchor_and_consum
             approved_actor="dashboard-admin",
             request_id=None,
         )
-        replacement = HttpBridgeSessionRecord(
-            session_key_kind="session_header",
-            session_key_value="task-terminal-rollback",
-            session_key_hash=canonical_json_sha256("task-terminal-rollback"),
-            api_key_scope="key-scope",
-            account_id="account-a",
-            owner_instance_id="instance-a",
-            owner_epoch=7,
-        )
-        session.add(replacement)
-        await session.commit()
-        replacement_id = replacement.id
         await repository.claim_dispatch_preflight(
             authority_id=captured.id,
             generation=captured.generation,
@@ -1067,7 +1397,10 @@ async def test_rowless_terminal_persistence_failure_rolls_back_anchor_and_consum
         assert stored.state == HttpBridgeRowlessRecoveryState.UNKNOWN
         durable_replacement = await session.get(HttpBridgeSessionRecord, replacement_id)
         assert durable_replacement is not None
-        assert durable_replacement.latest_response_id is None
+        assert durable_replacement.latest_response_id == rejected_anchor
+        assert durable_replacement.recovery_required_anchor_hash == durable_bridge_hash(rejected_anchor)
+        assert durable_replacement.recovery_required_account_id == "account-a"
+        assert durable_replacement.recovery_required_attempt_fingerprint is not None
         attempt = await session.scalar(select(HttpBridgeRecoveryAttemptRecord))
         assert attempt is not None
         assert attempt.state.value == "unknown"
