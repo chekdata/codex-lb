@@ -48,14 +48,40 @@ same durable marker generation.
   `x-codex-turn-state` affinity value
 - **AND** durable lookup resolves that alias to the exact hard session-header,
   account and active recovery marker
-- **AND** the stable session ID, prompt-cache key, thread ID and optional client
-  request ID still identify the same root task without a conflicting alias
+- **AND** the stable session ID and prompt-cache key equal the root task identity
+  supplied by `thread-id` or, when that header is omitted, by
+  `x-client-request-id`
+- **AND** when both identity headers are present they agree, without a
+  conflicting session alias
+- **AND** any metadata thread identity agrees and no header/body parent or
+  subagent signal is present
 - **WHEN** automatic pending-manifest proof fails but the complete request is
   otherwise eligible for marker-backed administrator recovery
 - **THEN** the service captures or consumes the one marker-bound authority
   instead of rejecting the request solely because turn-state affinity is present
 - **AND** no-row recovery, child-thread recovery, unresolved aliases and task-ID
   drift remain fail closed.
+
+#### Scenario: Client request identity cannot promote a child task
+
+- **GIVEN** a child Codex task shares its root session ID and prompt-cache key
+- **AND** `thread-id` is omitted but `x-client-request-id` identifies the child
+- **WHEN** the child submits a marker-backed or missing-row recovery request
+- **THEN** the request remains ineligible because its client request identity
+  differs from the root session and prompt-cache key
+- **AND** no authority, account selection, WebSocket connect or send occurs.
+
+#### Scenario: Metadata is corroboration, not replacement authority
+
+- **GIVEN** `thread-id` is omitted and the client request ID otherwise matches
+  the root session and prompt-cache key
+- **WHEN** client metadata names a different thread or contains a parent/subagent
+  signal
+- **THEN** marker-backed administrator recovery remains locally fail closed
+- **AND** direct-header and body-nested turn metadata are checked independently
+  so conflicts, malformed values, oversized values and non-turn request kinds
+  cannot be hidden by metadata merge precedence
+- **AND** metadata alone can never create a task authority.
 
 #### Scenario: Rowless projection removes only semantics-free Codex transport artifacts
 

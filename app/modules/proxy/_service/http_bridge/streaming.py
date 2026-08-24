@@ -1156,6 +1156,72 @@ async def _registered_turn_state_anchor_lookup(
     return lookup
 
 
+_ROWLESS_TURN_METADATA_MAX_BYTES = 16 * 1024
+
+
+def _rowless_client_fallback_metadata_evidence(
+    *,
+    raw_client_metadata: JsonValue | None,
+    normalized_headers: Mapping[str, str],
+    session_id: str,
+    task_identity: str,
+) -> tuple[bool, bool, bool]:
+    """Validate corroborating Codex metadata for a client-ID fallback."""
+
+    if raw_client_metadata is None:
+        client_metadata: Mapping[str, JsonValue] = {}
+    elif isinstance(raw_client_metadata, Mapping):
+        client_metadata = raw_client_metadata
+    else:
+        return False, False, False
+
+    child_signal = any(
+        key in normalized_headers or key in client_metadata for key in ("x-codex-parent-thread-id", "x-openai-subagent")
+    )
+    metadata_thread_present = False
+
+    for key, expected in (("session_id", session_id), ("thread_id", task_identity)):
+        if key not in client_metadata:
+            continue
+        value = client_metadata[key]
+        if not isinstance(value, str) or not value.strip() or value.strip() != expected:
+            return False, child_signal, metadata_thread_present
+        if key == "thread_id":
+            metadata_thread_present = True
+
+    turn_metadata_carriers: list[JsonValue] = []
+    if "x-codex-turn-metadata" in client_metadata:
+        turn_metadata_carriers.append(client_metadata["x-codex-turn-metadata"])
+    if "x-codex-turn-metadata" in normalized_headers:
+        turn_metadata_carriers.append(normalized_headers["x-codex-turn-metadata"])
+    for raw_turn_metadata in turn_metadata_carriers:
+        if (
+            not isinstance(raw_turn_metadata, str)
+            or not raw_turn_metadata.strip()
+            or len(raw_turn_metadata.encode("utf-8")) > _ROWLESS_TURN_METADATA_MAX_BYTES
+        ):
+            return False, child_signal, metadata_thread_present
+        try:
+            parsed_turn_metadata = json.loads(raw_turn_metadata)
+        except (TypeError, ValueError):
+            return False, child_signal, metadata_thread_present
+        if not isinstance(parsed_turn_metadata, Mapping):
+            return False, child_signal, metadata_thread_present
+        for key, expected in (("session_id", session_id), ("thread_id", task_identity)):
+            if key not in parsed_turn_metadata:
+                continue
+            value = parsed_turn_metadata[key]
+            if not isinstance(value, str) or not value.strip() or value.strip() != expected:
+                return False, child_signal, metadata_thread_present
+            if key == "thread_id":
+                metadata_thread_present = True
+        if "request_kind" in parsed_turn_metadata and parsed_turn_metadata["request_kind"] != "turn":
+            return False, child_signal, metadata_thread_present
+        child_signal = child_signal or any(key in parsed_turn_metadata for key in ("parent_thread_id", "subagent_kind"))
+
+    return True, child_signal, metadata_thread_present
+
+
 class _HTTPBridgeStreamingMixin:
     async def validate_http_bridge_legacy_forward_anchor(
         self: Any,
@@ -1709,7 +1775,7 @@ class _HTTPBridgeStreamingMixin:
         )
         rowless_thread_identity = normalized_ingress_headers.get("thread-id")
         rowless_client_request_identity = normalized_ingress_headers.get("x-client-request-id")
-        rowless_task_identity = (
+        rowless_thread_identity = (
             rowless_thread_identity.strip()
             if isinstance(rowless_thread_identity, str) and rowless_thread_identity.strip()
             else None
@@ -1719,14 +1785,57 @@ class _HTTPBridgeStreamingMixin:
             if isinstance(rowless_client_request_identity, str) and rowless_client_request_identity.strip()
             else None
         )
+        rowless_task_identity = rowless_thread_identity
+        marker_rowless_task_identity = rowless_thread_identity or rowless_client_request_identity
+        rowless_uses_client_identity_fallback = (
+            rowless_thread_identity is None and rowless_client_request_identity is not None
+        )
+        raw_client_metadata = bridge_payload.get("client_metadata")
+        rowless_fallback_metadata_valid = True
+        rowless_metadata_thread_present = False
+        rowless_explicit_child_signal = any(
+            header_name in normalized_ingress_headers
+            or (isinstance(raw_client_metadata, Mapping) and header_name in raw_client_metadata)
+            for header_name in ("x-codex-parent-thread-id", "x-openai-subagent")
+        )
+        if (
+            rowless_uses_client_identity_fallback
+            and official_session_id is not None
+            and marker_rowless_task_identity is not None
+        ):
+            (
+                rowless_fallback_metadata_valid,
+                rowless_explicit_child_signal,
+                rowless_metadata_thread_present,
+            ) = _rowless_client_fallback_metadata_evidence(
+                raw_client_metadata=raw_client_metadata,
+                normalized_headers=normalized_ingress_headers,
+                session_id=official_session_id,
+                task_identity=marker_rowless_task_identity,
+            )
+        rowless_task_identity_sources_consistent = not (
+            rowless_thread_identity is not None
+            and rowless_client_request_identity is not None
+            and rowless_thread_identity != rowless_client_request_identity
+        ) and (not rowless_uses_client_identity_fallback or rowless_fallback_metadata_valid)
         rowless_lookup_identity_eligible = (
             rowless_task_identity is not None
             and official_session_id is not None
             and explicit_prompt_cache_key is not None
             and official_session_id == explicit_prompt_cache_key == rowless_task_identity
         )
+        marker_rowless_lookup_identity_eligible = (
+            marker_rowless_task_identity is not None
+            and rowless_task_identity_sources_consistent
+            and not rowless_explicit_child_signal
+            and official_session_id is not None
+            and explicit_prompt_cache_key is not None
+            and official_session_id == explicit_prompt_cache_key == marker_rowless_task_identity
+        )
         rowless_dispatch_identity_eligible = (
             rowless_lookup_identity_eligible
+            and rowless_task_identity_sources_consistent
+            and not rowless_explicit_child_signal
             and bridge_session_key.strength == "hard"
             and bridge_session_key.affinity_kind == "session_header"
             and incoming_turn_state_header is None
@@ -2046,15 +2155,31 @@ class _HTTPBridgeStreamingMixin:
                 # back to this exact hard session-header marker, so marker-backed
                 # recovery can accept it without weakening rowless/no-row identity.
                 marker_rowless_dispatch_identity_eligible = (
-                    rowless_lookup_identity_eligible
+                    marker_rowless_lookup_identity_eligible
                     and bridge_session_key.strength == "hard"
                     and bridge_session_key.affinity_kind == "session_header"
                     and not conflicting_session_alias
                     and (
                         rowless_client_request_identity is None
-                        or rowless_client_request_identity == rowless_task_identity
+                        or rowless_client_request_identity == marker_rowless_task_identity
                     )
                 )
+                if (
+                    marker_rowless_dispatch_identity_eligible
+                    and not rowless_lookup_identity_eligible
+                    and official_session_id is not None
+                    and explicit_prompt_cache_key is not None
+                    and marker_rowless_task_identity is not None
+                ):
+                    rowless_task_identity = marker_rowless_task_identity
+                    rowless_capture_facts = build_rowless_recovery_capture_facts(untrimmed_effective_payload)
+                    task_authority_digest = rowless_task_authority_digest(
+                        session_id=official_session_id,
+                        prompt_cache_key=explicit_prompt_cache_key,
+                        thread_id=marker_rowless_task_identity,
+                    )
+                    rowless_api_key_scope = durable_bridge_api_key_scope(bridge_session_key.api_key_id)
+                    rowless_strong_hash = rowless_strong_session_hash("task_authority", task_authority_digest)
                 if (
                     task_authority_digest is not None
                     and rowless_api_key_scope is not None
@@ -2155,15 +2280,68 @@ class _HTTPBridgeStreamingMixin:
                             ),
                         )
                 else:
+                    diagnostic_capture_facts = rowless_capture_facts
+                    if (
+                        diagnostic_capture_facts is None
+                        and isinstance(untrimmed_effective_payload.input, list)
+                        and len(untrimmed_effective_payload.input) <= 512
+                    ):
+                        diagnostic_capture_facts = build_rowless_recovery_capture_facts(untrimmed_effective_payload)
+                    capture_facts_present = diagnostic_capture_facts is not None
                     _log_http_bridge_event(
                         "recovery_required_request_rejected",
                         bridge_session_key,
                         account_id=durable_lookup.account_id,
                         model=payload.model,
                         detail=(
-                            "reason=pending_call_resolution_required"
-                            if durable_lookup.latest_pending_tool_calls
-                            else "reason=complete_context_rehydration_required"
+                            (
+                                "reason=pending_call_resolution_required"
+                                if durable_lookup.latest_pending_tool_calls
+                                else "reason=complete_context_rehydration_required"
+                            )
+                            + ",identity_session_present="
+                            + str(official_session_id is not None).lower()
+                            + ",identity_prompt_cache_present="
+                            + str(explicit_prompt_cache_key is not None).lower()
+                            + ",identity_thread_present="
+                            + str(rowless_thread_identity is not None).lower()
+                            + ",identity_client_request_present="
+                            + str(rowless_client_request_identity is not None).lower()
+                            + ",identity_sources_consistent="
+                            + str(rowless_task_identity_sources_consistent).lower()
+                            + ",identity_explicit_child_signal="
+                            + str(rowless_explicit_child_signal).lower()
+                            + ",identity_metadata_thread_present="
+                            + str(rowless_metadata_thread_present).lower()
+                            + ",identity_fallback_metadata_valid="
+                            + str(rowless_fallback_metadata_valid).lower()
+                            + ",identity_turn_state_present="
+                            + str(incoming_turn_state_header is not None).lower()
+                            + ",identity_conflicting_session_alias="
+                            + str(conflicting_session_alias).lower()
+                            + ",identity_lookup_eligible="
+                            + str(rowless_lookup_identity_eligible).lower()
+                            + ",identity_marker_dispatch_eligible="
+                            + str(marker_rowless_dispatch_identity_eligible).lower()
+                            + ",capture_facts_present="
+                            + str(capture_facts_present).lower()
+                            + ",capture_diagnostic_bounded="
+                            + str(
+                                isinstance(untrimmed_effective_payload.input, list)
+                                and len(untrimmed_effective_payload.input) <= 512
+                            ).lower()
+                            + ",capture_unresolved_zero="
+                            + str(
+                                diagnostic_capture_facts is not None and diagnostic_capture_facts.unresolved_count == 0
+                            ).lower()
+                            + ",capture_self_contained="
+                            + str(
+                                diagnostic_capture_facts is not None and diagnostic_capture_facts.self_contained
+                            ).lower()
+                            + ",capture_account_neutral="
+                            + str(
+                                diagnostic_capture_facts is not None and diagnostic_capture_facts.account_neutral
+                            ).lower()
                         ),
                         cache_key_family=bridge_session_key.affinity_kind,
                         model_class=_extract_model_class(payload.model) if payload.model else None,
