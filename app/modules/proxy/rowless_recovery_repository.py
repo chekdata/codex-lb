@@ -305,6 +305,30 @@ class RowlessRecoveryRepository:
         )
         return _snapshot(row) if row is not None else None
 
+    async def lookup_stale_anchor_in_scope(
+        self,
+        *,
+        api_key_scope: str,
+        stale_anchor_hash: str,
+    ) -> RowlessRecoveryAuthoritySnapshot | None:
+        """Resolve an anchor fence even when incoming task headers are incomplete."""
+
+        rows = list(
+            (
+                await self._session.scalars(
+                    select(HttpBridgeRowlessRecoveryAuthority)
+                    .where(
+                        HttpBridgeRowlessRecoveryAuthority.api_key_scope == api_key_scope,
+                        HttpBridgeRowlessRecoveryAuthority.stale_anchor_hash == stale_anchor_hash,
+                    )
+                    .limit(2)
+                )
+            ).all()
+        )
+        if len(rows) > 1:
+            raise RowlessRecoveryStateError("rowless_anchor_authority_ambiguous")
+        return _snapshot(rows[0]) if rows else None
+
     async def lookup_exact_request_contract(
         self,
         *,

@@ -16,6 +16,8 @@ from app.core.clients.proxy import ProxyResponseError
 from app.core.utils.time import utcnow
 from app.db.models import (
     Base,
+    HttpBridgeRecoveryAttemptRecord,
+    HttpBridgeRecoveryAttemptState,
     HttpBridgeSessionAlias,
     HttpBridgeSessionRecord,
     HttpBridgeSessionState,
@@ -33,6 +35,7 @@ from app.modules.proxy.durable_bridge_repository import (
     REQUIRED_DURABLE_BRIDGE_TABLES,
     DurableBridgeAliasRegistration,
     DurableBridgeRepository,
+    durable_bridge_api_key_scope,
     missing_durable_bridge_tables,
 )
 
@@ -323,6 +326,139 @@ async def test_recovery_required_marker_is_owner_anchor_bound_durable_and_termin
     assert replacement.recovery_required_account_id is None
     assert replacement.recovery_required_attempt_fingerprint is None
     assert replacement.recovery_required_at is None
+
+
+@pytest.mark.asyncio
+async def test_marker_terminal_alias_conflict_rolls_back_checkpoint_and_journal(
+    coordinator: DurableBridgeSessionCoordinator,
+    async_session_factory: Callable[[], AsyncSession],
+) -> None:
+    api_key_id = "key-marker-terminal-atomic"
+    marker = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-marker-terminal-atomic",
+        api_key_id=api_key_id,
+        instance_id="instance-a",
+        owner_process_epoch="process-a",
+        lease_ttl_seconds=120.0,
+        account_id="acc-marker-terminal-atomic",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+    assert (
+        await coordinator.register_previous_response_id(
+            session_id=marker.session_id,
+            api_key_id=api_key_id,
+            instance_id="instance-a",
+            owner_epoch=marker.owner_epoch,
+            response_id="resp-marker-terminal-old",
+            lease_ttl_seconds=120.0,
+            input_item_count=4,
+            input_full_fingerprint="a" * 64,
+            pending_tool_calls={"call-a": "custom_tool_call"},
+        )
+        == DurableBridgeAliasRegistration.REGISTERED
+    )
+    assert await coordinator.mark_live_session_recovery_required(
+        session_id=marker.session_id,
+        instance_id="instance-a",
+        owner_epoch=marker.owner_epoch,
+        account_id="acc-marker-terminal-atomic",
+        rejected_response_id="resp-marker-terminal-old",
+    )
+    request_fingerprint = "b" * 64
+    assert await coordinator.claim_live_session_recovery_attempt(
+        session_id=marker.session_id,
+        instance_id="instance-a",
+        owner_epoch=marker.owner_epoch,
+        account_id="acc-marker-terminal-atomic",
+        rejected_response_id="resp-marker-terminal-old",
+        attempt_fingerprint=request_fingerprint,
+    )
+    attempt = await coordinator.record_recovery_attempt(
+        session_id=marker.session_id,
+        api_key_id=api_key_id,
+        instance_id="instance-a",
+        owner_epoch=marker.owner_epoch,
+        request_fingerprint=request_fingerprint,
+        request_id="request-marker-terminal-atomic",
+        account_id="acc-marker-terminal-atomic",
+        model="gpt-5.6-sol",
+        replay_safe=True,
+    )
+    assert attempt is not None
+
+    replay_kind, replay_key = make_http_bridge_account_neutral_replay_key("protected-terminal-alias")
+    protected = await coordinator.claim_live_session(
+        session_key_kind=replay_kind,
+        session_key_value=replay_key,
+        api_key_id=api_key_id,
+        instance_id="instance-b",
+        owner_process_epoch="process-b",
+        lease_ttl_seconds=120.0,
+        account_id="acc-protected-terminal-alias",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+    assert (
+        await coordinator.register_previous_response_id(
+            session_id=protected.session_id,
+            api_key_id=api_key_id,
+            instance_id="instance-b",
+            owner_epoch=protected.owner_epoch,
+            response_id="resp-marker-terminal-new",
+            lease_ttl_seconds=120.0,
+        )
+        == DurableBridgeAliasRegistration.REGISTERED
+    )
+
+    async with async_session_factory() as session:
+        settled = await DurableBridgeRepository(session).settle_marker_recovery_completed(
+            session_id=marker.session_id,
+            api_key_scope=durable_bridge_api_key_scope(api_key_id),
+            instance_id="instance-a",
+            owner_epoch=marker.owner_epoch,
+            account_id="acc-marker-terminal-atomic",
+            request_fingerprint=request_fingerprint,
+            request_id="request-marker-terminal-atomic",
+            response_id="resp-marker-terminal-new",
+            input_item_count=5,
+            input_full_fingerprint="c" * 64,
+            pending_tool_calls={},
+            lease_ttl_seconds=120.0,
+        )
+    assert settled is False
+
+    async with async_session_factory() as session:
+        retained_marker = await session.get(HttpBridgeSessionRecord, marker.session_id)
+        retained_attempt = await session.scalar(
+            select(HttpBridgeRecoveryAttemptRecord).where(
+                HttpBridgeRecoveryAttemptRecord.session_id == marker.session_id,
+                HttpBridgeRecoveryAttemptRecord.request_fingerprint == request_fingerprint,
+            )
+        )
+        protected_alias = await session.scalar(
+            select(HttpBridgeSessionAlias).where(
+                HttpBridgeSessionAlias.alias_kind == "previous_response_id",
+                HttpBridgeSessionAlias.alias_value == "resp-marker-terminal-new",
+            )
+        )
+        assert retained_marker is not None
+        assert retained_marker.latest_response_id == "resp-marker-terminal-old"
+        assert retained_marker.recovery_required_anchor_hash is not None
+        assert retained_marker.recovery_required_account_id == "acc-marker-terminal-atomic"
+        assert retained_marker.recovery_required_attempt_fingerprint == request_fingerprint
+        assert retained_attempt is not None
+        assert retained_attempt.state == HttpBridgeRecoveryAttemptState.UNKNOWN
+        assert retained_attempt.response_id is None
+        assert protected_alias is not None
+        assert protected_alias.session_id == protected.session_id
 
 
 @pytest.mark.asyncio

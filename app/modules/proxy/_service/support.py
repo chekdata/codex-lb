@@ -900,6 +900,11 @@ class _WebSocketRequestState:
     # claimed recovery journal; an attempted send must remain consumed.
     recovery_attempt_dispatched: bool = False
     recovery_attempt_event_observed: bool = False
+    # True only for the proof-gated automatic recovery of an active durable
+    # rejected-anchor marker. Its response.completed checkpoint must publish
+    # the replacement anchor, alias, marker clear, and recovery journal in one
+    # durable transaction before downstream success is delivered.
+    marker_recovery_terminal_settlement_required: bool = False
     # Responses-Lite model advertised by ``fresh_upstream_request_text``. A
     # fresh replay built from a trusted marker-only frame has the reserved
     # marker stripped, so swapping to the fresh body must also swap this onto

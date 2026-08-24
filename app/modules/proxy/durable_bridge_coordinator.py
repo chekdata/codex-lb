@@ -526,6 +526,38 @@ class DurableBridgeSessionCoordinator:
                 response_id=response_id,
             )
 
+    async def settle_marker_recovery_completed(
+        self,
+        *,
+        session_id: str,
+        api_key_id: str | None,
+        instance_id: str,
+        owner_epoch: int,
+        account_id: str,
+        request_fingerprint: str,
+        request_id: str,
+        response_id: str,
+        input_item_count: int,
+        input_full_fingerprint: str,
+        pending_tool_calls: Mapping[str, str],
+        lease_ttl_seconds: float,
+    ) -> bool:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).settle_marker_recovery_completed(
+                session_id=session_id,
+                api_key_scope=durable_bridge_api_key_scope(api_key_id),
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+                account_id=account_id,
+                request_fingerprint=request_fingerprint,
+                request_id=request_id,
+                response_id=response_id,
+                input_item_count=input_item_count,
+                input_full_fingerprint=input_full_fingerprint,
+                pending_tool_calls=pending_tool_calls,
+                lease_ttl_seconds=lease_ttl_seconds,
+            )
+
     async def rollback_recovery_attempt_replayed(
         self,
         *,

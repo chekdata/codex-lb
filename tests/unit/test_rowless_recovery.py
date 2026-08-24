@@ -648,6 +648,91 @@ async def test_marker_backed_admin_and_automatic_recovery_claims_are_mutually_ex
 
 
 @pytest.mark.asyncio
+async def test_marker_admin_and_automatic_claims_have_one_concurrent_winner(
+    async_session_factory: Callable[[], AsyncSession],
+) -> None:
+    rejected_anchor = "resp-marker-concurrent-mixed"
+    task_id = "task-marker-concurrent-mixed"
+    task_authority_digest = rowless_task_authority_digest(
+        session_id=task_id,
+        prompt_cache_key=task_id,
+        thread_id=task_id,
+    )
+    wire_fingerprint = "d" * 64
+    async with async_session_factory() as session:
+        marker = HttpBridgeSessionRecord(
+            session_key_kind="session_header",
+            session_key_value=task_id,
+            session_key_hash=canonical_json_sha256(task_id),
+            api_key_scope="key-scope",
+            account_id="account-a",
+            owner_instance_id="instance-a",
+            owner_epoch=9,
+            latest_response_id=rejected_anchor,
+            recovery_required_anchor_hash=durable_bridge_hash(rejected_anchor),
+            recovery_required_account_id="account-a",
+            recovery_required_at=datetime.now(timezone.utc),
+        )
+        session.add(marker)
+        await session.commit()
+        marker_id = marker.id
+        repository, captured, challenge = await _capture_and_challenge(
+            session,
+            task_id=task_id,
+            input_count=85,
+            stale_anchor_hash=durable_bridge_hash(rejected_anchor),
+            origin_marker_session_id=marker_id,
+        )
+        receipt = _receipt(
+            task_id=task_id,
+            strong_session_hash=captured.strong_session_hash,
+            full_ledger_pairs=93,
+        )
+        await repository.approve(
+            authority_id=captured.id,
+            generation=captured.generation,
+            challenge=challenge,
+            declared_receipt_sha256=receipt.sha256(),
+            receipt=receipt,
+            acknowledgement=ROWLESS_SEMANTIC_REBASE_ACKNOWLEDGEMENT,
+            approved_actor="dashboard-admin",
+            request_id="approval-request",
+        )
+
+    async def claim_admin() -> bool:
+        async with async_session_factory() as session:
+            try:
+                await RowlessRecoveryRepository(session).claim_dispatch_preflight(
+                    authority_id=captured.id,
+                    generation=captured.generation,
+                    request_id="admin-concurrent",
+                    wire_request_fingerprint=wire_fingerprint,
+                    task_authority_digest=task_authority_digest,
+                )
+            except RowlessRecoveryStateError:
+                return False
+            return True
+
+    async def claim_automatic() -> bool:
+        async with async_session_factory() as session:
+            return await DurableBridgeRepository(session).claim_recovery_required_attempt(
+                session_id=marker_id,
+                instance_id="instance-a",
+                owner_epoch=9,
+                account_id="account-a",
+                rejected_response_id=rejected_anchor,
+                attempt_fingerprint=wire_fingerprint,
+            )
+
+    winners = await asyncio.gather(claim_admin(), claim_automatic())
+    assert winners.count(True) == 1
+    async with async_session_factory() as session:
+        marker = await session.get(HttpBridgeSessionRecord, marker_id)
+        assert marker is not None
+        assert marker.recovery_required_attempt_fingerprint is not None
+
+
+@pytest.mark.asyncio
 async def test_rowless_dispatch_can_rollback_only_before_send_started(
     async_session_factory: Callable[[], AsyncSession],
 ) -> None:

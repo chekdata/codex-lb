@@ -92,6 +92,7 @@ _TEST_SYNC_TIMEOUT_SECONDS = 5.0
         ("cancel_during_fresh_reconnect", 1),
         ("socket_reconnect_does_not_prove_ambiguous_send_unsent", 1),
         ("two_closed_before_send", 1),
+        ("cancel_during_two_close_rollback", 1),
         ("fresh_setup_failure_before_send", 1),
         ("ambiguous_post_send", 1),
         ("live_publication_failure", 1),
@@ -132,7 +133,7 @@ async def test_rowless_stale_anchor_semantic_rebase_end_to_end(
         "late_wire_drift",
     }:
         upstreams = [stale_upstream, recovered_upstream]
-    elif recovery_mode == "two_closed_before_send":
+    elif recovery_mode in {"two_closed_before_send", "cancel_during_two_close_rollback"}:
         upstreams = [stale_upstream, *closed_upstreams, recovered_upstream]
     elif recovery_mode in {"fresh_setup_failure_before_send", "cancel_during_fresh_reconnect"}:
         upstreams = [stale_upstream, closed_upstreams[0]]
@@ -566,6 +567,38 @@ async def test_rowless_stale_anchor_semantic_rebase_end_to_end(
             assert consumed.state == HttpBridgeRowlessRecoveryState.CONSUMED
         return
 
+    if recovery_mode == "cancel_during_two_close_rollback":
+        original_rollback = RowlessRecoveryRepository.rollback_physically_unsent_after_send_marker
+        rollback_entered = asyncio.Event()
+        allow_rollback = asyncio.Event()
+
+        async def block_rollback_until_cancelled(repository, **kwargs):
+            rollback_entered.set()
+            await allow_rollback.wait()
+            return await original_rollback(repository, **kwargs)
+
+        monkeypatch.setattr(
+            RowlessRecoveryRepository,
+            "rollback_physically_unsent_after_send_marker",
+            block_rollback_until_cancelled,
+        )
+        recovery_task = asyncio.create_task(async_client.post("/v1/responses", headers=headers, json=request))
+        await asyncio.wait_for(rollback_entered.wait(), timeout=_TEST_SYNC_TIMEOUT_SECONDS)
+        recovery_task.cancel()
+        allow_rollback.set()
+        with pytest.raises(asyncio.CancelledError):
+            await recovery_task
+        assert connect_count == 3
+        assert all(not upstream.sent_text for upstream in closed_upstreams)
+        async with SessionLocal() as db_session:
+            restored = await db_session.get(HttpBridgeRowlessRecoveryAuthority, authority.id)
+            assert restored is not None
+            assert restored.state == HttpBridgeRowlessRecoveryState.APPROVED
+            assert restored.dispatch_send_started_at is None
+            assert restored.replacement_session_id is None
+            assert await db_session.scalar(select(HttpBridgeRecoveryAttemptRecord)) is None
+        return
+
     if recovery_mode == "fresh_setup_failure_before_send":
         proven_unsent = await async_client.post("/v1/responses", headers=headers, json=request)
         assert proven_unsent.status_code == 502, proven_unsent.text
@@ -836,7 +869,18 @@ async def test_rowless_child_thread_sharing_root_bridge_identity_fails_closed_wi
     assert authorities == []
 
 
-@pytest.mark.parametrize("resolution_mode", ["administrator", "automatic"])
+@pytest.mark.parametrize(
+    "resolution_mode",
+    [
+        "administrator",
+        "automatic",
+        "automatic_legacy_unknown",
+        "automatic_legacy_consumed",
+        "automatic_legacy_unknown_missing_thread",
+        "automatic_legacy_consumed_missing_thread",
+        "automatic_terminal_persistence_failure",
+    ],
+)
 @pytest.mark.asyncio
 async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_without_clearing_fence(
     async_client,
@@ -1003,7 +1047,47 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
         assert authority.state == HttpBridgeRowlessRecoveryState.CAPTURED
         assert authority.origin_marker_session_id == marker_id
 
-    if resolution_mode == "automatic":
+    if resolution_mode.startswith("automatic"):
+        if resolution_mode.startswith("automatic_legacy_"):
+            async with SessionLocal() as db_session:
+                legacy_authority = await db_session.get(HttpBridgeRowlessRecoveryAuthority, authority.id)
+                assert legacy_authority is not None
+                legacy_authority.origin_marker_session_id = None
+                if "unknown" in resolution_mode:
+                    legacy_authority.state = HttpBridgeRowlessRecoveryState.UNKNOWN
+                    legacy_authority.replacement_session_id = marker_id
+                    legacy_authority.dispatch_request_id = "legacy-rowless-unknown"
+                    legacy_authority.wire_request_fingerprint = legacy_authority.actual_wire_fingerprint
+                    legacy_authority.dispatch_send_started_at = utcnow()
+                    db_session.add(
+                        HttpBridgeRecoveryAttemptRecord(
+                            session_id=marker_id,
+                            request_fingerprint=legacy_authority.actual_wire_fingerprint,
+                            request_id="legacy-rowless-unknown",
+                            account_id=account.id,
+                            model="gpt-5.1",
+                            replay_safe=False,
+                            state=HttpBridgeRecoveryAttemptState.UNKNOWN,
+                        )
+                    )
+                else:
+                    legacy_authority.state = HttpBridgeRowlessRecoveryState.CONSUMED
+                    legacy_authority.consumed_response_id_hash = "c" * 64
+                    legacy_authority.consumed_at = utcnow()
+                await db_session.commit()
+
+        if resolution_mode == "automatic_terminal_persistence_failure":
+
+            async def fail_marker_terminal_settlement(*args, **kwargs):
+                del args, kwargs
+                raise RuntimeError("injected marker terminal persistence failure")
+
+            monkeypatch.setattr(
+                type(service._durable_bridge),
+                "settle_marker_recovery_completed",
+                fail_marker_terminal_settlement,
+            )
+
         automatic_full_resend = [
             *stored_input,
             {
@@ -1025,9 +1109,12 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
                 "output": "verified pending-call settlement",
             },
         ]
+        automatic_headers = dict(headers)
+        if resolution_mode.endswith("_missing_thread"):
+            automatic_headers.pop("thread-id")
         automatic_recovery = await async_client.post(
             "/v1/responses",
-            headers=headers,
+            headers=automatic_headers,
             json={
                 "model": "gpt-5.1",
                 "instructions": "Return exactly OK.",
@@ -1036,6 +1123,50 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
                 "input": automatic_full_resend,
             },
         )
+        if resolution_mode.startswith("automatic_legacy_"):
+            assert automatic_recovery.status_code == 400, automatic_recovery.text
+            expected_code = (
+                "rowless_recovery_dispatch_outcome_unknown"
+                if "unknown" in resolution_mode
+                else "rowless_recovery_already_consumed"
+            )
+            assert automatic_recovery.json()["error"]["code"] == expected_code
+            assert connect_count == 2
+            assert selection_count == selection_count_after_marker
+            assert not recovered_upstream.sent_text
+            async with SessionLocal() as db_session:
+                marker = await db_session.get(HttpBridgeSessionRecord, marker_id)
+                assert marker is not None
+                assert marker.recovery_required_attempt_fingerprint is None
+            return
+        if resolution_mode == "automatic_terminal_persistence_failure":
+            assert automatic_recovery.status_code == 502, automatic_recovery.text
+            assert automatic_recovery.json()["error"]["code"] == "bridge_continuity_persistence_failed"
+            assert connect_count == 3
+            assert len(recovered_upstream.sent_text) == 1
+            async with SessionLocal() as db_session:
+                marker = await db_session.get(HttpBridgeSessionRecord, marker_id)
+                assert marker is not None
+                assert marker.latest_response_id == "resp_bridge_custom_1"
+                assert marker.recovery_required_anchor_hash is not None
+                assert marker.recovery_required_attempt_fingerprint is not None
+                attempt = await db_session.scalar(
+                    select(HttpBridgeRecoveryAttemptRecord).where(
+                        HttpBridgeRecoveryAttemptRecord.session_id == marker_id,
+                        HttpBridgeRecoveryAttemptRecord.request_id.is_not(None),
+                    )
+                )
+                assert attempt is not None
+                assert attempt.state == HttpBridgeRecoveryAttemptState.UNKNOWN
+                assert attempt.response_id is None
+                replacement_alias = await db_session.scalar(
+                    select(HttpBridgeSessionAlias).where(
+                        HttpBridgeSessionAlias.alias_kind == "previous_response_id",
+                        HttpBridgeSessionAlias.alias_value == "resp_marker_rowless_recovered",
+                    )
+                )
+                assert replacement_alias is None
+            return
         assert automatic_recovery.status_code == 200, automatic_recovery.text
         assert connect_count == 3
         assert selection_count == selection_count_after_marker + 1

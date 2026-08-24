@@ -2,8 +2,16 @@
 
 ## Authority and precedence
 
-The existing automatic durable-marker proof remains the first recovery path.
-Only when that proof fails may the service look up or capture an administrator
+The existing automatic durable-marker proof remains the first recovery path,
+but it does not erase an earlier at-most-once decision. Before claiming the
+marker, the service resolves any rowless authority for the same task/anchor or
+exact request contract. Automatic proof may supersede only CAPTURED or
+not-yet-dispatched APPROVED authority bound to the exact current marker. A
+pre-marker or different-marker UNKNOWN/CONSUMED tombstone remains fail-closed.
+The conflict lookup is bound to API-key scope plus the rejected anchor and is
+therefore independent of optional incoming routing headers such as `thread-id`;
+those headers remain mandatory for creating or dispatching administrator authority.
+Only when automatic proof fails may the service capture an administrator
 authority. Capture locks the origin `http_bridge_sessions` row and verifies its
 exact API-key scope, account, recovery-required account, latest response hash,
 marker anchor hash and empty marker-attempt claim. The new authority stores the
@@ -56,11 +64,14 @@ the administrator authority.
 
 ## Terminal and rollback floor
 
-`response.completed` locks authority, origin marker and UNKNOWN journal, then
-atomically publishes the new response anchor, full client checkpoint, response
-alias, REPLAYED journal and CONSUMED authority while clearing all marker fields.
-A persistence failure leaves the old anchor, marker claim, UNKNOWN journal and
-authority intact.
+For administrator recovery, `response.completed` locks authority, origin marker
+and UNKNOWN journal, then atomically publishes the new response anchor, full
+client checkpoint, response alias, REPLAYED journal and CONSUMED authority while
+clearing all marker fields. Automatic recovery uses an equivalent transaction
+over the exact owner/marker/journal generation, without an administrator
+authority state transition. A persistence failure in either path is converted
+to a terminal error before downstream success is delivered and leaves the old
+anchor, marker claim and UNKNOWN journal intact.
 
 Startup schema readiness requires
 `http_bridge_rowless_recovery_authorities.origin_marker_session_id`, not merely

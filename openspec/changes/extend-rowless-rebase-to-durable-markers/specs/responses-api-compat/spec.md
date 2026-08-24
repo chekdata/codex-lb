@@ -13,9 +13,23 @@ same durable marker generation.
 
 - **GIVEN** an active durable recovery marker and a complete resend that exactly
   settles its stored prefix and pending manifest
+- **AND** no earlier rowless UNKNOWN or CONSUMED tombstone fences the same task turn
 - **WHEN** the request is evaluated
 - **THEN** the existing automatic proof path claims the marker generation
 - **AND** no administrator authority is required or dispatched.
+
+#### Scenario: Automatic proof preserves earlier rowless no-replay tombstones
+
+- **GIVEN** an active durable recovery marker and an exact automatic full-resend proof
+- **AND** a pre-marker or different-marker rowless UNKNOWN or CONSUMED authority
+  already fences the same task turn
+- **WHEN** the automatic request is evaluated
+- **THEN** it terminates locally before account selection, WebSocket connect or send
+- **AND** the lookup remains enforced when `thread-id` or other dispatch-only
+  routing identity is missing but API scope and rejected anchor still identify the fence
+- **AND** the earlier no-replay authority is not superseded by the current marker claim
+- **AND** only CAPTURED or not-yet-dispatched APPROVED authority bound to the exact
+  current marker may be superseded by the automatic proof.
 
 #### Scenario: Mismatched pending evidence captures without upstream work
 
@@ -74,6 +88,16 @@ same durable marker generation.
   CONSUMED authority become visible together
 - **AND** the recovery marker and marker attempt claim are cleared together
 - **AND** any persistence failure leaves the old generation fail-closed.
+
+#### Scenario: Automatic terminal completion is also one durable transaction
+
+- **GIVEN** the automatic exact-proof path has claimed and dispatched one marker generation
+- **WHEN** it reaches `response.completed`
+- **THEN** the new anchor, alias, complete client checkpoint and REPLAYED journal
+  become visible in the same transaction that clears every marker field
+- **AND** a transaction failure is returned as a terminal persistence error before
+  downstream success is delivered
+- **AND** the old anchor, marker claim and UNKNOWN journal remain intact.
 
 #### Scenario: Schema and rollback capability preserve replay fences
 

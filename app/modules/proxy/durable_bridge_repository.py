@@ -1557,6 +1557,88 @@ class DurableBridgeRepository:
             await self._session.commit()
         return DurableBridgeAliasRegistration.REGISTERED
 
+    async def settle_marker_recovery_completed(
+        self,
+        *,
+        session_id: str,
+        api_key_scope: str,
+        instance_id: str,
+        owner_epoch: int,
+        account_id: str,
+        request_fingerprint: str,
+        request_id: str,
+        response_id: str,
+        input_item_count: int,
+        input_full_fingerprint: str,
+        pending_tool_calls: Mapping[str, str],
+        lease_ttl_seconds: float,
+    ) -> bool:
+        """Atomically publish a proof-gated durable-marker recovery checkpoint."""
+
+        async with sqlite_writer_section():
+            marker = await self._session.scalar(
+                select(HttpBridgeSessionRecord)
+                .where(
+                    HttpBridgeSessionRecord.id == session_id,
+                    HttpBridgeSessionRecord.api_key_scope == api_key_scope,
+                    HttpBridgeSessionRecord.owner_instance_id == instance_id,
+                    HttpBridgeSessionRecord.owner_epoch == owner_epoch,
+                    HttpBridgeSessionRecord.account_id == account_id,
+                )
+                .with_for_update()
+            )
+            journal = await self._session.scalar(
+                select(HttpBridgeRecoveryAttemptRecord)
+                .where(
+                    HttpBridgeRecoveryAttemptRecord.session_id == session_id,
+                    HttpBridgeRecoveryAttemptRecord.request_fingerprint == request_fingerprint,
+                    HttpBridgeRecoveryAttemptRecord.request_id == request_id,
+                )
+                .with_for_update()
+            )
+            if (
+                marker is None
+                or marker.latest_response_id is None
+                or marker.recovery_required_anchor_hash != durable_bridge_hash(marker.latest_response_id)
+                or marker.recovery_required_account_id != account_id
+                or marker.recovery_required_attempt_fingerprint != request_fingerprint
+                or journal is None
+                or journal.account_id != account_id
+                or journal.state != HttpBridgeRecoveryAttemptState.UNKNOWN
+                or journal.response_id is not None
+            ):
+                await self._session.rollback()
+                return False
+
+            marker.latest_response_id = response_id
+            marker.latest_input_item_count = input_item_count
+            marker.latest_input_full_fingerprint = input_full_fingerprint
+            marker.latest_pending_tool_calls_json = _encode_pending_tool_calls(
+                response_id,
+                pending_tool_calls,
+            )
+            marker.recovery_required_anchor_hash = None
+            marker.recovery_required_account_id = None
+            marker.recovery_required_attempt_fingerprint = None
+            marker.recovery_required_at = None
+            now = utcnow()
+            marker.last_seen_at = now
+            marker.lease_expires_at = now + timedelta(seconds=max(1.0, lease_ttl_seconds))
+            registered = await self._execute_alias_upsert(
+                session_id=session_id,
+                alias_kind="previous_response_id",
+                alias_value=response_id,
+                api_key_scope=api_key_scope,
+                target_account_neutral_replay=False,
+            )
+            if not registered:
+                await self._session.rollback()
+                return False
+            journal.state = HttpBridgeRecoveryAttemptState.REPLAYED
+            journal.response_id = response_id
+            await self._session.commit()
+            return True
+
     async def register_reversible_turn_state_alias(
         self,
         *,

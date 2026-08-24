@@ -1329,16 +1329,13 @@ class _HTTPBridgeRequestSubmitMixin:
                                     and request_state.rowless_recovery_generation is not None
                                     and request_state.rowless_recovery_wire_fingerprint is not None
                                 ):
-                                    async with SessionLocal() as rowless_session:
-                                        rolled_back_rowless = await RowlessRecoveryRepository(
-                                            rowless_session
-                                        ).rollback_physically_unsent_after_send_marker(
-                                            authority_id=request_state.rowless_recovery_authority_id,
-                                            generation=request_state.rowless_recovery_generation,
-                                            request_id=request_state.request_id,
-                                            wire_request_fingerprint=(request_state.rowless_recovery_wire_fingerprint),
-                                            transport_proof_code=retry_exc.error_code,
-                                        )
+                                    rowless_rollback_task = asyncio.create_task(
+                                        self._rollback_rowless_cancelled_before_fresh_send(request_state)
+                                    )
+                                    (
+                                        rolled_back_rowless,
+                                        rowless_rollback_cancellation,
+                                    ) = await _await_task_deferring_cancellation(rowless_rollback_task)
                                     if not rolled_back_rowless:
                                         raise ProxyResponseError(
                                             502,
@@ -1347,6 +1344,8 @@ class _HTTPBridgeRequestSubmitMixin:
                                                 "The proven-unsent semantic rebase could not be restored safely.",
                                             ),
                                         ) from retry_exc
+                                else:
+                                    rowless_rollback_cancellation = None
                                 if second_pre_dispatch_close and recovery_receipt is not None:
                                     # Both physical sockets rejected the send
                                     # before any bytes were dispatched. The
@@ -1394,6 +1393,8 @@ class _HTTPBridgeRequestSubmitMixin:
                                         ) from retry_exc
                                     if rollback_cancellation is not None:
                                         raise rollback_cancellation
+                                if rowless_rollback_cancellation is not None:
+                                    raise rowless_rollback_cancellation
                                 if retry_exc.error_code == UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE:
                                     session.claim_liveness_settlement()
                                 raise

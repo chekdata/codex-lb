@@ -1759,6 +1759,7 @@ class _HTTPBridgeStreamingMixin:
             else None
         )
         rowless_authority = None
+        automatic_marker_supersedes_rowless_authority = False
         payload_looks_like_full_resend = _http_bridge_payload_looks_like_full_resend(payload)
         # Set when the quarantine check below suppresses the durable-anchor
         # injection for a full-resend payload; the session hydration and the
@@ -2206,6 +2207,104 @@ class _HTTPBridgeStreamingMixin:
                         update={"input": abandoned_projection.input_items}
                     )
                     durable_marker_abandoned_pending_replay = True
+                if durable_lookup.latest_response_id is not None:
+                    try:
+                        async with SessionLocal() as rowless_session:
+                            rowless_repository = RowlessRecoveryRepository(rowless_session)
+                            rowless_authority = await rowless_repository.lookup_stale_anchor_in_scope(
+                                api_key_scope=durable_lookup.api_key_scope,
+                                stale_anchor_hash=durable_bridge_hash(durable_lookup.latest_response_id),
+                            )
+                            if (
+                                rowless_authority is None
+                                and rowless_api_key_scope is not None
+                                and rowless_strong_hash is not None
+                                and rowless_capture_facts is not None
+                            ):
+                                rowless_authority = await rowless_repository.lookup_exact_request_contract(
+                                    api_key_scope=rowless_api_key_scope,
+                                    strong_session_hash=rowless_strong_hash,
+                                    facts=rowless_capture_facts,
+                                )
+                    except RowlessRecoveryStateError as exc:
+                        raise ProxyResponseError(
+                            400,
+                            openai_error(
+                                "rowless_recovery_authority_ambiguous",
+                                "Multiple semantic-rebase authorities match this exact turn; dispatch is unsafe.",
+                                error_type="invalid_request_error",
+                            ),
+                        ) from exc
+                if rowless_authority is not None:
+                    if (
+                        task_authority_digest is not None
+                        and rowless_authority.captured_task_authority_digest != task_authority_digest
+                    ):
+                        raise ProxyResponseError(
+                            400,
+                            openai_error(
+                                "rowless_recovery_task_identity_mismatch",
+                                "The approved semantic rebase belongs to a different Codex task.",
+                                error_type="invalid_request_error",
+                            ),
+                        )
+                    if (
+                        rowless_authority.origin_marker_session_id == durable_lookup.session_id
+                        and rowless_authority.selected_account_intent != durable_lookup.account_id
+                    ):
+                        raise ProxyResponseError(
+                            400,
+                            openai_error(
+                                "rowless_recovery_pinned_account_changed",
+                                "The durable marker account changed; the semantic rebase remains unsent.",
+                                error_type="invalid_request_error",
+                            ),
+                        )
+                    automatic_marker_supersedes_rowless_authority = bool(
+                        rowless_authority.origin_marker_session_id == durable_lookup.session_id
+                        and rowless_authority.selected_account_intent == durable_lookup.account_id
+                        and rowless_authority.state
+                        in {
+                            HttpBridgeRowlessRecoveryState.CAPTURED,
+                            HttpBridgeRowlessRecoveryState.APPROVED,
+                        }
+                    )
+                    if not automatic_marker_supersedes_rowless_authority:
+                        if rowless_authority.state == HttpBridgeRowlessRecoveryState.CAPTURED:
+                            envelope = openai_error(
+                                "previous_response_recovery_authorization_required",
+                                "A dashboard administrator must approve this same-turn semantic rebase.",
+                                error_type="invalid_request_error",
+                            )
+                            envelope["error"]["action"] = "retry_same_turn_after_admin_approval"
+                            raise ProxyResponseError(400, envelope)
+                        if rowless_authority.state == HttpBridgeRowlessRecoveryState.UNKNOWN:
+                            raise ProxyResponseError(
+                                400,
+                                openai_error(
+                                    "rowless_recovery_dispatch_outcome_unknown",
+                                    "The semantic-rebase dispatch outcome is unknown and cannot be replayed.",
+                                    error_type="invalid_request_error",
+                                ),
+                            )
+                        if rowless_authority.state == HttpBridgeRowlessRecoveryState.CONSUMED:
+                            raise ProxyResponseError(
+                                400,
+                                openai_error(
+                                    "rowless_recovery_already_consumed",
+                                    "This stale semantic-rebase turn was already consumed; "
+                                    "continue from its new checkpoint.",
+                                    error_type="invalid_request_error",
+                                ),
+                            )
+                        raise ProxyResponseError(
+                            400,
+                            openai_error(
+                                "rowless_recovery_marker_origin_mismatch",
+                                "The approved semantic rebase belongs to a different durable marker.",
+                                error_type="invalid_request_error",
+                            ),
+                        )
                 durable_marker_verified_recovery = True
                 _marker_request_state, marker_request_text = prepare_bridge_request(effective_payload)
                 del _marker_request_state
@@ -2412,12 +2511,7 @@ class _HTTPBridgeStreamingMixin:
                 session_identity=official_session_id,
                 facts=rowless_capture_facts,
             )
-        if (
-            not durable_marker_verified_recovery
-            and task_authority_digest is not None
-            and rowless_api_key_scope is not None
-            and rowless_strong_hash is not None
-        ):
+        if task_authority_digest is not None and rowless_api_key_scope is not None and rowless_strong_hash is not None:
             if rowless_authority is None:
                 async with SessionLocal() as rowless_session:
                     rowless_repository = RowlessRecoveryRepository(rowless_session)
@@ -2443,7 +2537,7 @@ class _HTTPBridgeStreamingMixin:
                                     error_type="invalid_request_error",
                                 ),
                             ) from exc
-            if rowless_authority is not None:
+            if rowless_authority is not None and not automatic_marker_supersedes_rowless_authority:
                 if rowless_authority.captured_task_authority_digest != task_authority_digest:
                     raise ProxyResponseError(
                         400,
@@ -2715,6 +2809,7 @@ class _HTTPBridgeStreamingMixin:
             request_state.recovery_attempt_fingerprint = durable_recovery_attempt_fingerprint
             request_state.recovery_attempt_session_id = durable_lookup.session_id
             request_state.recovery_attempt_owner_epoch = durable_lookup.owner_epoch
+            request_state.marker_recovery_terminal_settlement_required = True
         elif (
             effective_payload.previous_response_id is not None
             and payload_looks_like_full_resend
@@ -3777,6 +3872,9 @@ class _HTTPBridgeStreamingMixin:
                 request_state.recovery_attempt_session_id = previous_request_state.recovery_attempt_session_id
                 request_state.recovery_attempt_owner_epoch = previous_request_state.recovery_attempt_owner_epoch
                 request_state.recovery_attempt_claimed = previous_request_state.recovery_attempt_claimed
+                request_state.marker_recovery_terminal_settlement_required = (
+                    previous_request_state.marker_recovery_terminal_settlement_required
+                )
                 request_state.input_item_count = previous_request_state.input_item_count
                 request_state.input_full_fingerprint = previous_request_state.input_full_fingerprint
             elif client_full_resend_fresh_upstream_request_text is not None:
@@ -4575,6 +4673,9 @@ class _HTTPBridgeStreamingMixin:
                     retry_request_state.recovery_attempt_session_id = request_state.recovery_attempt_session_id
                     retry_request_state.recovery_attempt_owner_epoch = request_state.recovery_attempt_owner_epoch
                     retry_request_state.recovery_attempt_claimed = True
+                    retry_request_state.marker_recovery_terminal_settlement_required = (
+                        request_state.marker_recovery_terminal_settlement_required
+                    )
                 _apply_http_bridge_downstream_turn_state(
                     retry_request_state,
                     downstream_turn_state=downstream_turn_state,
