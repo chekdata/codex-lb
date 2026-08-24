@@ -83,6 +83,56 @@ same durable marker generation.
   cannot be hidden by metadata merge precedence
 - **AND** metadata alone can never create a task authority.
 
+#### Scenario: Official Responses-Lite 0.149 schema remains stateless
+
+- **GIVEN** a complete root-task resend uses the official Responses-Lite
+  `additional_tools` developer prefix
+- **AND** its tools contain only a closed namespace of validated
+  function/custom declarations plus an optional client-executed tool-search
+  declaration
+- **AND** client metadata session and thread IDs exactly equal the already
+  verified session, prompt-cache and task identity while turn ID is nonblank
+- **AND** canonical nested turn metadata contains the same complete identity,
+  uses the closed Codex 0.149 turn shape and agrees across body and direct-header
+  carriers
+- **AND** any flat root-turn, installation or window projection equals the
+  canonical nested value
+- **AND** a bounded body-only tool namespace inventory may exceed the 16 KiB
+  compatibility-header limit while a matching direct carrier omits that inventory
+- **WHEN** account-neutral replay eligibility is evaluated
+- **THEN** those schema and identity fields do not cause a false rejection
+- **AND** no-row and marker-backed recovery retain the same self-contained,
+  settled-ledger and account-neutral authority gates.
+
+#### Scenario: Responses-Lite schema drift remains fail closed
+
+- **GIVEN** a request contains an empty or nested namespace, a namespace child
+  missing an official required field, an unknown tool field, a non-client or
+  malformed tool-search schema, a null or non-grammar namespace custom format,
+  a deferred flag other than omitted or literal
+  `true`, missing or drifting metadata identity, conflicting body/direct
+  metadata carriers, a direct carrier containing body-only tool inventory,
+  drifting flat root-turn/installation/window projection, parent/subagent
+  lineage, an unknown nested metadata field,
+  a conversation or prompt reference, or file/container/vector-store state
+- **WHEN** recovery eligibility is evaluated
+- **THEN** the request remains non-neutral and cannot create or consume a
+  semantic-rebase authority
+- **AND** no account selection, WebSocket connect or upstream send occurs.
+
+#### Scenario: Invalid recovery metadata stops before routing
+
+- **GIVEN** a stale-anchor request supplies a verified root session, prompt-cache
+  key and thread identity
+- **AND** at least one direct-header or body turn-metadata carrier is present
+- **BUT** a carrier is malformed, oversized for its carrier kind or conflicts
+  with the other carrier
+- **WHEN** no durable recovery authority has already resolved that anchor
+- **THEN** the service returns a stable local invalid-metadata response
+- **AND** creates no authority and performs no account selection, WebSocket
+  connect or upstream send
+- **AND** a legacy request with no metadata carrier is not rejected by this gate.
+
 #### Scenario: Rowless projection removes only semantics-free Codex transport artifacts
 
 - **GIVEN** a complete client checkpoint whose direct call ledger is fully settled

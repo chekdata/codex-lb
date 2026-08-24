@@ -16,6 +16,7 @@ from app.modules.proxy.continuity import (
 )
 from app.modules.proxy.replay_safety import (
     abandoned_pending_agent_boundary_rejection_reason,
+    account_neutral_codex_turn_metadata_identity,
     project_responses_input_for_abandoned_pending_fresh_replay,
     project_responses_input_for_account_neutral_fresh_replay,
     responses_input_suffix_matches_pending_tool_calls,
@@ -158,6 +159,423 @@ def test_account_neutral_fresh_replay_accepts_self_contained_payloads(
     payload: dict[str, JsonValue],
 ) -> None:
     assert responses_payload_is_account_neutral_fresh_replay(payload) is True
+
+
+def test_account_neutral_fresh_replay_accepts_identity_bound_responses_lite_0149_schema() -> None:
+    task_id = "01a0322c-0c11-7780-b68e-061ace9161a4"
+    payload: dict[str, JsonValue] = {
+        "input": [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "functions",
+                        "description": "",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "lookup",
+                                "description": "Lookup a fixture.",
+                                "strict": False,
+                                "defer_loading": True,
+                                "parameters": {"type": "object", "properties": {}},
+                            },
+                            {
+                                "type": "custom",
+                                "name": "shell",
+                                "description": "Run a shell command.",
+                                "format": {
+                                    "type": "grammar",
+                                    "syntax": "lark",
+                                    "definition": "start: /.+/",
+                                },
+                            },
+                        ],
+                    },
+                    {
+                        "type": "tool_search",
+                        "execution": "client",
+                        "description": "Search deferred tools.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "Search query for deferred tools.",
+                                },
+                                "limit": {
+                                    "type": "number",
+                                    "description": "Maximum number of tools to return. Defaults to 8.",
+                                },
+                            },
+                            "required": ["query"],
+                            "additionalProperties": False,
+                        },
+                    },
+                ],
+            },
+            {"role": "developer", "content": "Use the declared tools."},
+            {"role": "user", "content": "Continue."},
+        ],
+        "client_metadata": {
+            "session_id": task_id,
+            "thread_id": task_id,
+            "turn_id": "019f-turn-id",
+            "root_turn_id": "019f-turn-id",
+            "x-codex-installation-id": "installation-a",
+            "x-codex-window-id": "window-a",
+            "x-codex-turn-metadata": json.dumps(
+                {
+                    "installation_id": "installation-a",
+                    "session_id": task_id,
+                    "thread_id": task_id,
+                    "turn_id": "019f-turn-id",
+                    "root_turn_id": "019f-turn-id",
+                    "window_id": "window-a",
+                    "request_kind": "turn",
+                }
+            ),
+        },
+    }
+
+    assert responses_payload_is_account_neutral_fresh_replay(
+        payload,
+        expected_session_identity=task_id,
+        expected_task_identity=task_id,
+    )
+    assert not responses_payload_is_account_neutral_fresh_replay(payload)
+    assert not responses_payload_is_account_neutral_fresh_replay(
+        payload,
+        expected_session_identity=task_id,
+        expected_task_identity="different-task",
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"type": "namespace", "name": "functions", "description": "", "tools": []},
+        {
+            "type": "namespace",
+            "name": "functions",
+            "description": "",
+            "tools": [{"type": "function", "name": "lookup", "container_id": "ctr-owner-a"}],
+        },
+        {
+            "type": "namespace",
+            "name": "functions",
+            "description": "",
+            "tools": [{"type": "function", "name": "lookup"}],
+        },
+        {
+            "type": "namespace",
+            "name": "functions",
+            "description": "",
+            "tools": [{"type": "custom", "name": "shell"}],
+        },
+        {
+            "type": "namespace",
+            "name": "functions",
+            "description": "",
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "shell",
+                    "description": "Run a shell command.",
+                    "format": {"type": "text"},
+                }
+            ],
+        },
+        {
+            "type": "namespace",
+            "name": "functions",
+            "description": "",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "Lookup a fixture.",
+                    "strict": False,
+                    "defer_loading": "yes",
+                    "parameters": {},
+                }
+            ],
+        },
+        {
+            "type": "namespace",
+            "name": "functions",
+            "description": "",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "Lookup a fixture.",
+                    "strict": False,
+                    "defer_loading": False,
+                    "parameters": {},
+                }
+            ],
+        },
+        {
+            "type": "tool_search",
+            "execution": "server",
+            "description": "Search deferred tools.",
+            "parameters": {},
+        },
+        {
+            "type": "tool_search",
+            "execution": "client",
+            "description": "Search deferred tools.",
+            "parameters": {"container_id": "ctr-owner-a"},
+        },
+    ],
+)
+def test_account_neutral_responses_lite_tools_reject_drift_and_owner_state(
+    mutation: dict[str, JsonValue],
+) -> None:
+    assert not responses_payload_is_account_neutral_fresh_replay(
+        {
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [mutation],
+                },
+                {"role": "developer", "content": "Use the declared tools."},
+                {"role": "user", "content": "Continue."},
+            ]
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "client_metadata",
+    [
+        {
+            "session_id": "root-task",
+            "thread_id": "root-task",
+            "turn_id": "turn-1",
+            "x-codex-parent-thread-id": "parent-task",
+            "x-codex-turn-metadata": json.dumps(
+                {
+                    "session_id": "root-task",
+                    "thread_id": "root-task",
+                    "turn_id": "turn-1",
+                    "request_kind": "turn",
+                }
+            ),
+        },
+        {
+            "session_id": "root-task",
+            "thread_id": "root-task",
+            "turn_id": "turn-1",
+            "x-codex-turn-metadata": json.dumps(
+                {
+                    "session_id": "root-task",
+                    "thread_id": "root-task",
+                    "turn_id": "turn-1",
+                    "request_kind": "turn",
+                    "tool_namespaces_info": {
+                        "functions": {
+                            "name": "functions",
+                            "functions": {},
+                        }
+                    },
+                }
+            ),
+        },
+        {
+            "session_id": "root-task",
+            "thread_id": "root-task",
+            "turn_id": "turn-1",
+            "root_turn_id": "turn-1",
+            "x-codex-turn-metadata": json.dumps(
+                {
+                    "session_id": "root-task",
+                    "thread_id": "root-task",
+                    "turn_id": "turn-1",
+                    "request_kind": "turn",
+                }
+            ),
+        },
+        {
+            "session_id": "root-task",
+            "thread_id": "root-task",
+            "turn_id": "turn-1",
+            "x-codex-installation-id": "installation-flat",
+            "x-codex-turn-metadata": json.dumps(
+                {
+                    "installation_id": "installation-nested",
+                    "session_id": "root-task",
+                    "thread_id": "root-task",
+                    "turn_id": "turn-1",
+                    "request_kind": "turn",
+                }
+            ),
+        },
+        {
+            "session_id": "root-task",
+            "thread_id": "root-task",
+            "turn_id": "turn-1",
+            "x-codex-window-id": "window-flat",
+            "x-codex-turn-metadata": json.dumps(
+                {
+                    "session_id": "root-task",
+                    "thread_id": "root-task",
+                    "turn_id": "turn-1",
+                    "window_id": "window-nested",
+                    "request_kind": "turn",
+                }
+            ),
+        },
+        {
+            "session_id": "root-task",
+            "thread_id": "root-task",
+            "turn_id": "turn-1",
+            "x-openai-subagent": "review",
+            "x-codex-turn-metadata": json.dumps(
+                {
+                    "session_id": "root-task",
+                    "thread_id": "root-task",
+                    "turn_id": "turn-1",
+                    "request_kind": "turn",
+                }
+            ),
+        },
+        {
+            "session_id": "root-task",
+            "thread_id": "root-task",
+            "turn_id": "turn-1",
+            "x-codex-turn-metadata": json.dumps({"request_kind": "turn"}),
+        },
+        {
+            "session_id": "root-task",
+            "thread_id": "root-task",
+            "turn_id": "turn-1",
+            "x-codex-turn-metadata": json.dumps(
+                {
+                    "session_id": "root-task",
+                    "thread_id": "root-task",
+                    "turn_id": "turn-1",
+                    "request_kind": "turn",
+                    "container_id": "ctr-owner-a",
+                }
+            ),
+        },
+    ],
+)
+def test_account_neutral_responses_lite_metadata_rejects_lineage_missing_identity_and_owner_state(
+    client_metadata: dict[str, JsonValue],
+) -> None:
+    assert not responses_payload_is_account_neutral_fresh_replay(
+        {
+            "input": [{"role": "user", "content": "Continue."}],
+            "client_metadata": client_metadata,
+        },
+        expected_session_identity="root-task",
+        expected_task_identity="root-task",
+    )
+
+
+def test_account_neutral_responses_lite_accepts_large_body_only_tool_inventory() -> None:
+    task_id = "root-task"
+    turn_metadata: dict[str, JsonValue] = {
+        "installation_id": "installation-a",
+        "session_id": task_id,
+        "thread_id": task_id,
+        "turn_id": "turn-1",
+        "window_id": "window-a",
+        "request_kind": "turn",
+        "tool_namespaces_info": {
+            "functions": {
+                "name": "functions",
+                "functions": {
+                    f"tool_{index:03d}": {
+                        "name": f"tool_{index:03d}",
+                        "direct": False,
+                        "code_mode_name": None,
+                        "deferred": True,
+                        "source": {"kind": "harness"},
+                    }
+                    for index in range(160)
+                },
+            }
+        },
+    }
+    serialized = json.dumps(turn_metadata, separators=(",", ":"))
+    assert len(serialized.encode()) > 16 * 1024
+    assert responses_payload_is_account_neutral_fresh_replay(
+        {
+            "input": [{"role": "user", "content": "Continue."}],
+            "client_metadata": {
+                "session_id": task_id,
+                "thread_id": task_id,
+                "turn_id": "turn-1",
+                "x-codex-turn-metadata": serialized,
+            },
+        },
+        expected_session_identity=task_id,
+        expected_task_identity=task_id,
+    )
+    assert (
+        account_neutral_codex_turn_metadata_identity(
+            serialized,
+            carrier="body",
+            expected_session_identity=task_id,
+            expected_task_identity=task_id,
+            expected_turn_identity="turn-1",
+        )
+        is not None
+    )
+    assert (
+        account_neutral_codex_turn_metadata_identity(
+            serialized,
+            carrier="direct",
+            expected_session_identity=task_id,
+            expected_task_identity=task_id,
+            expected_turn_identity="turn-1",
+        )
+        is None
+    )
+    small_inventory = dict(turn_metadata)
+    small_inventory["tool_namespaces_info"] = {
+        "functions": {
+            "name": "functions",
+            "functions": {
+                "tool_000": {
+                    "name": "tool_000",
+                    "direct": False,
+                    "code_mode_name": None,
+                    "deferred": True,
+                    "source": {"kind": "harness"},
+                }
+            },
+        }
+    }
+    small_serialized = json.dumps(small_inventory, separators=(",", ":"))
+    assert len(small_serialized.encode()) < 16 * 1024
+    assert (
+        account_neutral_codex_turn_metadata_identity(
+            small_serialized,
+            carrier="body",
+            expected_session_identity=task_id,
+            expected_task_identity=task_id,
+            expected_turn_identity="turn-1",
+        )
+        is not None
+    )
+    assert (
+        account_neutral_codex_turn_metadata_identity(
+            small_serialized,
+            carrier="direct",
+            expected_session_identity=task_id,
+            expected_task_identity=task_id,
+            expected_turn_identity="turn-1",
+        )
+        is None
+    )
 
 
 def test_account_neutral_replay_projection_removes_response_owned_bookkeeping() -> None:

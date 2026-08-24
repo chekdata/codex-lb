@@ -6,7 +6,7 @@ import json
 import logging
 import math
 from collections.abc import AsyncGenerator, Callable
-from typing import Any, AsyncIterator, Mapping, TypeVar, cast
+from typing import Any, AsyncIterator, Literal, Mapping, TypeVar, cast
 from uuid import uuid4
 
 import anyio
@@ -233,7 +233,9 @@ from app.modules.proxy.helpers import (
     _normalize_error_code,
 )
 from app.modules.proxy.replay_safety import (
+    AccountNeutralCodexTurnMetadataEvidence,
     abandoned_pending_agent_boundary_rejection_reason,
+    account_neutral_codex_turn_metadata_identity,
     project_responses_input_for_abandoned_pending_fresh_replay,
     project_responses_input_for_account_neutral_fresh_replay,
     responses_input_suffix_matches_pending_tool_calls,
@@ -1156,17 +1158,14 @@ async def _registered_turn_state_anchor_lookup(
     return lookup
 
 
-_ROWLESS_TURN_METADATA_MAX_BYTES = 16 * 1024
-
-
-def _rowless_client_fallback_metadata_evidence(
+def _rowless_client_metadata_evidence(
     *,
     raw_client_metadata: JsonValue | None,
     normalized_headers: Mapping[str, str],
     session_id: str,
     task_identity: str,
 ) -> tuple[bool, bool, bool]:
-    """Validate corroborating Codex metadata for a client-ID fallback."""
+    """Validate body and direct-header Codex identity carriers."""
 
     if raw_client_metadata is None:
         client_metadata: Mapping[str, JsonValue] = {}
@@ -1189,35 +1188,40 @@ def _rowless_client_fallback_metadata_evidence(
         if key == "thread_id":
             metadata_thread_present = True
 
-    turn_metadata_carriers: list[JsonValue] = []
+    flat_turn_id = client_metadata.get("turn_id")
+    if flat_turn_id is not None and not (isinstance(flat_turn_id, str) and bool(flat_turn_id.strip())):
+        return False, child_signal, metadata_thread_present
+    turn_metadata_carriers: list[tuple[JsonValue, Literal["body", "direct"]]] = []
     if "x-codex-turn-metadata" in client_metadata:
-        turn_metadata_carriers.append(client_metadata["x-codex-turn-metadata"])
+        turn_metadata_carriers.append((client_metadata["x-codex-turn-metadata"], "body"))
     if "x-codex-turn-metadata" in normalized_headers:
-        turn_metadata_carriers.append(normalized_headers["x-codex-turn-metadata"])
-    for raw_turn_metadata in turn_metadata_carriers:
-        if (
-            not isinstance(raw_turn_metadata, str)
-            or not raw_turn_metadata.strip()
-            or len(raw_turn_metadata.encode("utf-8")) > _ROWLESS_TURN_METADATA_MAX_BYTES
-        ):
+        turn_metadata_carriers.append((normalized_headers["x-codex-turn-metadata"], "direct"))
+    carrier_identities: list[AccountNeutralCodexTurnMetadataEvidence] = []
+    for raw_turn_metadata, carrier in turn_metadata_carriers:
+        identity = account_neutral_codex_turn_metadata_identity(
+            raw_turn_metadata,
+            carrier=carrier,
+            expected_session_identity=session_id,
+            expected_task_identity=task_identity,
+            expected_turn_identity=flat_turn_id,
+        )
+        if identity is None:
             return False, child_signal, metadata_thread_present
-        try:
-            parsed_turn_metadata = json.loads(raw_turn_metadata)
-        except (TypeError, ValueError):
+        carrier_identities.append(identity)
+        metadata_thread_present = True
+    if len(set(carrier_identities)) > 1:
+        return False, child_signal, metadata_thread_present
+    if carrier_identities:
+        canonical = carrier_identities[0]
+        flat_projection_pairs = (
+            (client_metadata.get("root_turn_id"), canonical.root_turn_identity),
+            (client_metadata.get("x-codex-installation-id"), canonical.installation_identity),
+            (client_metadata.get("x-codex-window-id"), canonical.window_identity),
+            (normalized_headers.get("x-codex-installation-id"), canonical.installation_identity),
+            (normalized_headers.get("x-codex-window-id"), canonical.window_identity),
+        )
+        if any(flat is not None and flat != nested for flat, nested in flat_projection_pairs):
             return False, child_signal, metadata_thread_present
-        if not isinstance(parsed_turn_metadata, Mapping):
-            return False, child_signal, metadata_thread_present
-        for key, expected in (("session_id", session_id), ("thread_id", task_identity)):
-            if key not in parsed_turn_metadata:
-                continue
-            value = parsed_turn_metadata[key]
-            if not isinstance(value, str) or not value.strip() or value.strip() != expected:
-                return False, child_signal, metadata_thread_present
-            if key == "thread_id":
-                metadata_thread_present = True
-        if "request_kind" in parsed_turn_metadata and parsed_turn_metadata["request_kind"] != "turn":
-            return False, child_signal, metadata_thread_present
-        child_signal = child_signal or any(key in parsed_turn_metadata for key in ("parent_thread_id", "subagent_kind"))
 
     return True, child_signal, metadata_thread_present
 
@@ -1787,9 +1791,6 @@ class _HTTPBridgeStreamingMixin:
         )
         rowless_task_identity = rowless_thread_identity
         marker_rowless_task_identity = rowless_thread_identity or rowless_client_request_identity
-        rowless_uses_client_identity_fallback = (
-            rowless_thread_identity is None and rowless_client_request_identity is not None
-        )
         raw_client_metadata = bridge_payload.get("client_metadata")
         rowless_fallback_metadata_valid = True
         rowless_metadata_thread_present = False
@@ -1798,32 +1799,51 @@ class _HTTPBridgeStreamingMixin:
             or (isinstance(raw_client_metadata, Mapping) and header_name in raw_client_metadata)
             for header_name in ("x-codex-parent-thread-id", "x-openai-subagent")
         )
-        if (
-            rowless_uses_client_identity_fallback
-            and official_session_id is not None
-            and marker_rowless_task_identity is not None
-        ):
+        rowless_turn_metadata_carrier_present = "x-codex-turn-metadata" in normalized_ingress_headers or (
+            isinstance(raw_client_metadata, Mapping) and "x-codex-turn-metadata" in raw_client_metadata
+        )
+        if official_session_id is not None and marker_rowless_task_identity is not None:
             (
                 rowless_fallback_metadata_valid,
                 rowless_explicit_child_signal,
                 rowless_metadata_thread_present,
-            ) = _rowless_client_fallback_metadata_evidence(
+            ) = _rowless_client_metadata_evidence(
                 raw_client_metadata=raw_client_metadata,
                 normalized_headers=normalized_ingress_headers,
                 session_id=official_session_id,
                 task_identity=marker_rowless_task_identity,
             )
-        rowless_task_identity_sources_consistent = not (
-            rowless_thread_identity is not None
-            and rowless_client_request_identity is not None
-            and rowless_thread_identity != rowless_client_request_identity
-        ) and (not rowless_uses_client_identity_fallback or rowless_fallback_metadata_valid)
+        rowless_task_identity_sources_consistent = (
+            not (
+                rowless_thread_identity is not None
+                and rowless_client_request_identity is not None
+                and rowless_thread_identity != rowless_client_request_identity
+            )
+            and rowless_fallback_metadata_valid
+        )
         rowless_lookup_identity_eligible = (
             rowless_task_identity is not None
             and official_session_id is not None
             and explicit_prompt_cache_key is not None
             and official_session_id == explicit_prompt_cache_key == rowless_task_identity
         )
+        if (
+            payload.previous_response_id is not None
+            and durable_lookup is None
+            and rowless_lookup_identity_eligible
+            and bridge_session_key.strength == "hard"
+            and bridge_session_key.affinity_kind == "session_header"
+            and rowless_turn_metadata_carrier_present
+            and not rowless_fallback_metadata_valid
+        ):
+            raise ProxyResponseError(
+                400,
+                openai_error(
+                    "rowless_recovery_identity_metadata_invalid",
+                    "The complete-context recovery metadata is invalid or conflicting.",
+                    error_type="invalid_request_error",
+                ),
+            )
         marker_rowless_lookup_identity_eligible = (
             marker_rowless_task_identity is not None
             and rowless_task_identity_sources_consistent
@@ -1843,7 +1863,11 @@ class _HTTPBridgeStreamingMixin:
             and (rowless_client_request_identity is None or rowless_client_request_identity == rowless_task_identity)
         )
         rowless_capture_facts = (
-            build_rowless_recovery_capture_facts(untrimmed_effective_payload)
+            build_rowless_recovery_capture_facts(
+                untrimmed_effective_payload,
+                expected_session_identity=official_session_id,
+                expected_task_identity=rowless_task_identity,
+            )
             if rowless_lookup_identity_eligible
             else None
         )
@@ -2172,7 +2196,11 @@ class _HTTPBridgeStreamingMixin:
                     and marker_rowless_task_identity is not None
                 ):
                     rowless_task_identity = marker_rowless_task_identity
-                    rowless_capture_facts = build_rowless_recovery_capture_facts(untrimmed_effective_payload)
+                    rowless_capture_facts = build_rowless_recovery_capture_facts(
+                        untrimmed_effective_payload,
+                        expected_session_identity=official_session_id,
+                        expected_task_identity=marker_rowless_task_identity,
+                    )
                     task_authority_digest = rowless_task_authority_digest(
                         session_id=official_session_id,
                         prompt_cache_key=explicit_prompt_cache_key,
@@ -2286,7 +2314,11 @@ class _HTTPBridgeStreamingMixin:
                         and isinstance(untrimmed_effective_payload.input, list)
                         and len(untrimmed_effective_payload.input) <= 512
                     ):
-                        diagnostic_capture_facts = build_rowless_recovery_capture_facts(untrimmed_effective_payload)
+                        diagnostic_capture_facts = build_rowless_recovery_capture_facts(
+                            untrimmed_effective_payload,
+                            expected_session_identity=official_session_id,
+                            expected_task_identity=marker_rowless_task_identity,
+                        )
                     capture_facts_present = diagnostic_capture_facts is not None
                     _log_http_bridge_event(
                         "recovery_required_request_rejected",
