@@ -54,6 +54,86 @@ _STAMPED_AFTER_LEGACY_PREFIX_4 = OLD_TO_NEW_REVISION_MAP["004_add_accounts_chatg
 _STAMPED_AFTER_LEGACY_PREFIX_1 = OLD_TO_NEW_REVISION_MAP["001_normalize_account_plan_types"]
 
 
+@pytest.mark.asyncio
+async def test_rowless_recovery_authority_migration_round_trip(tmp_path):
+    from alembic import command
+    from sqlalchemy import inspect as sa_inspect
+
+    from app.db.migrate import _build_alembic_config
+
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'rowless-recovery.sqlite'}"
+    parent_revision = "20260823_000000_add_http_bridge_recovery_required_marker"
+    revision = "20260824_000000_add_http_bridge_rowless_recovery_authorities"
+    table = "http_bridge_rowless_recovery_authorities"
+
+    def schema_state(sync_conn):
+        inspector = sa_inspect(sync_conn)
+        if not inspector.has_table(table):
+            return {"has_table": False}
+        return {
+            "has_table": True,
+            "columns": {column["name"] for column in inspector.get_columns(table)},
+            "uniques": {item["name"] for item in inspector.get_unique_constraints(table)},
+            "indexes": {item["name"] for item in inspector.get_indexes(table)},
+        }
+
+    await to_thread.run_sync(lambda: run_upgrade(db_url, parent_revision, bootstrap_legacy=False))
+    engine = create_async_engine(db_url, future=True)
+    try:
+        async with engine.connect() as conn:
+            assert not (await conn.run_sync(schema_state))["has_table"]
+
+        await to_thread.run_sync(lambda: run_upgrade(db_url, revision, bootstrap_legacy=False))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(schema_state)
+        assert state["has_table"]
+        assert {
+            "api_key_scope",
+            "strong_session_hash",
+            "stale_anchor_hash",
+            "captured_task_authority_digest",
+            "checkpoint_receipt_sha256",
+            "dispatch_send_started_at",
+            "consumed_response_id_hash",
+        } <= state["columns"]
+        assert "uq_http_bridge_rowless_recovery_authority" in state["uniques"]
+        assert "uq_http_bridge_rowless_recovery_task_contract" in state["uniques"]
+        assert "idx_http_bridge_rowless_recovery_state" in state["indexes"]
+
+        await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), parent_revision))
+        async with engine.connect() as conn:
+            assert not (await conn.run_sync(schema_state))["has_table"]
+
+        await to_thread.run_sync(lambda: run_upgrade(db_url, revision, bootstrap_legacy=False))
+        async with engine.connect() as conn:
+            assert (await conn.run_sync(schema_state))["has_table"]
+
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    f"INSERT INTO {table} ("
+                    "id,api_key_scope,session_key_kind,strong_session_hash,stale_anchor_hash,"
+                    "generation,generation_nonce,state,captured_input_item_count,"
+                    "captured_input_fingerprint,non_input_contract_fingerprint,"
+                    "settled_direct_call_ledger_digest,projected_payload_fingerprint,actual_wire_fingerprint,"
+                    "settled_direct_call_unresolved_count,selected_account_intent,"
+                    "captured_task_identity_hash,captured_session_identity_hash,"
+                    "captured_task_authority_digest,request_self_contained,request_account_neutral,"
+                    "created_at,updated_at) VALUES ("
+                    ":id,:scope,'session_header',:hash,:hash,1,:nonce,'consumed',1,"
+                    ":hash,:hash,:hash,:hash,:hash,0,'account-a',:hash,:hash,:hash,1,1,"
+                    "CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+                ),
+                {"id": str(uuid4()), "scope": "scope", "hash": "a" * 64, "nonce": "b" * 64},
+            )
+        with pytest.raises(RuntimeError, match="replay fences exist"):
+            await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), parent_revision))
+        async with engine.connect() as conn:
+            assert (await conn.run_sync(schema_state))["has_table"]
+    finally:
+        await engine.dispose()
+
+
 def _is_postgresql_database_url(url: str) -> bool:
     return url.startswith("postgresql+")
 

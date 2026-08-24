@@ -325,6 +325,137 @@ async def test_recovery_required_marker_is_owner_anchor_bound_durable_and_termin
 
 
 @pytest.mark.asyncio
+async def test_recovery_required_marker_survives_all_retention_paths_until_terminal_clear(
+    coordinator: DurableBridgeSessionCoordinator,
+    async_session_factory: Callable[[], AsyncSession],
+) -> None:
+    claimed = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-recovery-retention",
+        api_key_id="key-recovery-retention",
+        instance_id="instance-a",
+        owner_process_epoch="process-a",
+        lease_ttl_seconds=120.0,
+        account_id="acc-recovery-retention",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        latest_turn_state="turn-recovery-retention",
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+    registered = await coordinator.register_previous_response_id(
+        session_id=claimed.session_id,
+        api_key_id="key-recovery-retention",
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        response_id="resp-recovery-retention",
+        lease_ttl_seconds=120.0,
+        input_item_count=3,
+        input_full_fingerprint="a" * 64,
+        pending_tool_calls={"call-retained": "custom_tool_call"},
+    )
+    assert registered == DurableBridgeAliasRegistration.REGISTERED
+    assert await coordinator.mark_live_session_recovery_required(
+        session_id=claimed.session_id,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        account_id="acc-recovery-retention",
+        rejected_response_id="resp-recovery-retention",
+    )
+
+    stale_time = utcnow() - timedelta(hours=12)
+    async with async_session_factory() as session:
+        await session.execute(
+            update(HttpBridgeSessionRecord)
+            .where(HttpBridgeSessionRecord.id == claimed.session_id)
+            .values(
+                owner_instance_id=None,
+                lease_expires_at=stale_time,
+                last_seen_at=stale_time,
+                state=HttpBridgeSessionState.ACTIVE,
+            )
+        )
+        await session.commit()
+
+    # Process replacement/startup retention cannot erase the authority.
+    assert (
+        await DurableBridgeSessionCoordinator(async_session_factory).purge_owned_sessions_on_startup(
+            instance_id="instance-b",
+            ownerless_cutoff=utcnow() - timedelta(hours=1),
+        )
+        == 0
+    )
+    async with async_session_factory() as session:
+        await session.execute(
+            update(HttpBridgeSessionRecord)
+            .where(HttpBridgeSessionRecord.id == claimed.session_id)
+            .values(state=HttpBridgeSessionState.CLOSED, closed_at=stale_time)
+        )
+        await session.commit()
+        assert await DurableBridgeRepository(session).purge_closed_before(utcnow() - timedelta(hours=1)) == 0
+        await session.execute(
+            update(HttpBridgeSessionRecord)
+            .where(HttpBridgeSessionRecord.id == claimed.session_id)
+            .values(state=HttpBridgeSessionState.ACTIVE, closed_at=None)
+        )
+        await session.commit()
+        assert await DurableBridgeRepository(session).purge_abandoned_before(utcnow() - timedelta(hours=1)) == 0
+
+    after_restart = await DurableBridgeSessionCoordinator(async_session_factory).lookup_request_targets(
+        session_key_kind="session_header",
+        session_key_value="sid-recovery-retention",
+        api_key_id="key-recovery-retention",
+        turn_state=None,
+        session_header="sid-recovery-retention",
+        previous_response_id="resp-recovery-retention",
+    )
+    assert after_restart is not None
+    assert after_restart.recovery_is_required_for_latest_anchor()
+    assert after_restart.latest_pending_tool_calls == {"call-retained": "custom_tool_call"}
+
+    replacement = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-recovery-retention",
+        api_key_id="key-recovery-retention",
+        instance_id="instance-b",
+        owner_process_epoch="process-b",
+        lease_ttl_seconds=120.0,
+        account_id="acc-recovery-retention",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+    terminal = await coordinator.register_previous_response_id(
+        session_id=replacement.session_id,
+        api_key_id="key-recovery-retention",
+        instance_id="instance-b",
+        owner_epoch=replacement.owner_epoch,
+        response_id="resp-recovery-replacement",
+        lease_ttl_seconds=120.0,
+        input_item_count=5,
+        input_full_fingerprint="b" * 64,
+        pending_tool_calls={},
+    )
+    assert terminal == DurableBridgeAliasRegistration.REGISTERED
+    await coordinator.release_live_session(
+        session_id=replacement.session_id,
+        instance_id="instance-b",
+        owner_epoch=replacement.owner_epoch,
+        draining=False,
+    )
+    async with async_session_factory() as session:
+        await session.execute(
+            update(HttpBridgeSessionRecord)
+            .where(HttpBridgeSessionRecord.id == replacement.session_id)
+            .values(last_seen_at=stale_time, closed_at=stale_time)
+        )
+        await session.commit()
+        assert await DurableBridgeRepository(session).purge_closed_before(utcnow() - timedelta(hours=1)) == 1
+
+
+@pytest.mark.asyncio
 async def test_missing_durable_bridge_tables_checks_current_postgres_schemas() -> None:
     captured_sql: list[str] = []
 
@@ -339,6 +470,7 @@ async def test_missing_durable_bridge_tables_checks_current_postgres_schemas() -
     missing = await missing_durable_bridge_tables(cast(AsyncSession, _PostgresSession()))
 
     assert "http_bridge_session_aliases" in missing
+    assert "http_bridge_rowless_recovery_authorities" in missing
     assert any("current_schemas(false)" in sql for sql in captured_sql)
     assert all("table_schema = 'public'" not in sql for sql in captured_sql)
 

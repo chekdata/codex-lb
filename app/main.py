@@ -78,6 +78,7 @@ from app.modules.health import api as health_api
 from app.modules.model_sources import api as model_sources_api
 from app.modules.oauth import api as oauth_api
 from app.modules.proxy import api as proxy_api
+from app.modules.proxy import rowless_recovery_api
 from app.modules.proxy.cap_partitioning import refresh_cap_partition
 from app.modules.proxy.durable_bridge_coordinator import DurableBridgeSessionCoordinator
 from app.modules.proxy.durable_bridge_repository import missing_durable_bridge_tables
@@ -733,6 +734,7 @@ def create_app() -> FastAPI:
     app.include_router(quota_planner_api.router)
     app.include_router(reports_api.router)
     app.include_router(conversation_archive_api.router)
+    app.include_router(rowless_recovery_api.router)
     app.include_router(runtime_api.router)
     app.include_router(oauth_api.router)
     app.include_router(dashboard_auth_api.router)

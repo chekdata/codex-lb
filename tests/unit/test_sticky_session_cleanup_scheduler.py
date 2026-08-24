@@ -64,6 +64,8 @@ async def test_cleanup_once_purges_prompt_cache_only(monkeypatch) -> None:
     bridge_repo.purge_closed_before = AsyncMock(return_value=2)
     bridge_repo.purge_abandoned_before = AsyncMock(return_value=1)
     bridge_repo.purge_retry_circuits_before = AsyncMock(return_value=3)
+    rowless_repo = AsyncMock()
+    rowless_repo.purge_expired_audit_rows = AsyncMock(return_value={"captured": 0})
     ring_service = AsyncMock()
     ring_service.purge_stale_before = AsyncMock(return_value=0)
 
@@ -84,6 +86,7 @@ async def test_cleanup_once_purges_prompt_cache_only(monkeypatch) -> None:
         patch.object(cleanup_scheduler, "SettingsRepository", return_value=settings_repo),
         patch.object(cleanup_scheduler, "StickySessionsRepository", return_value=sticky_repo),
         patch.object(cleanup_scheduler, "DurableBridgeRepository", return_value=bridge_repo),
+        patch.object(cleanup_scheduler, "RowlessRecoveryRepository", return_value=rowless_repo),
         patch.object(cleanup_scheduler, "RingMembershipService", return_value=ring_service),
         patch.object(cleanup_scheduler, "_get_leader_election", lambda: _FakeLeader()),
         patch.object(cleanup_scheduler.startup_module, "_bridge_durable_schema_ready", True),
@@ -95,6 +98,7 @@ async def test_cleanup_once_purges_prompt_cache_only(monkeypatch) -> None:
     bridge_repo.purge_closed_before.assert_called_once()
     bridge_repo.purge_abandoned_before.assert_called_once()
     bridge_repo.purge_retry_circuits_before.assert_called_once()
+    rowless_repo.purge_expired_audit_rows.assert_called_once()
     ring_service.purge_stale_before.assert_called_once()
     sticky_repo.purge_stale_hard_codex_session_mappings.assert_called_once()
     passed_cutoff = sticky_repo.purge_stale_hard_codex_session_mappings.call_args.args[0]
@@ -127,6 +131,8 @@ async def test_cleanup_once_skips_bridge_purge_when_schema_is_not_ready(monkeypa
     bridge_repo.purge_closed_before = AsyncMock(return_value=0)
     bridge_repo.purge_abandoned_before = AsyncMock(return_value=0)
     bridge_repo.purge_retry_circuits_before = AsyncMock(return_value=0)
+    rowless_repo = AsyncMock()
+    rowless_repo.purge_expired_audit_rows = AsyncMock(return_value={"captured": 0})
     ring_service = AsyncMock()
     ring_service.purge_stale_before = AsyncMock(return_value=0)
 
@@ -147,6 +153,7 @@ async def test_cleanup_once_skips_bridge_purge_when_schema_is_not_ready(monkeypa
         patch.object(cleanup_scheduler, "SettingsRepository", return_value=settings_repo),
         patch.object(cleanup_scheduler, "StickySessionsRepository", return_value=sticky_repo),
         patch.object(cleanup_scheduler, "DurableBridgeRepository", return_value=bridge_repo),
+        patch.object(cleanup_scheduler, "RowlessRecoveryRepository", return_value=rowless_repo),
         patch.object(cleanup_scheduler, "RingMembershipService", return_value=ring_service),
         patch.object(cleanup_scheduler, "_get_leader_election", lambda: _FakeLeader()),
         patch.object(cleanup_scheduler.startup_module, "_bridge_durable_schema_ready", False),
@@ -162,6 +169,7 @@ async def test_cleanup_once_skips_bridge_purge_when_schema_is_not_ready(monkeypa
     bridge_repo.purge_closed_before.assert_not_called()
     bridge_repo.purge_abandoned_before.assert_not_called()
     bridge_repo.purge_retry_circuits_before.assert_not_called()
+    rowless_repo.purge_expired_audit_rows.assert_not_called()
     ring_service.purge_stale_before.assert_called_once()
 
 
@@ -190,6 +198,8 @@ async def test_cleanup_once_purges_bridge_when_schema_exists_after_startup_flag_
     bridge_repo.purge_closed_before = AsyncMock(return_value=1)
     bridge_repo.purge_abandoned_before = AsyncMock(return_value=0)
     bridge_repo.purge_retry_circuits_before = AsyncMock(return_value=0)
+    rowless_repo = AsyncMock()
+    rowless_repo.purge_expired_audit_rows = AsyncMock(return_value={"captured": 0})
     ring_service = AsyncMock()
     ring_service.purge_stale_before = AsyncMock(return_value=2)
 
@@ -210,6 +220,7 @@ async def test_cleanup_once_purges_bridge_when_schema_exists_after_startup_flag_
         patch.object(cleanup_scheduler, "SettingsRepository", return_value=settings_repo),
         patch.object(cleanup_scheduler, "StickySessionsRepository", return_value=sticky_repo),
         patch.object(cleanup_scheduler, "DurableBridgeRepository", return_value=bridge_repo),
+        patch.object(cleanup_scheduler, "RowlessRecoveryRepository", return_value=rowless_repo),
         patch.object(cleanup_scheduler, "RingMembershipService", return_value=ring_service),
         patch.object(cleanup_scheduler, "_get_leader_election", lambda: _FakeLeader()),
         patch.object(cleanup_scheduler.startup_module, "_bridge_durable_schema_ready", False),
@@ -221,6 +232,7 @@ async def test_cleanup_once_purges_bridge_when_schema_exists_after_startup_flag_
     bridge_repo.purge_closed_before.assert_called_once()
     bridge_repo.purge_abandoned_before.assert_called_once()
     bridge_repo.purge_retry_circuits_before.assert_called_once()
+    rowless_repo.purge_expired_audit_rows.assert_called_once()
     ring_service.purge_stale_before.assert_called_once()
 
 
@@ -278,6 +290,8 @@ async def test_cleanup_once_gates_abandoned_purge_on_prompt_cache_reuse_ttl(monk
     bridge_repo.purge_closed_before = AsyncMock(return_value=0)
     bridge_repo.purge_abandoned_before = AsyncMock(return_value=0)
     bridge_repo.purge_retry_circuits_before = AsyncMock(return_value=0)
+    rowless_repo = AsyncMock()
+    rowless_repo.purge_expired_audit_rows = AsyncMock(return_value={"captured": 0})
     ring_service = AsyncMock()
     ring_service.purge_stale_before = AsyncMock(return_value=0)
 
@@ -298,6 +312,7 @@ async def test_cleanup_once_gates_abandoned_purge_on_prompt_cache_reuse_ttl(monk
         patch.object(cleanup_scheduler, "SettingsRepository", return_value=settings_repo),
         patch.object(cleanup_scheduler, "StickySessionsRepository", return_value=sticky_repo),
         patch.object(cleanup_scheduler, "DurableBridgeRepository", return_value=bridge_repo),
+        patch.object(cleanup_scheduler, "RowlessRecoveryRepository", return_value=rowless_repo),
         patch.object(cleanup_scheduler, "RingMembershipService", return_value=ring_service),
         patch.object(cleanup_scheduler, "_get_leader_election", lambda: _FakeLeader()),
         patch.object(cleanup_scheduler.startup_module, "_bridge_durable_schema_ready", True),

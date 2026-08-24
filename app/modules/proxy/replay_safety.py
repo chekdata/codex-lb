@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Literal, cast
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -191,6 +193,56 @@ class AccountNeutralReplayProjection:
     position fail-closed, so projection can never make a non-adjacent
     developer message look canonical.
     """
+
+
+@dataclass(frozen=True, slots=True)
+class DirectCallLedgerSummary:
+    digest: str
+    unresolved_count: int
+
+
+def responses_direct_call_ledger_summary(
+    input_items: list[JsonValue],
+) -> DirectCallLedgerSummary | None:
+    """Hash the ordered direct-call lifecycle without retaining call content.
+
+    The digest includes only call/output identity, type, and status.  Invalid,
+    duplicate, orphaned, or type-mismatched entries are not a settlement
+    ledger and fail closed.
+    """
+
+    pending: dict[str, str] = {}
+    seen: set[str] = set()
+    ledger: list[dict[str, str | None]] = []
+    for item in input_items:
+        if not isinstance(item, dict):
+            continue
+        item_type_value = item.get("type")
+        item_type = item_type_value if isinstance(item_type_value, str) else None
+        if item_type not in _TOOL_CALL_TYPES and item_type not in _TOOL_CALL_TYPE_BY_OUTPUT_TYPE:
+            continue
+        call_id = item.get("call_id")
+        status_value = item.get("status")
+        status = status_value if isinstance(status_value, str) else None
+        if not isinstance(call_id, str) or not call_id or status not in (None, "completed", "failed"):
+            return None
+        if item_type in _TOOL_CALL_TYPES:
+            if call_id in seen:
+                return None
+            seen.add(call_id)
+            pending[call_id] = item_type
+            ledger.append({"call_id": call_id, "kind": "call", "status": status, "type": item_type})
+            continue
+        expected_call_type = _TOOL_CALL_TYPE_BY_OUTPUT_TYPE[item_type]
+        if pending.get(call_id) != expected_call_type:
+            return None
+        pending.pop(call_id)
+        ledger.append({"call_id": call_id, "kind": "output", "status": status, "type": item_type})
+    canonical = json.dumps(ledger, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    return DirectCallLedgerSummary(
+        digest=sha256(canonical.encode("utf-8")).hexdigest(),
+        unresolved_count=len(pending),
+    )
 
 
 def project_responses_input_for_account_neutral_fresh_replay(
@@ -494,6 +546,73 @@ def responses_input_items_are_self_contained_fresh_replay(input_items: list[Json
     return all(not call_ids for call_ids in unsettled_call_ids_by_type.values())
 
 
+def responses_input_items_are_self_contained_rowless_replay(
+    original_items: list[JsonValue],
+    projected_items: list[JsonValue],
+) -> bool:
+    """Admit only canonical, settled Codex agent deliveries for rowless replay."""
+
+    pending_calls: set[str] = set()
+    agent_indexes: list[int] = []
+    for index, item in enumerate(original_items):
+        if not isinstance(item, dict):
+            return False
+        item_type = item.get("type")
+        call_id = item.get("call_id")
+        if item_type in _TOOL_CALL_TYPES and isinstance(call_id, str):
+            pending_calls.add(call_id)
+        elif item_type in _TOOL_CALL_TYPE_BY_OUTPUT_TYPE and isinstance(call_id, str):
+            pending_calls.discard(call_id)
+        if item_type != "agent_message":
+            continue
+        if pending_calls or not _is_retained_agent_message(item):
+            return False
+        agent_indexes.append(index)
+        if not any(isinstance(later, dict) and later.get("role") == "user" for later in original_items[index + 1 :]):
+            return False
+    if not agent_indexes:
+        return responses_input_items_are_self_contained_fresh_replay(projected_items)
+
+    projected_without_agents: list[JsonValue] = []
+    for item in projected_items:
+        if not isinstance(item, dict) or item.get("type") != "agent_message":
+            projected_without_agents.append(item)
+            continue
+        metadata = item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
+        content = item.get("content")
+        if (
+            set(item)
+            not in {
+                frozenset({"author", "content", "recipient", "type"}),
+                frozenset(
+                    {
+                        "author",
+                        "content",
+                        _INTERNAL_CHAT_MESSAGE_METADATA_FIELD,
+                        "recipient",
+                        "type",
+                    }
+                ),
+            }
+            or not isinstance(item.get("author"), str)
+            or not _AGENT_PATH_PATTERN.fullmatch(cast(str, item["author"]))
+            or not isinstance(item.get("recipient"), str)
+            or not _AGENT_PATH_PATTERN.fullmatch(cast(str, item["recipient"]))
+            or item["author"] == item["recipient"]
+            or not _internal_chat_message_metadata_is_account_neutral(metadata)
+            or not isinstance(content, list)
+            or len(content) != 1
+            or not isinstance(content[0], dict)
+            or content[0].get("type") != "input_text"
+            or not _input_content_part_is_self_contained(
+                cast(dict[str, JsonValue], content[0]),
+                allow_output=False,
+            )
+        ):
+            return False
+    return responses_input_items_are_self_contained_fresh_replay(projected_without_agents)
+
+
 def _internal_chat_message_metadata_is_account_neutral(value: JsonValue | None) -> bool:
     if value is None:
         return True
@@ -632,7 +751,14 @@ def responses_input_suffix_matches_pending_tool_calls(
     pending_tool_calls: Mapping[str, str],
     canonical_lite_developer_index: int | None = None,
 ) -> bool:
-    """Prove the suffix exactly settles the durable prior-response call manifest."""
+    """Prove the suffix exactly settles the durable prior-response call manifest.
+
+    A completed call/output manifest is the physical client-side settlement
+    proof.  Codex can retain bounded later user/inter-agent inputs after that
+    settlement in the same complete-context resend.  Those later inputs do
+    not weaken the proof, but another tool loop does: the latter could belong
+    to a different response and must never stand in for the durable manifest.
+    """
 
     if stored_count <= 0 or len(input_items) <= stored_count or not pending_tool_calls:
         return False
@@ -644,33 +770,74 @@ def responses_input_suffix_matches_pending_tool_calls(
     if prefix_state is None or prefix_state[0] or prefix_state[1] & pending_tool_calls.keys():
         return False
     suffix = input_items[stored_count:]
-    if (
-        len(suffix) == 3
-        and isinstance(suffix[1], dict)
-        and _fresh_developer_message_is_transparent(suffix[1])
-        and _fresh_developer_interleave_is_bounded(suffix, index=1)
-    ):
-        suffix = [suffix[0], suffix[2]]
-    if not all(
-        isinstance(item, dict)
-        and isinstance(item.get("type"), str)
-        and item.get("type") in (_TOOL_CALL_TYPES | _TOOL_CALL_TYPE_BY_OUTPUT_TYPE.keys())
-        for item in suffix
-    ):
+    settlement_end = _exact_pending_tool_call_settlement_prefix_length(
+        suffix,
+        pending_tool_calls=pending_tool_calls,
+    )
+    if settlement_end is None:
         return False
-    if not responses_input_items_are_self_contained_fresh_replay(suffix):
+    followups = suffix[settlement_end:]
+    if not followups:
+        return True
+    if any(isinstance(item, dict) and item.get("role") == "developer" for item in suffix[:settlement_end]):
+        # The historical one-call developer interleave exception is sealed to
+        # that exact three-item window. It is not authority for accepting a
+        # later turn boundary or user follow-up.
         return False
-    suffix_calls: dict[str, str] = {}
-    suffix_outputs: dict[str, str] = {}
-    for item in cast(list[dict[str, JsonValue]], suffix):
-        item_type = cast(str, item["type"])
-        call_id = cast(str, item["call_id"])
-        if item_type in _TOOL_CALL_TYPES:
-            suffix_calls[call_id] = item_type
-        else:
-            suffix_outputs[call_id] = _TOOL_CALL_TYPE_BY_OUTPUT_TYPE[item_type]
+    first = followups[0]
+    if isinstance(first, dict) and first.get("type") == "agent_message":
+        if not _is_retained_agent_message(first):
+            return False
+        followups = followups[1:]
+    return _abandoned_pending_followup_sequence_is_bounded(
+        followups,
+        allow_response_owned_messages=False,
+    )
+
+
+def _exact_pending_tool_call_settlement_prefix_length(
+    input_items: list[JsonValue],
+    *,
+    pending_tool_calls: Mapping[str, str],
+) -> int | None:
+    """Return the shortest prefix that exactly settles one durable manifest."""
+
     expected = dict(pending_tool_calls)
-    return suffix_calls == expected and suffix_outputs == expected
+    for end in range(1, len(input_items) + 1):
+        candidate = input_items[:end]
+        normalized = candidate
+        if (
+            len(candidate) == 3
+            and isinstance(candidate[1], dict)
+            and _fresh_developer_message_is_transparent(candidate[1])
+            and _fresh_developer_interleave_is_bounded(candidate, index=1)
+        ):
+            normalized = [candidate[0], candidate[2]]
+        if not all(
+            isinstance(item, dict)
+            and isinstance(item.get("type"), str)
+            and item.get("type") in (_TOOL_CALL_TYPES | _TOOL_CALL_TYPE_BY_OUTPUT_TYPE.keys())
+            for item in normalized
+        ):
+            # A bounded call/developer/output window becomes recognizable
+            # only when its output arrives. Keep scanning possible prefixes;
+            # an unrelated non-settlement item will remain in every later
+            # candidate and therefore can never satisfy this predicate.
+            continue
+        if not responses_input_items_are_self_contained_fresh_replay(normalized):
+            continue
+        suffix_calls: dict[str, str] = {}
+        suffix_outputs: dict[str, str] = {}
+        for item in cast(list[dict[str, JsonValue]], normalized):
+            item_type = cast(str, item["type"])
+            call_id = cast(str, item["call_id"])
+            if item_type in _TOOL_CALL_TYPES:
+                suffix_calls[call_id] = item_type
+            else:
+                suffix_outputs[call_id] = _TOOL_CALL_TYPE_BY_OUTPUT_TYPE[item_type]
+        if suffix_calls == expected and suffix_outputs == expected:
+            return end
+    return None
 
 
 def responses_input_suffix_proves_abandoned_pending_agent_boundary(

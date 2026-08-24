@@ -1,0 +1,31 @@
+{
+  "cases": [
+    {
+      "case_id": "stored_85_custom_call_followup",
+      "pending_type": "custom_tool_call",
+      "stored_count": 85,
+      "suffix_shape": ["reasoning", "custom_tool_call", "custom_tool_call_output", "user_message"]
+    },
+    {
+      "case_id": "stored_288_function_call_agent_followup",
+      "pending_type": "function_call",
+      "stored_count": 288,
+      "suffix_shape": ["reasoning", "function_call", "function_call_output", "agent_message", "user_message"]
+    },
+    {
+      "case_id": "stored_194_custom_call_terminal",
+      "pending_type": "custom_tool_call",
+      "stored_count": 194,
+      "suffix_shape": ["reasoning", "custom_tool_call", "custom_tool_call_output"]
+    }
+  ],
+  "provenance": {
+    "contains_call_ids": false,
+    "contains_credentials": false,
+    "contains_message_text": false,
+    "contains_raw_ids": false,
+    "sanitized": true,
+    "source_kind": "production_request_structure"
+  },
+  "schema": "qk_http_responses_pending_settlement_shape_fixture_v1"
+}

@@ -972,6 +972,68 @@ async def test_disabled_dashboard_auth_mode_bypasses_guard_and_disables_password
 
 
 @pytest.mark.asyncio
+async def test_rowless_recovery_admin_surface_requires_trusted_proxy_operator(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    _set_dashboard_auth_env(monkeypatch, mode=DashboardAuthMode.DISABLED)
+    disabled = await async_client.get("/api/http-bridge/rowless-recovery")
+    assert disabled.status_code == 403
+
+    _set_dashboard_auth_env(
+        monkeypatch,
+        mode=DashboardAuthMode.TRUSTED_HEADER,
+        trust_proxy_headers=True,
+    )
+    without_actor = await async_client.get("/api/http-bridge/rowless-recovery")
+    assert without_actor.status_code == 401
+
+    bearer_only = await async_client.get(
+        "/api/http-bridge/rowless-recovery",
+        headers={"Authorization": "Bearer ordinary-proxy-key"},
+    )
+    assert bearer_only.status_code == 401
+
+    allowed = await async_client.get(
+        "/api/http-bridge/rowless-recovery",
+        headers={"Remote-User": "operator@example.com"},
+    )
+    assert allowed.status_code == 200
+    assert allowed.json() == []
+    status_response = await async_client.get(
+        "/api/http-bridge/rowless-recovery/status",
+        headers={"Remote-User": "operator@example.com"},
+    )
+    assert status_response.status_code == 200
+    assert status_response.json() == {
+        "stateCounts": {"captured": 0, "approved": 0, "unknown": 0, "consumed": 0},
+        "replayFenceCount": 0,
+        "preRowlessImageCompatible": True,
+        "minimumRollbackCapability": None,
+    }
+
+    _set_dashboard_auth_env(
+        monkeypatch,
+        mode=DashboardAuthMode.TRUSTED_HEADER,
+        trust_proxy_headers=True,
+        trusted_proxy_cidrs="10.0.0.0/8",
+    )
+    remote_transport = ASGITransport(app=app_instance, client=("203.0.113.24", 50001))
+    async with AsyncClient(transport=remote_transport, base_url="http://lb.example") as remote_client:
+        spoofed = await remote_client.get(
+            "/api/http-bridge/rowless-recovery",
+            headers={"Remote-User": "attacker@example.com"},
+        )
+        spoofed_status = await remote_client.get(
+            "/api/http-bridge/rowless-recovery/status",
+            headers={"Remote-User": "attacker@example.com"},
+        )
+    assert spoofed.status_code == 401
+    assert spoofed_status.status_code == 401
+
+
+@pytest.mark.asyncio
 async def test_trusted_header_proxy_auth_with_fallback_password_reports_no_active_session(async_client, monkeypatch):
     """Proxy-authenticated user with configured fallback password must see passwordSessionActive=False."""
     _set_dashboard_auth_env(

@@ -38,6 +38,7 @@ REQUIRED_DURABLE_BRIDGE_TABLES = (
     "http_bridge_session_aliases",
     "http_bridge_retry_circuits",
     "http_bridge_recovery_attempts",
+    "http_bridge_rowless_recovery_authorities",
 )
 DURABLE_BRIDGE_RETRY_CIRCUIT_STATE_TTL_SECONDS = 3600.0
 _PURGE_CLOSED_BATCH_SIZE = 500
@@ -1213,7 +1214,10 @@ class DurableBridgeRepository:
                         HttpBridgeSessionRecord.last_seen_at < ownerless_cutoff,
                     )
                 )
-            startup_purge_filter = or_(*purge_predicates)
+            startup_purge_filter = and_(
+                or_(*purge_predicates),
+                HttpBridgeSessionRecord.recovery_required_anchor_hash.is_(None),
+            )
             result = await self._session.execute(
                 select(
                     HttpBridgeSessionRecord.id,
@@ -1343,6 +1347,7 @@ class DurableBridgeRepository:
                 .where(
                     HttpBridgeSessionRecord.state == HttpBridgeSessionState.CLOSED,
                     HttpBridgeSessionRecord.last_seen_at < cutoff,
+                    HttpBridgeSessionRecord.recovery_required_anchor_hash.is_(None),
                 )
                 .order_by(HttpBridgeSessionRecord.last_seen_at.asc())
                 .limit(batch_size)
@@ -1358,6 +1363,7 @@ class DurableBridgeRepository:
                                 HttpBridgeSessionRecord.id.in_(session_ids),
                                 HttpBridgeSessionRecord.state == HttpBridgeSessionState.CLOSED,
                                 HttpBridgeSessionRecord.last_seen_at < cutoff,
+                                HttpBridgeSessionRecord.recovery_required_anchor_hash.is_(None),
                             )
                         )
                     )
@@ -1367,6 +1373,7 @@ class DurableBridgeRepository:
                     .where(HttpBridgeSessionRecord.id.in_(session_ids))
                     .where(HttpBridgeSessionRecord.state == HttpBridgeSessionState.CLOSED)
                     .where(HttpBridgeSessionRecord.last_seen_at < cutoff)
+                    .where(HttpBridgeSessionRecord.recovery_required_anchor_hash.is_(None))
                     .returning(HttpBridgeSessionRecord.id)
                 )
                 await self._session.commit()
@@ -1385,6 +1392,7 @@ class DurableBridgeRepository:
                     HttpBridgeSessionRecord.lease_expires_at < now,
                 ),
                 HttpBridgeSessionRecord.last_seen_at < cutoff,
+                HttpBridgeSessionRecord.recovery_required_anchor_hash.is_(None),
             )
             result = await self._session.execute(
                 select(HttpBridgeSessionRecord.id)
@@ -1894,7 +1902,7 @@ async def missing_durable_bridge_tables(session: AsyncSession) -> tuple[str, ...
                 "SELECT name FROM sqlite_master "
                 "WHERE type = 'table' "
                 "AND name IN ('http_bridge_sessions', 'http_bridge_session_aliases', 'http_bridge_retry_circuits', "
-                "'http_bridge_recovery_attempts')"
+                "'http_bridge_recovery_attempts', 'http_bridge_rowless_recovery_authorities')"
             )
         )
     else:
@@ -1904,7 +1912,7 @@ async def missing_durable_bridge_tables(session: AsyncSession) -> tuple[str, ...
                 "WHERE table_schema = ANY (current_schemas(false)) "
                 "AND table_name IN ("
                 "'http_bridge_sessions', 'http_bridge_session_aliases', 'http_bridge_retry_circuits', "
-                "'http_bridge_recovery_attempts'"
+                "'http_bridge_recovery_attempts', 'http_bridge_rowless_recovery_authorities'"
                 ")"
             )
         )
