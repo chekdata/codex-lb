@@ -218,7 +218,18 @@ def _make_bridge_session(
     )
 
 
-def test_http_bridge_account_neutral_replay_accepts_valid_namespaced_tool_call_history() -> None:
+@pytest.mark.parametrize(
+    ("namespace", "expected"),
+    [
+        ("collaboration", True),
+        ("   ", False),
+        (7, False),
+    ],
+)
+def test_http_bridge_account_neutral_replay_validates_namespaced_tool_call_history(
+    namespace: JsonValue,
+    expected: bool,
+) -> None:
     payload = proxy_service.ResponsesRequest.model_validate(
         {
             "model": "gpt-5.6-sol",
@@ -227,7 +238,7 @@ def test_http_bridge_account_neutral_replay_accepts_valid_namespaced_tool_call_h
                 {"role": "user", "content": "old request"},
                 {
                     "type": "function_call",
-                    "namespace": "collaboration",
+                    "namespace": namespace,
                     "call_id": "call_1",
                     "name": "spawn_agent",
                     "arguments": "{}",
@@ -238,14 +249,7 @@ def test_http_bridge_account_neutral_replay_accepts_valid_namespaced_tool_call_h
         }
     )
 
-    assert http_bridge_streaming_module._http_bridge_payload_is_account_neutral_fresh_replay(payload) is True
-
-    function_call = cast(dict[str, Any], payload.input[1])
-    function_call["namespace"] = "   "
-    assert http_bridge_streaming_module._http_bridge_payload_is_account_neutral_fresh_replay(payload) is False
-
-    function_call["namespace"] = 7
-    assert http_bridge_streaming_module._http_bridge_payload_is_account_neutral_fresh_replay(payload) is False
+    assert http_bridge_streaming_module._http_bridge_payload_is_account_neutral_fresh_replay(payload) is expected
 
 
 def _make_eventless_http_bridge_owner(
