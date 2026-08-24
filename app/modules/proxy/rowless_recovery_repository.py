@@ -64,6 +64,7 @@ class RowlessRecoveryAuthoritySnapshot:
     settled_direct_call_ledger_digest: str
     projected_payload_fingerprint: str
     actual_wire_fingerprint: str
+    origin_marker_session_id: str | None
     settled_direct_call_unresolved_count: int
     selected_account_intent: str
     captured_task_identity_hash: str
@@ -150,6 +151,7 @@ class RowlessRecoveryRepository:
         session_identity: str,
         task_authority_digest: str,
         facts: RowlessRecoveryCaptureFacts,
+        origin_marker_session_id: str | None = None,
     ) -> RowlessRecoveryAuthoritySnapshot:
         if (
             not api_key_scope
@@ -186,6 +188,7 @@ class RowlessRecoveryRepository:
                     session_identity,
                     task_authority_digest,
                     facts,
+                    origin_marker_session_id,
                 )
                 snapshot = _snapshot(existing)
                 await self._session.rollback()
@@ -203,6 +206,7 @@ class RowlessRecoveryRepository:
                     session_identity,
                     task_authority_digest,
                     facts,
+                    origin_marker_session_id,
                 )
                 snapshot = _snapshot(existing)
                 await self._session.rollback()
@@ -218,6 +222,13 @@ class RowlessRecoveryRepository:
             if int(captured_count or 0) >= ROWLESS_RECOVERY_MAX_CAPTURED_PER_API_SCOPE:
                 await self._session.rollback()
                 raise RowlessRecoveryStateError("rowless_capture_scope_limit_reached")
+            if origin_marker_session_id is not None:
+                await self._require_live_origin_marker(
+                    session_id=origin_marker_session_id,
+                    api_key_scope=api_key_scope,
+                    selected_account_intent=selected_account_intent,
+                    stale_anchor_hash=stale_anchor_hash,
+                )
             row = HttpBridgeRowlessRecoveryAuthority(
                 api_key_scope=api_key_scope,
                 session_key_kind=session_key_kind,
@@ -232,6 +243,7 @@ class RowlessRecoveryRepository:
                 settled_direct_call_ledger_digest=facts.direct_call_ledger_digest,
                 projected_payload_fingerprint=facts.projected_payload_fingerprint,
                 actual_wire_fingerprint=facts.actual_wire_fingerprint,
+                origin_marker_session_id=origin_marker_session_id,
                 settled_direct_call_unresolved_count=facts.unresolved_count,
                 selected_account_intent=selected_account_intent,
                 captured_task_identity_hash=canonical_json_sha256(task_identity),
@@ -265,6 +277,7 @@ class RowlessRecoveryRepository:
                     session_identity,
                     task_authority_digest,
                     facts,
+                    origin_marker_session_id,
                 )
                 snapshot = _snapshot(existing)
                 await self._session.rollback()
@@ -345,17 +358,17 @@ class RowlessRecoveryRepository:
         ).all()
         return [_snapshot(row) for row in rows]
 
-    async def authority_state_counts(self) -> dict[str, int]:
+    async def authority_state_counts(self, *, marker_bound_only: bool = False) -> dict[str, int]:
         """Return content-free counts used to enforce the image rollback floor."""
 
-        rows = (
-            await self._session.execute(
-                select(
-                    HttpBridgeRowlessRecoveryAuthority.state,
-                    func.count(HttpBridgeRowlessRecoveryAuthority.id),
-                ).group_by(HttpBridgeRowlessRecoveryAuthority.state)
-            )
-        ).all()
+        statement = select(
+            HttpBridgeRowlessRecoveryAuthority.state,
+            func.count(HttpBridgeRowlessRecoveryAuthority.id),
+        )
+        if marker_bound_only:
+            statement = statement.where(HttpBridgeRowlessRecoveryAuthority.origin_marker_session_id.is_not(None))
+        statement = statement.group_by(HttpBridgeRowlessRecoveryAuthority.state)
+        rows = (await self._session.execute(statement)).all()
         counts = {state.value: 0 for state in HttpBridgeRowlessRecoveryState}
         for state, count in rows:
             counts[state.value] = int(count)
@@ -566,6 +579,26 @@ class RowlessRecoveryRepository:
                             "task_authority",
                             row is not None and row.captured_task_authority_digest != task_authority_digest,
                         ),
+                        (
+                            "origin_marker_session",
+                            row is not None
+                            and row.origin_marker_session_id is not None
+                            and replacement is not None
+                            and replacement.id != row.origin_marker_session_id,
+                        ),
+                        (
+                            "origin_marker_generation",
+                            row is not None
+                            and row.origin_marker_session_id is not None
+                            and not self._origin_marker_matches_authority(
+                                replacement,
+                                row,
+                                expected_attempt_fingerprint=_origin_marker_attempt_fingerprint(
+                                    row,
+                                    wire_request_fingerprint,
+                                ),
+                            ),
+                        ),
                         ("replacement_missing", replacement is None),
                         (
                             "api_scope",
@@ -631,15 +664,31 @@ class RowlessRecoveryRepository:
 
         async with sqlite_writer_section():
             row = await self._find_id_for_update(authority_id)
+            origin_marker = None
+            if row is not None and row.origin_marker_session_id is not None:
+                origin_marker = await self._session.scalar(
+                    select(HttpBridgeSessionRecord)
+                    .where(HttpBridgeSessionRecord.id == row.origin_marker_session_id)
+                    .with_for_update()
+                )
             if (
                 row is None
                 or row.generation != generation
                 or row.state != HttpBridgeRowlessRecoveryState.APPROVED
                 or row.checkpoint_receipt_sha256 is None
                 or row.captured_task_authority_digest != task_authority_digest
+                or (
+                    row.origin_marker_session_id is not None
+                    and not self._origin_marker_matches_authority(origin_marker, row)
+                )
             ):
                 await self._session.rollback()
                 raise RowlessRecoveryStateError("approved_generation_preflight_fence_rejected")
+            if origin_marker is not None:
+                origin_marker.recovery_required_attempt_fingerprint = _origin_marker_attempt_fingerprint(
+                    row,
+                    wire_request_fingerprint,
+                )
             row.state = HttpBridgeRowlessRecoveryState.UNKNOWN
             row.dispatch_request_id = request_id
             row.wire_request_fingerprint = wire_request_fingerprint
@@ -660,6 +709,7 @@ class RowlessRecoveryRepository:
 
         async with sqlite_writer_section():
             row = await self._find_id_for_update(authority_id)
+            origin_marker = await self._load_origin_marker_for_update(row)
             if (
                 row is None
                 or row.generation != generation
@@ -668,6 +718,17 @@ class RowlessRecoveryRepository:
                 or row.wire_request_fingerprint != wire_request_fingerprint
                 or row.replacement_session_id is not None
                 or row.dispatch_send_started_at is not None
+                or (
+                    row.origin_marker_session_id is not None
+                    and not self._origin_marker_matches_authority(
+                        origin_marker,
+                        row,
+                        expected_attempt_fingerprint=_origin_marker_attempt_fingerprint(
+                            row,
+                            wire_request_fingerprint,
+                        ),
+                    )
+                )
             ):
                 await self._session.rollback()
                 return False
@@ -683,6 +744,8 @@ class RowlessRecoveryRepository:
             row.state = HttpBridgeRowlessRecoveryState.APPROVED
             row.dispatch_request_id = None
             row.wire_request_fingerprint = None
+            if origin_marker is not None:
+                origin_marker.recovery_required_attempt_fingerprint = None
             await self._session.commit()
             return True
 
@@ -698,6 +761,7 @@ class RowlessRecoveryRepository:
 
         async with sqlite_writer_section():
             row = await self._find_id_for_update(authority_id)
+            origin_marker = await self._load_origin_marker_for_update(row)
             journal = None
             if row is not None and row.replacement_session_id is not None:
                 journal = await self._session.scalar(
@@ -719,6 +783,17 @@ class RowlessRecoveryRepository:
                 or journal is None
                 or journal.state != HttpBridgeRecoveryAttemptState.UNKNOWN
                 or journal.response_id is not None
+                or (
+                    row.origin_marker_session_id is not None
+                    and not self._origin_marker_matches_authority(
+                        origin_marker,
+                        row,
+                        expected_attempt_fingerprint=_origin_marker_attempt_fingerprint(
+                            row,
+                            wire_request_fingerprint,
+                        ),
+                    )
+                )
             ):
                 await self._session.rollback()
                 return False
@@ -736,6 +811,7 @@ class RowlessRecoveryRepository:
     ) -> bool:
         async with sqlite_writer_section():
             row = await self._find_id_for_update(authority_id)
+            origin_marker = await self._load_origin_marker_for_update(row)
             if (
                 row is None
                 or row.generation != generation
@@ -743,6 +819,17 @@ class RowlessRecoveryRepository:
                 or row.dispatch_request_id != request_id
                 or row.wire_request_fingerprint != wire_request_fingerprint
                 or row.dispatch_send_started_at is not None
+                or (
+                    row.origin_marker_session_id is not None
+                    and not self._origin_marker_matches_authority(
+                        origin_marker,
+                        row,
+                        expected_attempt_fingerprint=_origin_marker_attempt_fingerprint(
+                            row,
+                            wire_request_fingerprint,
+                        ),
+                    )
+                )
             ):
                 await self._session.rollback()
                 return False
@@ -767,6 +854,8 @@ class RowlessRecoveryRepository:
             row.replacement_session_id = None
             row.dispatch_request_id = None
             row.wire_request_fingerprint = None
+            if origin_marker is not None:
+                origin_marker.recovery_required_attempt_fingerprint = None
             await self._session.commit()
             return True
 
@@ -785,6 +874,7 @@ class RowlessRecoveryRepository:
             return False
         async with sqlite_writer_section():
             row = await self._find_id_for_update(authority_id)
+            origin_marker = await self._load_origin_marker_for_update(row)
             if (
                 row is None
                 or row.generation != generation
@@ -793,6 +883,17 @@ class RowlessRecoveryRepository:
                 or row.wire_request_fingerprint != wire_request_fingerprint
                 or row.dispatch_send_started_at is None
                 or row.replacement_session_id is None
+                or (
+                    row.origin_marker_session_id is not None
+                    and not self._origin_marker_matches_authority(
+                        origin_marker,
+                        row,
+                        expected_attempt_fingerprint=_origin_marker_attempt_fingerprint(
+                            row,
+                            wire_request_fingerprint,
+                        ),
+                    )
+                )
             ):
                 await self._session.rollback()
                 return False
@@ -815,6 +916,66 @@ class RowlessRecoveryRepository:
             row.dispatch_request_id = None
             row.dispatch_send_started_at = None
             row.wire_request_fingerprint = None
+            if origin_marker is not None:
+                origin_marker.recovery_required_attempt_fingerprint = None
+            await self._session.commit()
+            return True
+
+    async def rollback_before_send_primitive(
+        self,
+        *,
+        authority_id: str,
+        generation: int,
+        request_id: str,
+        wire_request_fingerprint: str,
+    ) -> bool:
+        """Restore an exact UNKNOWN journal before its send helper is invoked."""
+
+        async with sqlite_writer_section():
+            row = await self._find_id_for_update(authority_id)
+            origin_marker = await self._load_origin_marker_for_update(row)
+            if (
+                row is None
+                or row.generation != generation
+                or row.state != HttpBridgeRowlessRecoveryState.UNKNOWN
+                or row.dispatch_request_id != request_id
+                or row.wire_request_fingerprint != wire_request_fingerprint
+                or row.replacement_session_id is None
+                or (
+                    row.origin_marker_session_id is not None
+                    and not self._origin_marker_matches_authority(
+                        origin_marker,
+                        row,
+                        expected_attempt_fingerprint=_origin_marker_attempt_fingerprint(
+                            row,
+                            wire_request_fingerprint,
+                        ),
+                    )
+                )
+            ):
+                await self._session.rollback()
+                return False
+            deleted = await self._session.execute(
+                delete(HttpBridgeRecoveryAttemptRecord)
+                .where(
+                    HttpBridgeRecoveryAttemptRecord.session_id == row.replacement_session_id,
+                    HttpBridgeRecoveryAttemptRecord.request_fingerprint == wire_request_fingerprint,
+                    HttpBridgeRecoveryAttemptRecord.request_id == request_id,
+                    HttpBridgeRecoveryAttemptRecord.state == HttpBridgeRecoveryAttemptState.UNKNOWN,
+                    HttpBridgeRecoveryAttemptRecord.response_id.is_(None),
+                )
+                .returning(HttpBridgeRecoveryAttemptRecord.id)
+            )
+            if deleted.scalar_one_or_none() is None:
+                await self._session.rollback()
+                return False
+            row.state = HttpBridgeRowlessRecoveryState.APPROVED
+            row.replacement_session_id = None
+            row.dispatch_request_id = None
+            row.dispatch_send_started_at = None
+            row.wire_request_fingerprint = None
+            if origin_marker is not None:
+                origin_marker.recovery_required_attempt_fingerprint = None
             await self._session.commit()
             return True
 
@@ -867,6 +1028,20 @@ class RowlessRecoveryRepository:
                 or journal.response_id is not None
                 or input_item_count != row.captured_input_item_count
                 or input_full_fingerprint != row.captured_input_fingerprint
+                or (
+                    row.origin_marker_session_id is not None
+                    and (
+                        replacement.id != row.origin_marker_session_id
+                        or not self._origin_marker_matches_authority(
+                            replacement,
+                            row,
+                            expected_attempt_fingerprint=_origin_marker_attempt_fingerprint(
+                                row,
+                                row.wire_request_fingerprint,
+                            ),
+                        )
+                    )
+                )
             ):
                 await self._session.rollback()
                 return False
@@ -938,6 +1113,60 @@ class RowlessRecoveryRepository:
             .with_for_update()
         )
 
+    async def _require_live_origin_marker(
+        self,
+        *,
+        session_id: str,
+        api_key_scope: str,
+        selected_account_intent: str,
+        stale_anchor_hash: str,
+    ) -> None:
+        marker = await self._session.scalar(
+            select(HttpBridgeSessionRecord).where(HttpBridgeSessionRecord.id == session_id).with_for_update()
+        )
+        if (
+            marker is None
+            or marker.api_key_scope != api_key_scope
+            or marker.account_id != selected_account_intent
+            or marker.recovery_required_account_id != selected_account_intent
+            or marker.recovery_required_anchor_hash != stale_anchor_hash
+            or marker.latest_response_id is None
+            or durable_bridge_hash(marker.latest_response_id) != stale_anchor_hash
+            or marker.recovery_required_attempt_fingerprint is not None
+        ):
+            raise RowlessRecoveryStateError("durable_marker_capture_fence_rejected")
+
+    @staticmethod
+    def _origin_marker_matches_authority(
+        marker: HttpBridgeSessionRecord | None,
+        authority: HttpBridgeRowlessRecoveryAuthority,
+        *,
+        expected_attempt_fingerprint: str | None = None,
+    ) -> bool:
+        return bool(
+            marker is not None
+            and marker.id == authority.origin_marker_session_id
+            and marker.api_key_scope == authority.api_key_scope
+            and marker.account_id == authority.selected_account_intent
+            and marker.recovery_required_account_id == authority.selected_account_intent
+            and marker.recovery_required_anchor_hash == authority.stale_anchor_hash
+            and marker.latest_response_id is not None
+            and durable_bridge_hash(marker.latest_response_id) == authority.stale_anchor_hash
+            and marker.recovery_required_attempt_fingerprint == expected_attempt_fingerprint
+        )
+
+    async def _load_origin_marker_for_update(
+        self,
+        authority: HttpBridgeRowlessRecoveryAuthority | None,
+    ) -> HttpBridgeSessionRecord | None:
+        if authority is None or authority.origin_marker_session_id is None:
+            return None
+        return await self._session.scalar(
+            select(HttpBridgeSessionRecord)
+            .where(HttpBridgeSessionRecord.id == authority.origin_marker_session_id)
+            .with_for_update()
+        )
+
     async def _find_exact_request_contract_for_update(
         self,
         *,
@@ -966,9 +1195,11 @@ class RowlessRecoveryRepository:
         session_identity: str,
         task_authority_digest: str,
         facts: RowlessRecoveryCaptureFacts,
+        origin_marker_session_id: str | None,
     ) -> None:
         if (
             row.selected_account_intent != selected_account_intent
+            or row.origin_marker_session_id != origin_marker_session_id
             or row.captured_task_identity_hash != canonical_json_sha256(task_identity)
             or row.captured_session_identity_hash != canonical_json_sha256(session_identity)
             or row.captured_task_authority_digest != task_authority_digest
@@ -1001,6 +1232,7 @@ def _snapshot(row: HttpBridgeRowlessRecoveryAuthority) -> RowlessRecoveryAuthori
         settled_direct_call_ledger_digest=row.settled_direct_call_ledger_digest,
         projected_payload_fingerprint=row.projected_payload_fingerprint,
         actual_wire_fingerprint=row.actual_wire_fingerprint,
+        origin_marker_session_id=row.origin_marker_session_id,
         settled_direct_call_unresolved_count=row.settled_direct_call_unresolved_count,
         selected_account_intent=row.selected_account_intent,
         captured_task_identity_hash=row.captured_task_identity_hash,
@@ -1015,6 +1247,22 @@ def _snapshot(row: HttpBridgeRowlessRecoveryAuthority) -> RowlessRecoveryAuthori
         wire_request_fingerprint=row.wire_request_fingerprint,
         created_at=row.created_at,
         updated_at=row.updated_at,
+    )
+
+
+def _origin_marker_attempt_fingerprint(
+    authority: HttpBridgeRowlessRecoveryAuthority,
+    wire_request_fingerprint: str | None,
+) -> str:
+    if wire_request_fingerprint is None:
+        raise RowlessRecoveryStateError("rowless_marker_wire_fingerprint_missing")
+    return canonical_json_sha256(
+        {
+            "domain": "qk_http_bridge_rowless_marker_attempt_v1",
+            "authority_id": authority.id,
+            "generation": authority.generation,
+            "wire_request_fingerprint": wire_request_fingerprint,
+        }
     )
 
 

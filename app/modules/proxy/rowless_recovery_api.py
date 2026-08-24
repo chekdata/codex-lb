@@ -70,6 +70,7 @@ async def list_rowless_authorities(
             "strongSessionHash": item.strong_session_hash,
             "taskAuthorityDigest": item.captured_task_authority_digest,
             "staleAnchorHash": item.stale_anchor_hash,
+            "markerOriginBound": item.origin_marker_session_id is not None,
             "inputItemCount": item.captured_input_item_count,
             "createdAt": item.created_at,
             "updatedAt": item.updated_at,
@@ -84,13 +85,23 @@ async def rowless_recovery_status(
 ) -> dict[str, object]:
     del principal
     async with SessionLocal() as session:
-        counts = await RowlessRecoveryRepository(session).authority_state_counts()
+        repository = RowlessRecoveryRepository(session)
+        counts = await repository.authority_state_counts()
+        marker_bound_counts = await repository.authority_state_counts(marker_bound_only=True)
     replay_fence_count = counts["approved"] + counts["unknown"] + counts["consumed"]
+    marker_bound_count = sum(marker_bound_counts.values())
     return {
         "stateCounts": counts,
+        "markerBoundStateCounts": marker_bound_counts,
         "replayFenceCount": replay_fence_count,
-        "preRowlessImageCompatible": replay_fence_count == 0,
-        "minimumRollbackCapability": "rowless_recovery_v1" if replay_fence_count else None,
+        "markerBoundAuthorityCount": marker_bound_count,
+        "preRowlessImageCompatible": replay_fence_count == 0 and marker_bound_count == 0,
+        "preMarkerRecoveryImageCompatible": marker_bound_count == 0,
+        "minimumRollbackCapability": (
+            "rowless_marker_recovery_v2"
+            if marker_bound_count
+            else ("rowless_recovery_v1" if replay_fence_count else None)
+        ),
     }
 
 

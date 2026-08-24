@@ -40,6 +40,9 @@ REQUIRED_DURABLE_BRIDGE_TABLES = (
     "http_bridge_recovery_attempts",
     "http_bridge_rowless_recovery_authorities",
 )
+REQUIRED_DURABLE_BRIDGE_COLUMNS = {
+    "http_bridge_rowless_recovery_authorities": ("origin_marker_session_id",),
+}
 DURABLE_BRIDGE_RETRY_CIRCUIT_STATE_TTL_SECONDS = 3600.0
 _PURGE_CLOSED_BATCH_SIZE = 500
 _SESSION_ID_LOOKUP_CHUNK_SIZE = 500
@@ -1917,7 +1920,25 @@ async def missing_durable_bridge_tables(session: AsyncSession) -> tuple[str, ...
             )
         )
     present = {str(row[0]) for row in result.fetchall()}
-    return tuple(sorted(expected - present))
+    missing = set(expected - present)
+    rowless_table = "http_bridge_rowless_recovery_authorities"
+    if rowless_table in present:
+        if dialect == "sqlite":
+            column_result = await session.execute(text(f"PRAGMA table_info({rowless_table})"))
+            present_columns = {str(row[1]) for row in column_result.fetchall()}
+        else:
+            column_result = await session.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = ANY (current_schemas(false)) "
+                    "AND table_name = 'http_bridge_rowless_recovery_authorities'"
+                )
+            )
+            present_columns = {str(row[0]) for row in column_result.fetchall()}
+        for column in REQUIRED_DURABLE_BRIDGE_COLUMNS[rowless_table]:
+            if column not in present_columns:
+                missing.add(f"{rowless_table}.{column}")
+    return tuple(sorted(missing))
 
 
 _SNAPSHOT_COLUMNS = (

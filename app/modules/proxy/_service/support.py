@@ -797,6 +797,14 @@ class _WebSocketRequestState:
     # may roll back a reversible recovery alias; cancellation after this point
     # is ambiguous and must retain the alias/fail closed.
     fresh_upstream_send_primitive_reached: bool = False
+    # Set immediately before the initial rowless semantic-rebase send helper
+    # is invoked. Cleanup may restore the durable attempt only while this is
+    # false; after the helper is entered, cancellation is ambiguous.
+    rowless_recovery_send_primitive_reached: bool = False
+    # True only after the initial rowless send returned the transport's exact
+    # closed-before-send proof. Generic socket-only reconnects must never set
+    # this bit: replay_count alone is not physical non-delivery evidence.
+    rowless_recovery_first_send_proven_unsent: bool = False
     bridge_queue_wait_started_at: float | None = None
     # Monotonic deadline of the original bridge request budget. Retry and
     # recovery paths re-prepare request states with a fresh started_at, so

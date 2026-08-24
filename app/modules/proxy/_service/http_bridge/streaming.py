@@ -1694,6 +1694,71 @@ class _HTTPBridgeStreamingMixin:
         durable_marker_abandoned_pending_replay = False
         durable_marker_verified_recovery = False
         force_local_recovery_creation = False
+        normalized_ingress_headers = {key.lower(): value for key, value in headers.items()}
+        official_session_id_value = normalized_ingress_headers.get("session-id")
+        official_session_id = (
+            official_session_id_value.strip()
+            if isinstance(official_session_id_value, str) and official_session_id_value.strip()
+            else None
+        )
+        conflicting_session_alias = any(
+            isinstance(normalized_ingress_headers.get(alias), str)
+            and bool(normalized_ingress_headers[alias].strip())
+            and normalized_ingress_headers[alias].strip() != official_session_id
+            for alias in ("session_id", "x-codex-session-id", "x-codex-conversation-id")
+        )
+        rowless_thread_identity = normalized_ingress_headers.get("thread-id")
+        rowless_client_request_identity = normalized_ingress_headers.get("x-client-request-id")
+        rowless_task_identity = (
+            rowless_thread_identity.strip()
+            if isinstance(rowless_thread_identity, str) and rowless_thread_identity.strip()
+            else None
+        )
+        rowless_client_request_identity = (
+            rowless_client_request_identity.strip()
+            if isinstance(rowless_client_request_identity, str) and rowless_client_request_identity.strip()
+            else None
+        )
+        rowless_lookup_identity_eligible = (
+            rowless_task_identity is not None
+            and official_session_id is not None
+            and explicit_prompt_cache_key is not None
+            and official_session_id == explicit_prompt_cache_key == rowless_task_identity
+        )
+        rowless_dispatch_identity_eligible = (
+            rowless_lookup_identity_eligible
+            and bridge_session_key.strength == "hard"
+            and bridge_session_key.affinity_kind == "session_header"
+            and incoming_turn_state_header is None
+            and not conflicting_session_alias
+            and (rowless_client_request_identity is None or rowless_client_request_identity == rowless_task_identity)
+        )
+        rowless_capture_facts = (
+            build_rowless_recovery_capture_facts(untrimmed_effective_payload)
+            if rowless_lookup_identity_eligible
+            else None
+        )
+        task_authority_digest = (
+            rowless_task_authority_digest(
+                session_id=official_session_id,
+                prompt_cache_key=explicit_prompt_cache_key,
+                thread_id=rowless_task_identity,
+            )
+            if rowless_lookup_identity_eligible
+            and official_session_id is not None
+            and explicit_prompt_cache_key is not None
+            and rowless_task_identity is not None
+            else None
+        )
+        rowless_api_key_scope = (
+            durable_bridge_api_key_scope(bridge_session_key.api_key_id) if task_authority_digest is not None else None
+        )
+        rowless_strong_hash = (
+            rowless_strong_session_hash("task_authority", task_authority_digest)
+            if task_authority_digest is not None
+            else None
+        )
+        rowless_authority = None
         payload_looks_like_full_resend = _http_bridge_payload_looks_like_full_resend(payload)
         # Set when the quarantine check below suppresses the durable-anchor
         # injection for a full-resend payload; the session hydration and the
@@ -1974,42 +2039,142 @@ class _HTTPBridgeStreamingMixin:
                 )
             )
             if durable_recovery_marker_active and not verified_marker_full_resend:
-                _log_http_bridge_event(
-                    "recovery_required_request_rejected",
-                    bridge_session_key,
-                    account_id=durable_lookup.account_id,
-                    model=payload.model,
-                    detail=(
-                        "reason=pending_call_resolution_required"
-                        if durable_lookup.latest_pending_tool_calls
-                        else "reason=complete_context_rehydration_required"
-                    ),
-                    cache_key_family=bridge_session_key.affinity_kind,
-                    model_class=_extract_model_class(payload.model) if payload.model else None,
-                    owner_check_applied=True,
-                )
-                raise ProxyResponseError(
-                    400,
-                    openai_error(
-                        (
-                            "previous_response_pending_call_resolution_required"
-                            if durable_lookup.latest_pending_tool_calls
-                            else "previous_response_complete_context_required"
-                        ),
-                        (
-                            "The saved response anchor has an unresolved pending call. "
-                            "Retry once with the complete conversation context after resolving that call."
-                            if durable_lookup.latest_pending_tool_calls
-                            else (
-                                "The saved response anchor requires complete conversation context. "
-                                "Retry once with a verified complete resend."
+                if (
+                    task_authority_digest is not None
+                    and rowless_api_key_scope is not None
+                    and rowless_strong_hash is not None
+                    and durable_lookup.latest_response_id is not None
+                    and durable_lookup.account_id is not None
+                ):
+                    stale_anchor_hash = durable_bridge_hash(durable_lookup.latest_response_id)
+                    try:
+                        async with SessionLocal() as rowless_session:
+                            rowless_repository = RowlessRecoveryRepository(rowless_session)
+                            rowless_authority = await rowless_repository.lookup(
+                                api_key_scope=rowless_api_key_scope,
+                                strong_session_hash=rowless_strong_hash,
+                                stale_anchor_hash=stale_anchor_hash,
                             )
+                            if rowless_authority is None and rowless_capture_facts is not None:
+                                rowless_authority = await rowless_repository.lookup_exact_request_contract(
+                                    api_key_scope=rowless_api_key_scope,
+                                    strong_session_hash=rowless_strong_hash,
+                                    facts=rowless_capture_facts,
+                                )
+                            if (
+                                rowless_authority is None
+                                and rowless_dispatch_identity_eligible
+                                and rowless_capture_facts is not None
+                                and rowless_capture_facts.unresolved_count == 0
+                                and rowless_capture_facts.self_contained
+                                and rowless_capture_facts.account_neutral
+                                and rowless_task_identity is not None
+                                and official_session_id is not None
+                            ):
+                                installation_id = await rowless_session.scalar(
+                                    select(Account.codex_installation_id).where(Account.id == durable_lookup.account_id)
+                                )
+                                if installation_id:
+                                    marker_projected_payload = untrimmed_effective_payload.model_copy(
+                                        update={
+                                            "input": rowless_capture_facts.projected_input,
+                                            "previous_response_id": None,
+                                        }
+                                    )
+                                    _marker_state, marker_text = prepare_bridge_request(marker_projected_payload)
+                                    del _marker_state
+                                    marker_text = _text_with_account_installation_id(marker_text, installation_id)
+                                    rowless_authority = await rowless_repository.capture(
+                                        api_key_scope=rowless_api_key_scope,
+                                        session_key_kind=bridge_session_key.affinity_kind,
+                                        strong_session_hash=rowless_strong_hash,
+                                        stale_anchor_hash=stale_anchor_hash,
+                                        selected_account_intent=durable_lookup.account_id,
+                                        task_identity=rowless_task_identity,
+                                        session_identity=official_session_id,
+                                        task_authority_digest=task_authority_digest,
+                                        facts=dataclasses.replace(
+                                            rowless_capture_facts,
+                                            actual_wire_fingerprint=rowless_actual_wire_fingerprint(marker_text),
+                                        ),
+                                        origin_marker_session_id=durable_lookup.session_id,
+                                    )
+                    except RowlessRecoveryStateError as exc:
+                        raise ProxyResponseError(
+                            502,
+                            openai_error(
+                                "bridge_continuity_persistence_failed",
+                                "The durable-marker semantic-rebase authority could not be fenced safely.",
+                            ),
+                        ) from exc
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to persist durable-marker rowless recovery authority",
+                            exc_info=True,
+                        )
+                        raise ProxyResponseError(
+                            502,
+                            openai_error(
+                                "bridge_continuity_persistence_failed",
+                                "The durable-marker semantic-rebase authority could not be persisted.",
+                            ),
+                        ) from exc
+                if rowless_authority is not None:
+                    if rowless_authority.origin_marker_session_id != durable_lookup.session_id:
+                        raise ProxyResponseError(
+                            400,
+                            openai_error(
+                                "rowless_recovery_marker_origin_mismatch",
+                                "The semantic-rebase authority belongs to a different durable marker.",
+                                error_type="invalid_request_error",
+                            ),
+                        )
+                    if rowless_authority.selected_account_intent != durable_lookup.account_id:
+                        raise ProxyResponseError(
+                            400,
+                            openai_error(
+                                "rowless_recovery_pinned_account_changed",
+                                "The durable marker account changed; the semantic rebase remains unsent.",
+                                error_type="invalid_request_error",
+                            ),
+                        )
+                else:
+                    _log_http_bridge_event(
+                        "recovery_required_request_rejected",
+                        bridge_session_key,
+                        account_id=durable_lookup.account_id,
+                        model=payload.model,
+                        detail=(
+                            "reason=pending_call_resolution_required"
+                            if durable_lookup.latest_pending_tool_calls
+                            else "reason=complete_context_rehydration_required"
                         ),
-                    ),
-                    retryable_same_contract=False,
-                    failure_detail="durable_recovery_required",
-                    upstream_error_code="previous_response_not_found",
-                )
+                        cache_key_family=bridge_session_key.affinity_kind,
+                        model_class=_extract_model_class(payload.model) if payload.model else None,
+                        owner_check_applied=True,
+                    )
+                    raise ProxyResponseError(
+                        400,
+                        openai_error(
+                            (
+                                "previous_response_pending_call_resolution_required"
+                                if durable_lookup.latest_pending_tool_calls
+                                else "previous_response_complete_context_required"
+                            ),
+                            (
+                                "The saved response anchor has an unresolved pending call. "
+                                "Retry once with the complete conversation context after resolving that call."
+                                if durable_lookup.latest_pending_tool_calls
+                                else (
+                                    "The saved response anchor requires complete conversation context. "
+                                    "Retry once with a verified complete resend."
+                                )
+                            ),
+                        ),
+                        retryable_same_contract=False,
+                        failure_detail="durable_recovery_required",
+                        upstream_error_code="previous_response_not_found",
+                    )
             if durable_recovery_marker_active and verified_marker_full_resend:
                 # A prior request already supplied the physical stale-anchor
                 # rejection.  The durable marker is therefore equivalent to
@@ -2223,70 +2388,6 @@ class _HTTPBridgeStreamingMixin:
                 previous_response_trimmed_input_fingerprint = _fingerprint_input_items(previous_response_input_items)
                 effective_payload = effective_payload.model_copy(update={"input": trimmed_input_items})
         request_state, text_data = prepare_bridge_request(effective_payload)
-        normalized_ingress_headers = {key.lower(): value for key, value in headers.items()}
-        official_session_id_value = normalized_ingress_headers.get("session-id")
-        official_session_id = (
-            official_session_id_value.strip()
-            if isinstance(official_session_id_value, str) and official_session_id_value.strip()
-            else None
-        )
-        conflicting_session_alias = any(
-            isinstance(normalized_ingress_headers.get(alias), str)
-            and bool(normalized_ingress_headers[alias].strip())
-            and normalized_ingress_headers[alias].strip() != official_session_id
-            for alias in ("session_id", "x-codex-session-id", "x-codex-conversation-id")
-        )
-        rowless_thread_identity = normalized_ingress_headers.get("thread-id")
-        rowless_client_request_identity = normalized_ingress_headers.get("x-client-request-id")
-        rowless_task_identity = (
-            rowless_thread_identity.strip()
-            if isinstance(rowless_thread_identity, str) and rowless_thread_identity.strip()
-            else None
-        )
-        rowless_client_request_identity = (
-            rowless_client_request_identity.strip()
-            if isinstance(rowless_client_request_identity, str) and rowless_client_request_identity.strip()
-            else None
-        )
-        rowless_lookup_identity_eligible = (
-            rowless_task_identity is not None
-            and official_session_id is not None
-            and explicit_prompt_cache_key is not None
-            and official_session_id == explicit_prompt_cache_key == rowless_task_identity
-        )
-        rowless_dispatch_identity_eligible = (
-            rowless_lookup_identity_eligible
-            and bridge_session_key.strength == "hard"
-            and bridge_session_key.affinity_kind == "session_header"
-            and incoming_turn_state_header is None
-            and not conflicting_session_alias
-            and (rowless_client_request_identity is None or rowless_client_request_identity == rowless_task_identity)
-        )
-        rowless_capture_facts = (
-            build_rowless_recovery_capture_facts(untrimmed_effective_payload)
-            if rowless_lookup_identity_eligible
-            else None
-        )
-        task_authority_digest = (
-            rowless_task_authority_digest(
-                session_id=official_session_id,
-                prompt_cache_key=explicit_prompt_cache_key,
-                thread_id=rowless_task_identity,
-            )
-            if rowless_lookup_identity_eligible
-            and official_session_id is not None
-            and explicit_prompt_cache_key is not None
-            and rowless_task_identity is not None
-            else None
-        )
-        rowless_api_key_scope = (
-            durable_bridge_api_key_scope(bridge_session_key.api_key_id) if task_authority_digest is not None else None
-        )
-        rowless_strong_hash = (
-            rowless_strong_session_hash("task_authority", task_authority_digest)
-            if task_authority_digest is not None
-            else None
-        )
         if (
             task_authority_digest is not None
             and rowless_api_key_scope is not None
@@ -2309,32 +2410,32 @@ class _HTTPBridgeStreamingMixin:
                 session_identity=official_session_id,
                 facts=rowless_capture_facts,
             )
-        rowless_authority = None
         if task_authority_digest is not None and rowless_api_key_scope is not None and rowless_strong_hash is not None:
-            async with SessionLocal() as rowless_session:
-                rowless_repository = RowlessRecoveryRepository(rowless_session)
-                if untrimmed_effective_payload.previous_response_id is not None:
-                    rowless_authority = await rowless_repository.lookup(
-                        api_key_scope=rowless_api_key_scope,
-                        strong_session_hash=rowless_strong_hash,
-                        stale_anchor_hash=durable_bridge_hash(untrimmed_effective_payload.previous_response_id),
-                    )
-                if rowless_authority is None and rowless_capture_facts is not None:
-                    try:
-                        rowless_authority = await rowless_repository.lookup_exact_request_contract(
+            if rowless_authority is None:
+                async with SessionLocal() as rowless_session:
+                    rowless_repository = RowlessRecoveryRepository(rowless_session)
+                    if untrimmed_effective_payload.previous_response_id is not None:
+                        rowless_authority = await rowless_repository.lookup(
                             api_key_scope=rowless_api_key_scope,
                             strong_session_hash=rowless_strong_hash,
-                            facts=rowless_capture_facts,
+                            stale_anchor_hash=durable_bridge_hash(untrimmed_effective_payload.previous_response_id),
                         )
-                    except RowlessRecoveryStateError as exc:
-                        raise ProxyResponseError(
-                            400,
-                            openai_error(
-                                "rowless_recovery_authority_ambiguous",
-                                "Multiple semantic-rebase authorities match this exact turn; dispatch is unsafe.",
-                                error_type="invalid_request_error",
-                            ),
-                        ) from exc
+                    if rowless_authority is None and rowless_capture_facts is not None:
+                        try:
+                            rowless_authority = await rowless_repository.lookup_exact_request_contract(
+                                api_key_scope=rowless_api_key_scope,
+                                strong_session_hash=rowless_strong_hash,
+                                facts=rowless_capture_facts,
+                            )
+                        except RowlessRecoveryStateError as exc:
+                            raise ProxyResponseError(
+                                400,
+                                openai_error(
+                                    "rowless_recovery_authority_ambiguous",
+                                    "Multiple semantic-rebase authorities match this exact turn; dispatch is unsafe.",
+                                    error_type="invalid_request_error",
+                                ),
+                            ) from exc
             if rowless_authority is not None:
                 if rowless_authority.captured_task_authority_digest != task_authority_digest:
                     raise ProxyResponseError(
@@ -2855,6 +2956,15 @@ class _HTTPBridgeStreamingMixin:
                     deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
                     defer_account_health_writes=request_state.api_key_reservation is not None,
                 )
+            except asyncio.CancelledError:
+                rollback_task = asyncio.create_task(
+                    self._rollback_rowless_preflight_setup_failure_if_unbound(request_state)
+                )
+                try:
+                    await asyncio.shield(rollback_task)
+                except asyncio.CancelledError:
+                    await rollback_task
+                raise
             except ProxyResponseError as exc:
                 if (
                     request_state.rowless_recovery_authority_id is not None
@@ -2936,6 +3046,9 @@ class _HTTPBridgeStreamingMixin:
                 )
                 switch_to_account_neutral_replay()
                 continue
+            except Exception:
+                await self._rollback_rowless_preflight_setup_failure_if_unbound(request_state)
+                raise
             break
         if isinstance(session_or_forward, _HTTPBridgeOwnerForward):
             await _current_origin_legacy_owner_anchor_lookup(

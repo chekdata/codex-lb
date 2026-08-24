@@ -30,6 +30,7 @@ from app.modules.proxy.continuity import (
 )
 from app.modules.proxy.durable_bridge_coordinator import DurableBridgeSessionCoordinator
 from app.modules.proxy.durable_bridge_repository import (
+    REQUIRED_DURABLE_BRIDGE_TABLES,
     DurableBridgeAliasRegistration,
     DurableBridgeRepository,
     missing_durable_bridge_tables,
@@ -473,6 +474,34 @@ async def test_missing_durable_bridge_tables_checks_current_postgres_schemas() -
     assert "http_bridge_rowless_recovery_authorities" in missing
     assert any("current_schemas(false)" in sql for sql in captured_sql)
     assert all("table_schema = 'public'" not in sql for sql in captured_sql)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dialect", ("sqlite", "postgresql"))
+async def test_missing_durable_bridge_tables_reports_marker_origin_column(
+    dialect: str,
+) -> None:
+    captured_sql: list[str] = []
+
+    class _SchemaSession:
+        def get_bind(self) -> SimpleNamespace:
+            return SimpleNamespace(dialect=SimpleNamespace(name=dialect))
+
+        async def execute(self, statement: object) -> SimpleNamespace:
+            rendered = str(statement)
+            captured_sql.append(rendered)
+            if "sqlite_master" in rendered or "information_schema.tables" in rendered:
+                rows = [(table,) for table in REQUIRED_DURABLE_BRIDGE_TABLES]
+            elif "PRAGMA table_info" in rendered:
+                rows = [(0, "id")]
+            else:
+                rows = [("id",)]
+            return SimpleNamespace(fetchall=lambda: rows)
+
+    missing = await missing_durable_bridge_tables(cast(AsyncSession, _SchemaSession()))
+
+    assert missing == ("http_bridge_rowless_recovery_authorities.origin_marker_session_id",)
+    assert len(captured_sql) == 2
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,86 @@
+# Delta: Responses API compatibility
+
+## ADDED Requirements
+
+### Requirement: Durable recovery markers support an explicit administrator semantic rebase
+
+When an active durable recovery marker cannot be recovered by exact owner-bound
+automatic proof, the service MUST keep automatic safety predicates unchanged
+and MAY capture one administrator-authorized semantic-rebase authority for the
+same durable marker generation.
+
+#### Scenario: Automatic exact proof remains preferred
+
+- **GIVEN** an active durable recovery marker and a complete resend that exactly
+  settles its stored prefix and pending manifest
+- **WHEN** the request is evaluated
+- **THEN** the existing automatic proof path claims the marker generation
+- **AND** no administrator authority is required or dispatched.
+
+#### Scenario: Mismatched pending evidence captures without upstream work
+
+- **GIVEN** the saved anchor was rejected before any response event
+- **AND** the current complete request is self-contained and account neutral
+- **BUT** its call/output IDs do not exactly settle the durable pending manifest
+- **WHEN** automatic proof fails
+- **THEN** the service persists one authority bound to the exact durable session,
+  API scope, account, anchor generation, task identity and request contract
+- **AND** returns the stable authorization-required action
+- **AND** performs no additional account selection, WebSocket connect or upstream send.
+
+#### Scenario: Administrator and automatic claims are mutually exclusive
+
+- **GIVEN** one approved administrator authority for an active marker
+- **WHEN** administrator and automatic recovery attempts race with even the same
+  raw wire fingerprint
+- **THEN** both lock the same marker generation
+- **AND** the administrator claim uses its domain-separated authority/generation digest
+- **AND** exactly one path wins before account selection or connect
+- **AND** the loser cannot create a second journal or upstream effect.
+
+#### Scenario: Proven-unsent failures restore the marker generation
+
+- **GIVEN** administrator preflight has claimed the marker generation
+- **WHEN** local setup fails before replacement binding, the request owner is
+  cancelled before invoking its initial send helper, a typed first socket close
+  is followed by cancellation before the fresh send helper, or every attempted
+  socket is physically proven closed before its send primitive
+- **THEN** one transaction restores APPROVED and clears the administrator marker claim
+- **AND** deletes any exact UNKNOWN journal and replacement binding when present
+- **AND** retains the old anchor, account and recovery-required marker.
+
+#### Scenario: Socket-only reconnect is not a proven-unsent send
+
+- **GIVEN** an administrator request reconnects a closed socket without sending
+- **AND** the later initial send primitive may deliver the request
+- **WHEN** that send is cancelled before any response event is observed
+- **THEN** the generic reconnect counter MUST NOT authorize rollback
+- **AND** authority, journal and marker claim remain UNKNOWN
+- **AND** a later retry cannot produce a second upstream effect.
+
+#### Scenario: Ambiguous delivery remains permanently fenced
+
+- **GIVEN** the send primitive may have delivered the administrator request
+- **WHEN** the stream fails without a physical unsent proof
+- **THEN** authority and journal remain UNKNOWN
+- **AND** the marker attempt claim and old anchor remain
+- **AND** no automatic, reconnect or administrator replay is permitted.
+
+#### Scenario: Terminal completion atomically establishes the new checkpoint
+
+- **GIVEN** the one administrator semantic-rebase request reaches `response.completed`
+- **WHEN** durable settlement commits
+- **THEN** the new anchor, alias, complete client checkpoint, REPLAYED journal and
+  CONSUMED authority become visible together
+- **AND** the recovery marker and marker attempt claim are cleared together
+- **AND** any persistence failure leaves the old generation fail-closed.
+
+#### Scenario: Schema and rollback capability preserve replay fences
+
+- **GIVEN** the rowless authority table exists
+- **WHEN** its origin-marker column is absent
+- **THEN** durable bridge startup readiness fails
+- **AND** any marker-bound authority, including CAPTURED, requires
+  `rowless_marker_recovery_v2`
+- **AND** migration downgrade and v1-only image rollback are rejected while such
+  authority exists.

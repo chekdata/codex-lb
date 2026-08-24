@@ -20,6 +20,7 @@ from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import ApiKeyCreateData, ApiKeysService
 from app.modules.dashboard_auth.service import DASHBOARD_SESSION_COOKIE, get_dashboard_session_store
+from app.modules.proxy.rowless_recovery_repository import RowlessRecoveryRepository
 
 pytestmark = pytest.mark.integration
 
@@ -1008,10 +1009,34 @@ async def test_rowless_recovery_admin_surface_requires_trusted_proxy_operator(
     assert status_response.status_code == 200
     assert status_response.json() == {
         "stateCounts": {"captured": 0, "approved": 0, "unknown": 0, "consumed": 0},
+        "markerBoundStateCounts": {"captured": 0, "approved": 0, "unknown": 0, "consumed": 0},
         "replayFenceCount": 0,
+        "markerBoundAuthorityCount": 0,
         "preRowlessImageCompatible": True,
+        "preMarkerRecoveryImageCompatible": True,
         "minimumRollbackCapability": None,
     }
+
+    async def marker_bound_counts(self, *, marker_bound_only=False):
+        del self, marker_bound_only
+        return {
+            "captured": 1,
+            "approved": 0,
+            "unknown": 0,
+            "consumed": 0,
+        }
+
+    with monkeypatch.context() as status_patch:
+        status_patch.setattr(RowlessRecoveryRepository, "authority_state_counts", marker_bound_counts)
+        marker_status = await async_client.get(
+            "/api/http-bridge/rowless-recovery/status",
+            headers={"Remote-User": "operator@example.com"},
+        )
+    assert marker_status.status_code == 200
+    assert marker_status.json()["markerBoundAuthorityCount"] == 1
+    assert marker_status.json()["preRowlessImageCompatible"] is False
+    assert marker_status.json()["preMarkerRecoveryImageCompatible"] is False
+    assert marker_status.json()["minimumRollbackCapability"] == "rowless_marker_recovery_v2"
 
     _set_dashboard_auth_env(
         monkeypatch,
