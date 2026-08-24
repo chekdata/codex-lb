@@ -170,6 +170,7 @@ _ACCOUNT_NEUTRAL_CLIENT_METADATA_FIELDS = frozenset(
 # validation below.
 _ACCOUNT_NEUTRAL_TURN_METADATA_DIRECT_MAX_BYTES = 16 * 1024
 _ACCOUNT_NEUTRAL_TURN_METADATA_BODY_MAX_BYTES = 1024 * 1024
+_ACCOUNT_NEUTRAL_WORKSPACE_KIND_MAX_BYTES = 128
 _ACCOUNT_NEUTRAL_TURN_METADATA_FIELDS = frozenset(
     {
         "agent_name",
@@ -189,6 +190,7 @@ _ACCOUNT_NEUTRAL_TURN_METADATA_FIELDS = frozenset(
         "turn_id",
         "turn_started_at_unix_ms",
         "window_id",
+        "workspace_kind",
         "workspaces",
     }
 )
@@ -1808,8 +1810,22 @@ def account_neutral_codex_turn_metadata_identity(
         or decoded.get("request_kind") != "turn"
     ):
         return None
-    for key in ("agent_name", "forked_from_thread_id", "installation_id", "sandbox", "sandbox_mode", "window_id"):
+    for key in (
+        "agent_name",
+        "forked_from_thread_id",
+        "installation_id",
+        "sandbox",
+        "sandbox_mode",
+        "window_id",
+    ):
         if key in decoded and not _is_nonblank_string(decoded[key]):
+            return None
+    if "workspace_kind" in decoded:
+        workspace_kind = decoded["workspace_kind"]
+        if (
+            not _is_nonblank_string(workspace_kind)
+            or len(cast(str, workspace_kind).encode("utf-8")) > _ACCOUNT_NEUTRAL_WORKSPACE_KIND_MAX_BYTES
+        ):
             return None
     root_turn_id = decoded.get("root_turn_id")
     if root_turn_id is not None and root_turn_id != turn_id:
