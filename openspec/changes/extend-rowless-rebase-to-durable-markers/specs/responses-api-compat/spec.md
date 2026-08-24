@@ -92,9 +92,12 @@ same durable marker generation.
 #### Scenario: Automatic terminal completion is also one durable transaction
 
 - **GIVEN** the automatic exact-proof path has claimed and dispatched one marker generation
-- **WHEN** it reaches `response.completed`
+- **WHEN** it reaches `response.completed` with a complete, supported pending
+  tool-call manifest
 - **THEN** the new anchor, alias, complete client checkpoint and REPLAYED journal
   become visible in the same transaction that clears every marker field
+- **AND** an absent, malformed or unsupported terminal tool-call manifest is
+  returned as a persistence error without clearing the marker or settling the journal
 - **AND** a transaction failure is returned as a terminal persistence error before
   downstream success is delivered
 - **AND** the old anchor, marker claim and UNKNOWN journal remain intact.

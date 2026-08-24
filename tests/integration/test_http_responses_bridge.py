@@ -879,6 +879,7 @@ async def test_rowless_child_thread_sharing_root_bridge_identity_fails_closed_wi
         "automatic_legacy_unknown_missing_thread",
         "automatic_legacy_consumed_missing_thread",
         "automatic_terminal_persistence_failure",
+        "automatic_terminal_invalid_tool_manifest",
     ],
 )
 @pytest.mark.asyncio
@@ -902,7 +903,20 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
         tool_call_type="custom_tool_call",
     )
     stale_upstream = _RejectStalePreviousResponseUpstreamWebSocket("resp_bridge_custom_1")
-    recovered_upstream = _FakeBridgeUpstreamWebSocket("resp_marker_rowless_recovered")
+    recovered_upstream = _FakeBridgeUpstreamWebSocket(
+        "resp_marker_rowless_recovered",
+        completed_output=(
+            [
+                {
+                    "type": "computer_call",
+                    "call_id": "call_computer",
+                    "action": {"type": "screenshot"},
+                }
+            ]
+            if resolution_mode == "automatic_terminal_invalid_tool_manifest"
+            else None
+        ),
+    )
     upstreams = [source_upstream, stale_upstream, recovered_upstream]
     connect_count = 0
     selection_count = 0
@@ -1139,7 +1153,10 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
                 assert marker is not None
                 assert marker.recovery_required_attempt_fingerprint is None
             return
-        if resolution_mode == "automatic_terminal_persistence_failure":
+        if resolution_mode in {
+            "automatic_terminal_persistence_failure",
+            "automatic_terminal_invalid_tool_manifest",
+        }:
             assert automatic_recovery.status_code == 502, automatic_recovery.text
             assert automatic_recovery.json()["error"]["code"] == "bridge_continuity_persistence_failed"
             assert connect_count == 3
@@ -1588,10 +1605,16 @@ class _FakeUpstreamMessage:
 
 
 class _FakeBridgeUpstreamWebSocket:
-    def __init__(self, response_id_prefix: str = "resp_bridge") -> None:
+    def __init__(
+        self,
+        response_id_prefix: str = "resp_bridge",
+        *,
+        completed_output: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.sent_text: list[str] = []
         self.closed = False
         self.response_id_prefix = response_id_prefix
+        self.completed_output = completed_output
         self._messages: asyncio.Queue[_FakeUpstreamMessage] = asyncio.Queue()
 
     async def send_text(self, text: str) -> None:
@@ -1619,7 +1642,8 @@ class _FakeBridgeUpstreamWebSocket:
                             "id": response_id,
                             "object": "response",
                             "status": "completed",
-                            "output": [
+                            "output": self.completed_output
+                            or [
                                 {
                                     "type": "message",
                                     "role": "assistant",

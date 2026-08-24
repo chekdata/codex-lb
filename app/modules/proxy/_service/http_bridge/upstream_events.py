@@ -2246,6 +2246,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                     and marker_fingerprint is not None
                     and matched_request_state.input_item_count > 0
                     and matched_request_state.input_full_fingerprint is not None
+                    and completed_pending_tool_call_manifest is not None
                 ):
                     try:
                         marker_settled = await self._durable_bridge.settle_marker_recovery_completed(
