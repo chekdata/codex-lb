@@ -10,6 +10,7 @@ from typing import cast
 from app.core.openai.requests import ResponsesRequest
 from app.core.types import JsonValue
 from app.modules.proxy.replay_safety import (
+    normalize_responses_input_for_rowless_replay,
     project_responses_input_for_account_neutral_fresh_replay,
     responses_direct_call_ledger_summary,
     responses_input_items_are_self_contained_rowless_replay,
@@ -148,13 +149,16 @@ def build_rowless_recovery_capture_facts(
     )
     if projection is None:
         return None
-    projected_payload = payload.model_copy(update={"input": projection.input_items, "previous_response_id": None})
+    projected_input = normalize_responses_input_for_rowless_replay(projection.input_items)
+    if projected_input is None:
+        return None
+    projected_payload = payload.model_copy(update={"input": projected_input, "previous_response_id": None})
     self_contained = responses_input_items_are_self_contained_rowless_replay(
         input_items,
-        projection.input_items,
+        projected_input,
     )
     account_neutral_input = [
-        item for item in projection.input_items if not (isinstance(item, dict) and item.get("type") == "agent_message")
+        item for item in projected_input if not (isinstance(item, dict) and item.get("type") == "agent_message")
     ]
     account_neutral_payload = projected_payload.model_copy(update={"input": account_neutral_input})
     return RowlessRecoveryCaptureFacts(
@@ -165,7 +169,7 @@ def build_rowless_recovery_capture_facts(
         projected_payload_fingerprint=rowless_forwarding_payload_fingerprint(projected_payload),
         actual_wire_fingerprint=rowless_forwarding_payload_fingerprint(projected_payload),
         unresolved_count=ledger.unresolved_count,
-        projected_input=projection.input_items,
+        projected_input=projected_input,
         self_contained=self_contained,
         account_neutral=(
             self_contained
@@ -201,12 +205,15 @@ def approved_rowless_recovery_projection(
         input_items,
         stored_count=captured_input_item_count,
     )
-    if projection is None or not responses_input_items_are_self_contained_rowless_replay(
+    if projection is None:
+        return None
+    projected_input = normalize_responses_input_for_rowless_replay(projection.input_items)
+    if projected_input is None or not responses_input_items_are_self_contained_rowless_replay(
         input_items,
-        projection.input_items,
+        projected_input,
     ):
         return None
-    projected_payload = payload.model_copy(update={"input": projection.input_items, "previous_response_id": None})
+    projected_payload = payload.model_copy(update={"input": projected_input, "previous_response_id": None})
     if rowless_forwarding_payload_fingerprint(projected_payload) != projected_payload_fingerprint:
         return None
-    return projection.input_items
+    return projected_input

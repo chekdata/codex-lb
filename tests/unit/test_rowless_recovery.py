@@ -1125,6 +1125,161 @@ def test_rowless_exact_three_sanitized_incident_shapes_are_self_contained_and_ex
         )
 
 
+def test_rowless_capture_normalizes_only_exact_empty_output_and_encrypted_agent_transport_parts() -> None:
+    items: list[object] = [
+        {
+            "type": "custom_tool_call",
+            "call_id": "call-1",
+            "name": "fixture_tool",
+            "input": "{}",
+            "status": "completed",
+        },
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call-1",
+            "output": [
+                {"type": "input_text", "text": "settled"},
+                {"type": "input_text", "text": ""},
+            ],
+        },
+        {
+            "type": "function_call",
+            "call_id": "call-2",
+            "namespace": "collaboration",
+            "name": "send_message",
+            "arguments": "{}",
+        },
+        {"type": "function_call_output", "call_id": "call-2", "output": "settled"},
+        {
+            "type": "agent_message",
+            "id": "amsg_00000000-0000-4000-8000-000000000001",
+            "author": "/root/worker",
+            "recipient": "/root",
+            "content": [
+                {"type": "input_text", "text": "completed"},
+                {"type": "encrypted_content", "encrypted_content": "opaque-response-state"},
+            ],
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "00000000-0000-4000-8000-000000000002",
+                "create_time": 1.0,
+            },
+        },
+        {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+    ]
+    payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.6-sol",
+            "instructions": "sanitized fixture",
+            "previous_response_id": "resp_stale_fixture",
+            "prompt_cache_key": "fixture-task",
+            "input": items,
+        }
+    )
+
+    facts = build_rowless_recovery_capture_facts(payload)
+
+    assert facts is not None
+    assert facts.self_contained
+    assert facts.account_neutral
+    assert facts.unresolved_count == 0
+    projected_output = next(
+        cast(dict[str, object], item)
+        for item in facts.projected_input
+        if isinstance(item, dict) and item.get("type") == "custom_tool_call_output"
+    )
+    assert projected_output["output"] == [{"type": "input_text", "text": "settled"}]
+    projected_function_call = next(
+        cast(dict[str, object], item)
+        for item in facts.projected_input
+        if isinstance(item, dict) and item.get("type") == "function_call"
+    )
+    assert projected_function_call["namespace"] == "collaboration"
+    projected_agent = next(
+        cast(dict[str, object], item)
+        for item in facts.projected_input
+        if isinstance(item, dict) and item.get("type") == "agent_message"
+    )
+    assert projected_agent["content"] == [{"type": "input_text", "text": "completed"}]
+    assert (
+        approved_rowless_recovery_projection(
+            payload,
+            captured_input_item_count=facts.input_item_count,
+            captured_input_fingerprint=facts.input_fingerprint,
+            non_input_contract_fingerprint=facts.contract_fingerprint,
+            direct_call_ledger_digest=facts.direct_call_ledger_digest,
+            projected_payload_fingerprint=facts.projected_payload_fingerprint,
+        )
+        == facts.projected_input
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda items: cast(
+            dict[str, object], cast(list[object], cast(dict[str, object], items[1])["output"])[1]
+        ).update({"unexpected": "drift"}),
+        lambda items: cast(
+            dict[str, object], cast(list[object], cast(dict[str, object], items[2])["content"])[1]
+        ).update({"unexpected": "drift"}),
+        lambda items: cast(dict[str, object], items[2]).update(
+            {
+                "content": [
+                    {"type": "encrypted_content", "encrypted_content": "opaque-response-state"},
+                    {"type": "input_text", "text": "completed"},
+                ]
+            }
+        ),
+    ),
+)
+def test_rowless_transport_artifact_normalization_rejects_semantic_or_shape_drift(mutate) -> None:
+    items: list[object] = [
+        {
+            "type": "custom_tool_call",
+            "call_id": "call-1",
+            "name": "fixture_tool",
+            "input": "{}",
+            "status": "completed",
+        },
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call-1",
+            "output": [
+                {"type": "input_text", "text": "settled"},
+                {"type": "input_text", "text": ""},
+            ],
+        },
+        {
+            "type": "agent_message",
+            "id": "amsg_00000000-0000-4000-8000-000000000001",
+            "author": "/root/worker",
+            "recipient": "/root",
+            "content": [
+                {"type": "input_text", "text": "completed"},
+                {"type": "encrypted_content", "encrypted_content": "opaque-response-state"},
+            ],
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "00000000-0000-4000-8000-000000000002",
+                "create_time": 1.0,
+            },
+        },
+        {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+    ]
+    mutate(items)
+    payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.6-sol",
+            "instructions": "sanitized fixture",
+            "previous_response_id": "resp_stale_fixture",
+            "prompt_cache_key": "fixture-task",
+            "input": items,
+        }
+    )
+
+    facts = build_rowless_recovery_capture_facts(payload)
+    assert facts is None or not facts.self_contained or not facts.account_neutral
+
+
 def test_rowless_capture_rejects_transformable_external_image_url() -> None:
     payload = ResponsesRequest.model_validate(
         {
@@ -1221,7 +1376,7 @@ def test_rowless_agent_message_proof_rejects_shape_metadata_and_boundary_drift()
     )
     malformed_variants.append(dangling_after_agent)
 
-    for malformed in malformed_variants:
+    for variant_index, malformed in enumerate(malformed_variants):
         payload = ResponsesRequest.model_validate(
             {
                 "model": "gpt-5.1",
@@ -1232,7 +1387,7 @@ def test_rowless_agent_message_proof_rejects_shape_metadata_and_boundary_drift()
             }
         )
         facts = build_rowless_recovery_capture_facts(payload)
-        assert facts is None or not facts.self_contained or not facts.account_neutral
+        assert facts is None or not facts.self_contained or not facts.account_neutral, f"variant {variant_index}"
 
 
 @pytest.mark.asyncio
