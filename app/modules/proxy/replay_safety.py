@@ -930,12 +930,23 @@ def responses_input_retains_prior_output_and_root_retry_chain(
             continue
         if item.get("type") not in (None, "message") or item.get("role") != "assistant":
             continue
-        if item.get("phase") != "final_answer" or not _is_retained_response_message(item):
+        if item.get("phase") != "final_answer":
+            continue
+        if not _is_retained_response_message(item):
             return False
 
         followups = input_items[index + 1 :]
         if len(followups) < 2:
             return False
+        # ResponsesRequest hoists developer messages for non-Lite requests.
+        # Require the canonical Lite bundle so the staged ordering proof sees
+        # the exact developer items received on the wire.
+        if (
+            bool(input_items)
+            and _is_canonical_lite_tool_bundle(input_items[0])
+            and _staged_settled_custom_tool_root_retry_chain_is_bounded(followups)
+        ):
+            return True
         if _settled_custom_tool_root_retry_chain_is_bounded(followups):
             return True
         user_count = 0
@@ -960,6 +971,128 @@ def responses_input_retains_prior_output_and_root_retry_chain(
             return False
         return user_count >= 2 and not developer_pending_user
     return False
+
+
+def _staged_settled_custom_tool_root_retry_chain_is_bounded(
+    followups: list[JsonValue],
+) -> bool:
+    """Accept one fully settled partial response between failed retry chains."""
+
+    index = 0
+    message_ids: set[str] = set()
+    initial_user_count = 0
+    developer_pending_user = False
+    while index < len(followups):
+        item = followups[index]
+        if not isinstance(item, dict):
+            return False
+        if _is_response_owned_user_message(item):
+            message_id = cast(str, item["id"])
+            if message_id in message_ids:
+                return False
+            message_ids.add(message_id)
+            initial_user_count += 1
+            developer_pending_user = False
+            index += 1
+            continue
+        if _is_response_owned_developer_message(item):
+            message_id = cast(str, item["id"])
+            if message_id in message_ids or initial_user_count == 0 or developer_pending_user:
+                return False
+            message_ids.add(message_id)
+            developer_pending_user = True
+            index += 1
+            continue
+        break
+    if initial_user_count < 2 or developer_pending_user or index >= len(followups):
+        return False
+
+    reasoning_seen = False
+    commentary_seen = False
+    settled_call_count = 0
+    seen_call_ids: set[str] = set()
+    seen_call_item_ids: set[str] = set()
+    seen_output_ids: set[str] = set()
+    while index < len(followups):
+        item = followups[index]
+        if not isinstance(item, dict):
+            return False
+        if item.get("type") == "reasoning":
+            if not _is_response_owned_reasoning_boundary_item(item):
+                return False
+            reasoning_seen = True
+            index += 1
+            continue
+        if item.get("type") in (None, "message") and item.get("role") == "assistant":
+            if not _is_response_owned_commentary_message(item):
+                return False
+            message_id = cast(str, item["id"])
+            if message_id in message_ids:
+                return False
+            message_ids.add(message_id)
+            commentary_seen = True
+            index += 1
+            continue
+        if item.get("type") != "custom_tool_call":
+            break
+        call_id = item.get("call_id")
+        item_id = item.get("id")
+        if (
+            not _is_nonblank_string(call_id)
+            or cast(str, call_id) in seen_call_ids
+            or not _is_bounded_response_owned_item_id(item_id, prefix="ctc_")
+            or cast(str, item_id) in seen_call_item_ids
+            or item.get("status") != "completed"
+            or not _input_item_has_only_known_fields(item, "custom_tool_call")
+            or not _caller_is_self_contained(item)
+            or not _response_owned_tool_metadata_is_account_neutral(item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD))
+            or not _tool_call_is_self_contained("custom_tool_call", item)
+            or index + 1 >= len(followups)
+        ):
+            return False
+        output = followups[index + 1]
+        output_id = output.get("id") if isinstance(output, dict) else None
+        if (
+            not isinstance(output, dict)
+            or output.get("type") != "custom_tool_call_output"
+            or output.get("call_id") != call_id
+            or not _is_bounded_response_owned_item_id(output_id, prefix="ctco_")
+            or cast(str, output_id) in seen_output_ids
+            or output.get("status") not in (None, "completed")
+            or not _input_item_has_only_known_fields(output, "custom_tool_call_output")
+            or not _caller_is_self_contained(output)
+            or not _response_owned_tool_metadata_is_account_neutral(output.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD))
+            or not _tool_output_is_self_contained("custom_tool_call_output", output)
+        ):
+            return False
+        seen_call_ids.add(cast(str, call_id))
+        seen_call_item_ids.add(cast(str, item_id))
+        seen_output_ids.add(cast(str, output_id))
+        settled_call_count += 1
+        index += 2
+
+    if not reasoning_seen or not commentary_seen or settled_call_count == 0:
+        return False
+
+    if index < len(followups):
+        item = followups[index]
+        if isinstance(item, dict) and _is_response_owned_developer_message(item):
+            message_id = cast(str, item["id"])
+            if message_id in message_ids:
+                return False
+            message_ids.add(message_id)
+            index += 1
+
+    retry_user_count = 0
+    for item in followups[index:]:
+        if not isinstance(item, dict) or not _is_response_owned_user_message(item):
+            return False
+        message_id = cast(str, item["id"])
+        if message_id in message_ids:
+            return False
+        message_ids.add(message_id)
+        retry_user_count += 1
+    return retry_user_count >= 2
 
 
 def _settled_custom_tool_root_retry_chain_is_bounded(
@@ -1508,6 +1641,51 @@ def _is_retained_response_message(item: Mapping[str, JsonValue]) -> bool:
     ):
         return False
     return _message_has_valid_account_neutral_content(item)
+
+
+def _is_response_owned_commentary_message(item: Mapping[str, JsonValue]) -> bool:
+    """Validate a persisted assistant commentary item inside a partial response."""
+
+    item_id = item.get("id")
+    metadata = item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
+    return (
+        item.get("type") == "message"
+        and item.get("role") == "assistant"
+        and item.get("phase") == "commentary"
+        and item.get("status") in (None, "completed")
+        and _is_bounded_response_owned_item_id(item_id, prefix="msg_")
+        and (
+            metadata is None
+            or (
+                isinstance(metadata, dict)
+                and set(metadata) == _RESPONSE_OWNED_AGENT_MESSAGE_METADATA_FIELDS
+                and _is_uuid(metadata.get("turn_id"))
+                and _is_finite_nonnegative_number(metadata.get("create_time"))
+            )
+        )
+        and _input_item_has_only_known_fields(item, "message")
+        and _message_has_valid_account_neutral_content(item)
+    )
+
+
+def _is_bounded_response_owned_item_id(value: JsonValue | None, *, prefix: str) -> bool:
+    if not isinstance(value, str) or not value.startswith(prefix):
+        return False
+    suffix = value.removeprefix(prefix)
+    return (
+        1 <= len(suffix) <= 256
+        and suffix.isascii()
+        and all(character.isalnum() or character in {"-", "_"} for character in suffix)
+    )
+
+
+def _response_owned_tool_metadata_is_account_neutral(value: JsonValue | None) -> bool:
+    return _internal_chat_message_metadata_is_account_neutral(value) or (
+        isinstance(value, dict)
+        and set(value) == _RESPONSE_OWNED_AGENT_MESSAGE_METADATA_FIELDS
+        and _is_nonblank_string(value.get("turn_id"))
+        and _is_finite_nonnegative_number(value.get("create_time"))
+    )
 
 
 def _is_retained_agent_message(item: Mapping[str, JsonValue]) -> bool:

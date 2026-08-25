@@ -1709,6 +1709,43 @@ def test_rowless_capture_accepts_canonical_root_retry_chain_for_automatic_recove
     assert facts.retains_prior_output
 
 
+def test_staged_settled_retry_requires_lite_bundle_to_preserve_developer_order() -> None:
+    from tests.unit.test_replay_safety import _staged_settled_custom_tool_retry_chain
+
+    lite_input = _staged_settled_custom_tool_retry_chain()
+    common = {
+        "model": "gpt-5.6-sol",
+        "instructions": "sanitized fixture",
+        "previous_response_id": "resp_stale_fixture",
+        "prompt_cache_key": "fixture-task",
+    }
+    lite_facts = build_rowless_recovery_capture_facts(ResponsesRequest.model_validate({**common, "input": lite_input}))
+    non_lite_facts = build_rowless_recovery_capture_facts(
+        ResponsesRequest.model_validate({**common, "input": lite_input[1:]})
+    )
+    malformed_lite_input = copy.deepcopy(lite_input)
+    duplicate_developer = copy.deepcopy(malformed_lite_input[3])
+    cast(dict[str, object], duplicate_developer)["id"] = "msg_00000000-0000-4000-8000-000000000299"
+    malformed_lite_input.insert(4, duplicate_developer)
+    malformed_lite_facts = build_rowless_recovery_capture_facts(
+        ResponsesRequest.model_validate({**common, "input": malformed_lite_input})
+    )
+    misplaced_lite_input = copy.deepcopy(lite_input)
+    misplaced_lite_input.insert(0, {"type": "message", "role": "user", "content": "non-Lite prefix"})
+    misplaced_lite_facts = build_rowless_recovery_capture_facts(
+        ResponsesRequest.model_validate({**common, "input": misplaced_lite_input})
+    )
+
+    assert lite_facts is not None
+    assert lite_facts.retains_prior_output
+    assert non_lite_facts is not None
+    assert not non_lite_facts.retains_prior_output
+    assert malformed_lite_facts is not None
+    assert not malformed_lite_facts.retains_prior_output
+    assert misplaced_lite_facts is not None
+    assert not misplaced_lite_facts.retains_prior_output
+
+
 def test_rowless_capture_normalizes_only_exact_empty_output_and_encrypted_agent_transport_parts() -> None:
     items: list[object] = [
         {
