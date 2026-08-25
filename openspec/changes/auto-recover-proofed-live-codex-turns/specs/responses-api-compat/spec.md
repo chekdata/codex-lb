@@ -65,6 +65,22 @@ employee MUST NOT need to visit the dashboard or retry the turn.
   identifier, leading developer message, or trailing developer message in the
   retry tail MUST keep the request fail closed.
 
+#### Scenario: Settled post-answer tool history does not strand a failed follow-up retry
+
+- **GIVEN** an official root turn retains a completed assistant final answer
+- **AND** its trailing history contains canonical response-owned reasoning and
+  one or more adjacent self-contained `custom_tool_call` and matching output
+  pairs with unique call IDs and no unresolved call
+- **AND** at most one bounded account-neutral developer refresh precedes at
+  least two response-owned user retry messages
+- **WHEN** the live retry independently satisfies every automatic recovery
+  identity, settlement, account-neutrality, and at-most-once gate
+- **THEN** the service MAY supersede a physically unsent CAPTURED or APPROVED
+  generation and claim the exact anchor-free request once
+- **BUT** a missing or reordered output, mismatched or duplicate call ID,
+  unknown tool type, malformed reasoning, second developer message, or fewer
+  than two retry messages MUST keep the request fail closed.
+
 #### Scenario: Marker-backed anchorless retry uses the verified stale anchor
 
 - **GIVEN** an eligible official root turn omits `previous_response_id`

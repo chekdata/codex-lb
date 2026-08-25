@@ -26,6 +26,15 @@ never contains consecutive developer messages. Assistant output, tool
 activity, unknown items, duplicate IDs, and malformed ordering remain
 ineligible. All other automatic recovery gates still apply independently.
 
+One narrower continuation shape is also eligible after a completed assistant
+final answer: canonical response-owned reasoning, at least one adjacent
+`custom_tool_call`/`custom_tool_call_output` pair with exact unique call-ID
+matching and a self-contained completed or failed output, at most one bounded
+account-neutral developer refresh, and then at least two response-owned user
+retry messages. The reasoning and settled pair are retained history, not a
+request to execute the tool again. Missing, reordered, duplicated, unknown, or
+unsettled calls remain ineligible.
+
 ## Live first-attempt recovery
 
 When upstream rejects the explicit anchor before `response.created` and before
