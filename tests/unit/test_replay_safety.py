@@ -4575,6 +4575,117 @@ def test_rowless_root_retry_chain_accepts_only_response_owned_failed_turn_inputs
     assert responses_input_retains_prior_output_and_root_retry_chain(input_items)
 
 
+def test_rowless_root_retry_chain_accepts_settled_custom_tool_tail_before_failed_turns() -> None:
+    input_items: list[JsonValue] = [
+        {
+            "type": "message",
+            "role": "assistant",
+            "phase": "final_answer",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "prior answer"}],
+        },
+        {
+            "type": "reasoning",
+            "id": "rs_00000000-0000-4000-8000-000000000001",
+            "encrypted_content": "opaque",
+            "summary": [],
+            "status": "completed",
+        },
+        {
+            "type": "custom_tool_call",
+            "id": "ctc_00000000-0000-4000-8000-000000000001",
+            "call_id": "call_settled",
+            "name": "shell",
+            "input": "pwd",
+            "status": "completed",
+        },
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call_settled",
+            "output": "verified",
+            "status": "completed",
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000001",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "bounded retry context"}],
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000002",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "first failed retry"}],
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000003",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "live retry"}],
+        },
+    ]
+
+    assert responses_input_retains_prior_output_and_root_retry_chain(input_items)
+
+
+@pytest.mark.parametrize("mutation", ["missing-output", "mismatched-output", "missing-reasoning", "one-retry"])
+def test_rowless_root_retry_chain_rejects_unproven_settled_custom_tool_tail(mutation: str) -> None:
+    reasoning: JsonValue = {
+        "type": "reasoning",
+        "id": "rs_00000000-0000-4000-8000-000000000101",
+        "encrypted_content": "opaque",
+        "summary": [],
+        "status": "completed",
+    }
+    call: JsonValue = {
+        "type": "custom_tool_call",
+        "id": "ctc_00000000-0000-4000-8000-000000000101",
+        "call_id": "call_settled",
+        "name": "shell",
+        "input": "pwd",
+        "status": "completed",
+    }
+    output: JsonValue = {
+        "type": "custom_tool_call_output",
+        "call_id": "call_other" if mutation == "mismatched-output" else "call_settled",
+        "output": "verified",
+        "status": "completed",
+    }
+    tail = ([] if mutation == "missing-reasoning" else [reasoning]) + [call]
+    if mutation != "missing-output":
+        tail.append(output)
+    tail.extend(
+        [
+            {
+                "type": "message",
+                "id": "msg_00000000-0000-4000-8000-000000000102",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "first failed retry"}],
+            },
+            {
+                "type": "message",
+                "id": "msg_00000000-0000-4000-8000-000000000103",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "live retry"}],
+            },
+        ]
+    )
+    if mutation == "one-retry":
+        tail.pop()
+    input_items: list[JsonValue] = [
+        {
+            "type": "message",
+            "role": "assistant",
+            "phase": "final_answer",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "prior answer"}],
+        },
+        *tail,
+    ]
+
+    assert not responses_input_retains_prior_output_and_root_retry_chain(input_items)
+
+
 @pytest.mark.parametrize(
     "invalid_followup",
     [

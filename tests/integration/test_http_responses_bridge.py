@@ -1929,6 +1929,7 @@ async def test_rowless_child_thread_sharing_root_bridge_identity_fails_closed_wi
         "automatic_root_retry_chain",
         "automatic_root_retry_chain_operator_approved",
         "automatic_root_retry_chain_operator_approved_anchorless",
+        "automatic_settled_tool_retry_chain_operator_approved_anchorless",
         "automatic_legacy_unknown",
         "automatic_legacy_consumed",
         "automatic_legacy_unknown_missing_thread",
@@ -2305,6 +2306,7 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
     if resolution_mode in {
         "automatic_root_retry_chain_operator_approved",
         "automatic_root_retry_chain_operator_approved_anchorless",
+        "automatic_settled_tool_retry_chain_operator_approved_anchorless",
     }:
         async with SessionLocal() as db_session:
             repository = RowlessRecoveryRepository(db_session)
@@ -2441,6 +2443,7 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
             "automatic_root_retry_chain",
             "automatic_root_retry_chain_operator_approved",
             "automatic_root_retry_chain_operator_approved_anchorless",
+            "automatic_settled_tool_retry_chain_operator_approved_anchorless",
         }:
             automatic_full_resend = [
                 *automatic_full_resend[:-1],
@@ -2459,6 +2462,50 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
                 {
                     "type": "message",
                     "id": "msg_00000000-0000-4000-8000-000000000033",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "live retry"}],
+                },
+            ]
+        if resolution_mode == "automatic_settled_tool_retry_chain_operator_approved_anchorless":
+            automatic_full_resend = [
+                *automatic_full_resend[:-3],
+                {
+                    "type": "reasoning",
+                    "id": "rs_00000000-0000-4000-8000-000000000041",
+                    "content": None,
+                    "encrypted_content": "opaque",
+                    "summary": [],
+                    "status": "completed",
+                },
+                {
+                    "type": "custom_tool_call",
+                    "id": "ctc_00000000-0000-4000-8000-000000000041",
+                    "call_id": "call_settled_after_answer",
+                    "name": "shell",
+                    "input": "pwd",
+                    "status": "completed",
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_settled_after_answer",
+                    "output": "verified",
+                    "status": "completed",
+                },
+                {
+                    "type": "message",
+                    "id": "msg_00000000-0000-4000-8000-000000000042",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "bounded retry context"}],
+                },
+                {
+                    "type": "message",
+                    "id": "msg_00000000-0000-4000-8000-000000000043",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "first failed retry"}],
+                },
+                {
+                    "type": "message",
+                    "id": "msg_00000000-0000-4000-8000-000000000044",
                     "role": "user",
                     "content": [{"type": "input_text", "text": "live retry"}],
                 },
@@ -2516,7 +2563,10 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
         }
         if automatic_client_metadata is not None:
             automatic_request["client_metadata"] = automatic_client_metadata
-        if resolution_mode == "automatic_root_retry_chain_operator_approved_anchorless":
+        if resolution_mode in {
+            "automatic_root_retry_chain_operator_approved_anchorless",
+            "automatic_settled_tool_retry_chain_operator_approved_anchorless",
+        }:
             automatic_request.pop("previous_response_id")
         automatic_request_task = asyncio.create_task(
             async_client.post(

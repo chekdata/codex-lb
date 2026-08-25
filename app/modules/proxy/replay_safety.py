@@ -936,6 +936,8 @@ def responses_input_retains_prior_output_and_root_retry_chain(
         followups = input_items[index + 1 :]
         if len(followups) < 2:
             return False
+        if _settled_custom_tool_root_retry_chain_is_bounded(followups):
+            return True
         user_count = 0
         developer_pending_user = False
         message_ids: set[str] = set()
@@ -958,6 +960,83 @@ def responses_input_retains_prior_output_and_root_retry_chain(
             return False
         return user_count >= 2 and not developer_pending_user
     return False
+
+
+def _settled_custom_tool_root_retry_chain_is_bounded(
+    followups: list[JsonValue],
+) -> bool:
+    """Accept only a fully settled response tail before canonical retries."""
+
+    index = 0
+    reasoning_seen = False
+    settled_call_count = 0
+    seen_call_ids: set[str] = set()
+    while index < len(followups):
+        item = followups[index]
+        if not isinstance(item, dict):
+            return False
+        if item.get("type") == "reasoning":
+            if not _is_response_owned_reasoning_boundary_item(item):
+                return False
+            reasoning_seen = True
+            index += 1
+            continue
+        if item.get("type") != "custom_tool_call":
+            break
+        call_id = item.get("call_id")
+        item_id = item.get("id")
+        if (
+            not _is_nonblank_string(call_id)
+            or cast(str, call_id) in seen_call_ids
+            or not isinstance(item_id, str)
+            or not item_id.startswith("ctc_")
+            or not _input_item_has_only_known_fields(item, "custom_tool_call")
+            or not _tool_call_is_self_contained("custom_tool_call", item)
+            or index + 1 >= len(followups)
+        ):
+            return False
+        output = followups[index + 1]
+        if (
+            not isinstance(output, dict)
+            or output.get("type") != "custom_tool_call_output"
+            or output.get("call_id") != call_id
+            or not _input_item_has_only_known_fields(output, "custom_tool_call_output")
+            or not _tool_output_is_self_contained("custom_tool_call_output", output)
+        ):
+            return False
+        seen_call_ids.add(cast(str, call_id))
+        settled_call_count += 1
+        index += 2
+
+    if not reasoning_seen or settled_call_count == 0:
+        return False
+    if index < len(followups):
+        item = followups[index]
+        developer_item_type = (
+            cast(str, item.get("type")) if isinstance(item, dict) and isinstance(item.get("type"), str) else None
+        )
+        if isinstance(item, dict) and (
+            _is_response_owned_developer_message(item)
+            or _historical_pending_developer_message_is_transparent(
+                item,
+                item_type=developer_item_type,
+            )
+            or _fresh_developer_message_is_transparent(item)
+        ):
+            index += 1
+
+    retries = followups[index:]
+    if len(retries) < 2:
+        return False
+    message_ids: set[str] = set()
+    for item in retries:
+        if not isinstance(item, dict) or not _is_response_owned_user_message(item):
+            return False
+        message_id = item.get("id")
+        if not isinstance(message_id, str) or message_id in message_ids:
+            return False
+        message_ids.add(message_id)
+    return True
 
 
 def responses_input_suffix_matches_pending_tool_calls(
