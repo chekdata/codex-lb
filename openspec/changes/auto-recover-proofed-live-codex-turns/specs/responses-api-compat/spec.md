@@ -81,6 +81,29 @@ employee MUST NOT need to visit the dashboard or retry the turn.
   unknown tool type, malformed reasoning, second developer message, or fewer
   than two retry messages MUST keep the request fail closed.
 
+#### Scenario: Settled Responses Lite progress between failed retry chains remains recoverable
+
+- **GIVEN** an official root turn retains a canonical Responses Lite tool
+  bundle and a completed assistant final answer
+- **AND** a canonical response-owned retry chain with at least two user
+  messages precedes a partial response
+- **AND** the partial response contains canonical reasoning, a response-owned
+  assistant commentary message, and one or more adjacent completed
+  `custom_tool_call` and matching completed output pairs
+- **AND** an optional single response-owned developer refresh precedes at
+  least two response-owned user messages in the final retry chain
+- **WHEN** the live retry independently satisfies every automatic recovery
+  identity, settlement, account-neutrality, and at-most-once gate
+- **THEN** the service MAY supersede a physically unsent CAPTURED or APPROVED
+  generation and claim the exact anchor-free request once
+- **BUT** duplicate message, call, or output IDs; arbitrary assistant phases;
+  malformed developer ordering; unresolved or unknown calls; missing or
+  mismatched outputs; or fewer than two users in either retry chain MUST keep
+  the request fail closed.
+- **AND** a request without the canonical Lite bundle MUST remain ineligible
+  for this staged proof because developer ordering cannot be reconstructed
+  after instruction normalization.
+
 #### Scenario: Marker-backed anchorless retry uses the verified stale anchor
 
 - **GIVEN** an eligible official root turn omits `previous_response_id`

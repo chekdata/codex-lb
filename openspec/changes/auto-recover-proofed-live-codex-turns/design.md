@@ -35,6 +35,23 @@ retry messages. The reasoning and settled pair are retained history, not a
 request to execute the tool again. Missing, reordered, duplicated, unknown, or
 unsettled calls remain ineligible.
 
+Official Codex Responses Lite can also retain an earlier canonical failed-retry
+message chain, make substantive progress in a partial response, and then
+persist another failed-retry chain. That staged shape is eligible only when a
+canonical Lite tool bundle keeps developer messages in the input instead of
+letting request normalization hoist them; the earlier chain contains at least
+two response-owned user messages with bounded developer interleaves; the
+partial response contains canonical reasoning, at least one response-owned
+assistant commentary message, and one or more immediately settled completed
+custom-tool pairs; and the final chain contains an optional single
+response-owned developer message followed by at least two response-owned user
+messages. Tool metadata may be absent, contain only a nonblank turn ID, or use
+the exact response-owned turn-ID plus finite create-time shape already accepted
+by replay projection. Message IDs, call IDs, call-item IDs, and output IDs must
+be valid and unique within the proofed tail. Any arbitrary assistant phase,
+malformed developer ordering, unknown tool type, non-completed call or output,
+or missing/mismatched output keeps the request ineligible.
+
 ## Live first-attempt recovery
 
 When upstream rejects the explicit anchor before `response.created` and before

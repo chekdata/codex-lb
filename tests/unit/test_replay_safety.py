@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -4626,6 +4627,197 @@ def test_rowless_root_retry_chain_accepts_settled_custom_tool_tail_before_failed
     ]
 
     assert responses_input_retains_prior_output_and_root_retry_chain(input_items)
+
+
+def _staged_settled_custom_tool_retry_chain() -> list[JsonValue]:
+    return [
+        {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "shell",
+                    "description": "Run a bounded shell command.",
+                    "format": {"type": "text"},
+                }
+            ],
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "phase": "final_answer",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "prior answer"}],
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000201",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "first historical retry"}],
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000202",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "bounded historical context"}],
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000203",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "second historical retry"}],
+        },
+        {
+            "type": "reasoning",
+            "id": "rs_00000000-0000-4000-8000-000000000204",
+            "encrypted_content": "opaque",
+            "summary": [],
+            "status": "completed",
+        },
+        {
+            "type": "message",
+            "id": "msg_08639659bba14680016a8a0902e9a887d090946ff27b898f05",
+            "role": "assistant",
+            "phase": "commentary",
+            "content": [{"type": "output_text", "text": "working on the retained task"}],
+        },
+        {
+            "type": "custom_tool_call",
+            "id": "ctc_00000000-0000-4000-8000-000000000206",
+            "call_id": "call_staged_1",
+            "name": "shell",
+            "input": "pwd",
+            "status": "completed",
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "00000000-0000-4000-8000-000000000206",
+                "create_time": 1.0,
+            },
+        },
+        {
+            "type": "custom_tool_call_output",
+            "id": "ctco_00000000-0000-4000-8000-000000000207",
+            "call_id": "call_staged_1",
+            "output": "verified",
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "00000000-0000-4000-8000-000000000207",
+                "create_time": 2.0,
+            },
+        },
+        {
+            "type": "reasoning",
+            "id": "rs_00000000-0000-4000-8000-000000000208",
+            "encrypted_content": "opaque",
+            "summary": [],
+            "status": "completed",
+        },
+        {
+            "type": "custom_tool_call",
+            "id": "ctc_00000000-0000-4000-8000-000000000209",
+            "call_id": "call_staged_2",
+            "name": "shell",
+            "input": "git status --short",
+            "status": "completed",
+        },
+        {
+            "type": "custom_tool_call_output",
+            "id": "ctco_00000000-0000-4000-8000-000000000210",
+            "call_id": "call_staged_2",
+            "output": "clean",
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000211",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "bounded retry context"}],
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000212",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "first current retry"}],
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000213",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "live retry"}],
+        },
+    ]
+
+
+def test_rowless_root_retry_chain_accepts_staged_settled_custom_tool_response() -> None:
+    assert responses_input_retains_prior_output_and_root_retry_chain(_staged_settled_custom_tool_retry_chain())
+
+
+def test_rowless_root_retry_chain_rejects_staged_lite_bundle_outside_canonical_prefix() -> None:
+    input_items = _staged_settled_custom_tool_retry_chain()
+    input_items.insert(0, {"type": "message", "role": "user", "content": "non-Lite prefix"})
+
+    assert not responses_input_retains_prior_output_and_root_retry_chain(input_items)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "commentary-missing",
+        "commentary-unknown-phase",
+        "duplicate-message-id",
+        "duplicate-call-id",
+        "duplicate-output-id",
+        "mismatched-output",
+        "missing-output",
+        "invalid-developer-sequence",
+        "unresolved-call",
+        "failed-output",
+        "invalid-tool-metadata",
+        "malformed-tool-item-id",
+        "unknown-tool-type",
+        "arbitrary-assistant-message",
+        "one-current-retry",
+    ],
+)
+def test_rowless_root_retry_chain_rejects_unproven_staged_settled_response(mutation: str) -> None:
+    input_items = copy.deepcopy(_staged_settled_custom_tool_retry_chain())
+    commentary = cast(dict[str, JsonValue], input_items[6])
+    second_call = cast(dict[str, JsonValue], input_items[10])
+    second_output = cast(dict[str, JsonValue], input_items[11])
+    if mutation == "commentary-missing":
+        input_items.pop(6)
+    elif mutation == "commentary-unknown-phase":
+        commentary["phase"] = "future"
+    elif mutation == "duplicate-message-id":
+        cast(dict[str, JsonValue], input_items[-1])["id"] = cast(dict[str, JsonValue], input_items[2])["id"]
+    elif mutation == "duplicate-call-id":
+        second_call["call_id"] = "call_staged_1"
+        second_output["call_id"] = "call_staged_1"
+    elif mutation == "duplicate-output-id":
+        second_output["id"] = cast(dict[str, JsonValue], input_items[8])["id"]
+    elif mutation == "mismatched-output":
+        second_output["call_id"] = "call_other"
+    elif mutation == "missing-output":
+        input_items.pop(11)
+    elif mutation == "invalid-developer-sequence":
+        cast(dict[str, JsonValue], input_items[4])["role"] = "developer"
+    elif mutation == "unresolved-call":
+        second_call["status"] = "in_progress"
+    elif mutation == "failed-output":
+        second_output["status"] = "failed"
+    elif mutation == "invalid-tool-metadata":
+        second_output["internal_chat_message_metadata_passthrough"] = {
+            "turn_id": "00000000-0000-4000-8000-000000000210",
+            "create_time": -1.0,
+        }
+    elif mutation == "malformed-tool-item-id":
+        second_call["id"] = "ctc_"
+    elif mutation == "unknown-tool-type":
+        second_call["type"] = "computer_call"
+    elif mutation == "arbitrary-assistant-message":
+        commentary.pop("phase")
+    elif mutation == "one-current-retry":
+        input_items.pop()
+
+    assert not responses_input_retains_prior_output_and_root_retry_chain(input_items)
 
 
 @pytest.mark.parametrize("mutation", ["missing-output", "mismatched-output", "missing-reasoning", "one-retry"])

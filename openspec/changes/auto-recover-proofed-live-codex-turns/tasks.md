@@ -14,6 +14,9 @@
 - [x] Admit the exact response-owned reasoning plus fully settled custom-tool
   tail observed after a recovered follow-up, while rejecting every incomplete
   or reordered variant.
+- [x] Admit the exact staged failed-retry, assistant-commentary, settled-tool,
+  and final-retry shape observed on the original production task while
+  rejecting malformed phases, identifiers, ordering, and settlement.
 - [x] Carry a verified marker-injected stale anchor through anchorless
   automatic preflight without trimming or rebuilding the claimed wire.
 - [x] Expose the automatic-authority rollback floor and map all uniqueness
