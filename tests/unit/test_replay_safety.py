@@ -19,6 +19,7 @@ from app.modules.proxy.replay_safety import (
     account_neutral_codex_turn_metadata_identity,
     project_responses_input_for_abandoned_pending_fresh_replay,
     project_responses_input_for_account_neutral_fresh_replay,
+    responses_input_retains_prior_output_and_root_retry_chain,
     responses_input_suffix_matches_pending_tool_calls,
     responses_input_suffix_proves_abandoned_pending_agent_boundary,
     responses_input_suffix_retains_prior_output,
@@ -4539,3 +4540,94 @@ def test_account_neutral_replay_marker_requires_tagged_existing_hard_kind() -> N
 def test_account_neutral_replay_marker_rejects_empty_nonce() -> None:
     with pytest.raises(ValueError, match="nonce"):
         make_http_bridge_account_neutral_replay_key("")
+
+
+def test_rowless_root_retry_chain_accepts_only_response_owned_failed_turn_inputs() -> None:
+    input_items: list[JsonValue] = [
+        {"role": "user", "content": "original question"},
+        {
+            "type": "message",
+            "role": "assistant",
+            "phase": "final_answer",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "prior answer"}],
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000001",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "first failed retry"}],
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000002",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "bounded retry context"}],
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000003",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "live retry"}],
+        },
+    ]
+
+    assert responses_input_retains_prior_output_and_root_retry_chain(input_items)
+
+
+@pytest.mark.parametrize(
+    "invalid_followup",
+    [
+        pytest.param(
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "unowned retry"}],
+            },
+            id="unowned-user",
+        ),
+        pytest.param(
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_retry",
+                "name": "shell",
+                "input": "pwd",
+            },
+            id="tool-call",
+        ),
+        pytest.param(
+            {
+                "type": "message",
+                "id": "msg_00000000-0000-4000-8000-000000000004",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "trailing developer"}],
+            },
+            id="trailing-developer",
+        ),
+    ],
+)
+def test_rowless_root_retry_chain_rejects_unproven_tail(invalid_followup: JsonValue) -> None:
+    input_items: list[JsonValue] = [
+        {
+            "type": "message",
+            "role": "assistant",
+            "phase": "final_answer",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "prior answer"}],
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000010",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "first failed retry"}],
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000011",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "second failed retry"}],
+        },
+        invalid_followup,
+    ]
+
+    assert not responses_input_retains_prior_output_and_root_retry_chain(input_items)

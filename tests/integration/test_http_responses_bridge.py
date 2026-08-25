@@ -1926,6 +1926,7 @@ async def test_rowless_child_thread_sharing_root_bridge_identity_fails_closed_wi
         "administrator_responses_lite_0149",
         "administrator_child_client_request_id",
         "automatic",
+        "automatic_root_retry_chain",
         "automatic_legacy_unknown",
         "automatic_legacy_consumed",
         "automatic_legacy_unknown_missing_thread",
@@ -2391,6 +2392,28 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
             },
             {"role": "user", "content": "continue the original task"},
         ]
+        if resolution_mode == "automatic_root_retry_chain":
+            automatic_full_resend = [
+                *automatic_full_resend[:-1],
+                {
+                    "type": "message",
+                    "id": "msg_00000000-0000-4000-8000-000000000031",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "first failed retry"}],
+                },
+                {
+                    "type": "message",
+                    "id": "msg_00000000-0000-4000-8000-000000000032",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "bounded retry context"}],
+                },
+                {
+                    "type": "message",
+                    "id": "msg_00000000-0000-4000-8000-000000000033",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "live retry"}],
+                },
+            ]
         if resolution_mode == "automatic_incremental":
             automatic_full_resend = [{"role": "user", "content": "continue the original task"}]
         automatic_headers = dict(headers)

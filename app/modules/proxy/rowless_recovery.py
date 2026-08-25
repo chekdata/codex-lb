@@ -15,6 +15,7 @@ from app.modules.proxy.replay_safety import (
     responses_direct_call_ledger_summary,
     responses_input_items_are_self_contained_rowless_replay,
     responses_input_retains_prior_output_and_fresh_followup,
+    responses_input_retains_prior_output_and_root_retry_chain,
     responses_payload_is_account_neutral_fresh_replay,
 )
 
@@ -181,7 +182,9 @@ def build_rowless_recovery_capture_facts(
     )
     # The wire projection strips response-owned IDs. Keep them only in this
     # classification copy so retained agent output can still be proven.
-    retains_prior_output = responses_input_retains_prior_output_and_fresh_followup(evidence_input)
+    retains_prior_output = responses_input_retains_prior_output_and_fresh_followup(
+        evidence_input
+    ) or responses_input_retains_prior_output_and_root_retry_chain(input_items)
     account_neutral_input = [
         item for item in projected_input if not (isinstance(item, dict) and item.get("type") == "agent_message")
     ]

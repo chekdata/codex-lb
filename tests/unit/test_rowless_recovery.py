@@ -1662,6 +1662,53 @@ def test_automatic_rowless_proof_requires_retained_output_before_fresh_followup(
     assert compacted.retains_prior_output
 
 
+def test_rowless_capture_accepts_canonical_root_retry_chain_for_automatic_recovery() -> None:
+    payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.6-sol",
+            "instructions": "sanitized fixture",
+            "previous_response_id": "resp_stale_fixture",
+            "prompt_cache_key": "fixture-task",
+            "input": [
+                {"role": "user", "content": "original"},
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "original result"}],
+                },
+                {
+                    "type": "message",
+                    "id": "msg_00000000-0000-4000-8000-000000000021",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "first failed retry"}],
+                },
+                {
+                    "type": "message",
+                    "id": "msg_00000000-0000-4000-8000-000000000022",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "bounded retry context"}],
+                },
+                {
+                    "type": "message",
+                    "id": "msg_00000000-0000-4000-8000-000000000023",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "live retry"}],
+                },
+            ],
+        }
+    )
+
+    facts = build_rowless_recovery_capture_facts(payload)
+
+    assert facts is not None
+    assert facts.unresolved_count == 0
+    assert facts.self_contained
+    assert facts.account_neutral
+    assert facts.retains_prior_output
+
+
 def test_rowless_capture_normalizes_only_exact_empty_output_and_encrypted_agent_transport_parts() -> None:
     items: list[object] = [
         {

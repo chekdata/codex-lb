@@ -912,6 +912,54 @@ def responses_input_retains_prior_output_and_fresh_followup(
     return False
 
 
+def responses_input_retains_prior_output_and_root_retry_chain(
+    input_items: list[JsonValue],
+) -> bool:
+    """Prove a completed answer followed only by canonical failed-turn inputs.
+
+    Official Codex can persist several failed root-turn retries before a live
+    rowless recovery reaches the gateway. Those retries are safe evidence only
+    when they contain response-owned user/developer messages and no assistant
+    output or tool activity. Requiring two user messages keeps the ordinary
+    single-follow-up path on its existing stricter proof.
+    """
+
+    for index in range(len(input_items) - 2, -1, -1):
+        item = input_items[index]
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") not in (None, "message") or item.get("role") != "assistant":
+            continue
+        if item.get("phase") != "final_answer" or not _is_retained_response_message(item):
+            return False
+
+        followups = input_items[index + 1 :]
+        if len(followups) < 2:
+            return False
+        user_count = 0
+        developer_pending_user = False
+        message_ids: set[str] = set()
+        for followup in followups:
+            if not isinstance(followup, dict):
+                return False
+            message_id = followup.get("id")
+            if not isinstance(message_id, str) or message_id in message_ids:
+                return False
+            message_ids.add(message_id)
+            if _is_response_owned_user_message(followup):
+                user_count += 1
+                developer_pending_user = False
+                continue
+            if _is_response_owned_developer_message(followup):
+                if user_count == 0 or developer_pending_user:
+                    return False
+                developer_pending_user = True
+                continue
+            return False
+        return user_count >= 2 and not developer_pending_user
+    return False
+
+
 def responses_input_suffix_matches_pending_tool_calls(
     input_items: list[JsonValue],
     *,
