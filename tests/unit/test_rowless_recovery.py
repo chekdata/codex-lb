@@ -9,6 +9,7 @@ from typing import cast
 
 import pytest
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from starlette.requests import Request
 
@@ -28,6 +29,8 @@ from app.db.models import (
 )
 from app.modules.proxy.durable_bridge_repository import DurableBridgeRepository, durable_bridge_hash
 from app.modules.proxy.rowless_recovery import (
+    ROWLESS_AUTHORIZATION_MODE_AUTOMATIC,
+    ROWLESS_AUTHORIZATION_MODE_OPERATOR,
     ROWLESS_SEMANTIC_REBASE_ACKNOWLEDGEMENT,
     RowlessRecoveryCaptureFacts,
     approved_rowless_recovery_projection,
@@ -90,6 +93,7 @@ def _facts(*, input_count: int, account_neutral: bool = True) -> RowlessRecovery
         projected_input=[{"role": "user", "content": "redacted"}],
         self_contained=True,
         account_neutral=account_neutral,
+        retains_prior_output=True,
     )
 
 
@@ -229,6 +233,375 @@ async def test_rowless_approval_separates_full_checkpoint_and_retained_request_l
 
         assert approved.state == HttpBridgeRowlessRecoveryState.APPROVED
         assert approved.captured_input_item_count == retained_input_count
+        assert approved.authorization_mode == ROWLESS_AUTHORIZATION_MODE_OPERATOR
+        assert approved.authorization_proof_sha256 == receipt.sha256()
+
+
+@pytest.mark.asyncio
+async def test_automatic_live_request_claims_new_authority_without_operator_approval(
+    async_session_factory: Callable[[], AsyncSession],
+) -> None:
+    task_id = "task-automatic-live"
+    task_authority_digest = rowless_task_authority_digest(
+        session_id=task_id,
+        prompt_cache_key=task_id,
+        thread_id=task_id,
+    )
+    strong_hash = rowless_strong_session_hash("task_authority", task_authority_digest)
+    facts = _facts(input_count=122)
+
+    async with async_session_factory() as session:
+        repository = RowlessRecoveryRepository(session)
+        claimed = await repository.capture_and_claim_automatic_preflight(
+            api_key_scope="key-scope",
+            session_key_kind="session_header",
+            strong_session_hash=strong_hash,
+            stale_anchor_hash="a" * 64,
+            selected_account_intent="account-a",
+            task_identity=task_id,
+            session_identity=task_id,
+            task_authority_digest=task_authority_digest,
+            facts=facts,
+            request_id="request-automatic",
+            wire_request_fingerprint=facts.actual_wire_fingerprint,
+        )
+
+        assert claimed.generation == 1
+        assert claimed.state == HttpBridgeRowlessRecoveryState.UNKNOWN
+        assert claimed.authorization_mode == ROWLESS_AUTHORIZATION_MODE_AUTOMATIC
+        assert claimed.authorization_proof_sha256 is not None
+        assert claimed.checkpoint_receipt_sha256 is None
+        assert claimed.dispatch_request_id == "request-automatic"
+        assert await repository.active_automatic_authority_count() == 1
+        assert await repository.rollback_preflight_setup_failure(
+            authority_id=claimed.id,
+            generation=claimed.generation,
+            request_id="request-automatic",
+            wire_request_fingerprint=facts.actual_wire_fingerprint,
+        )
+        restored = await repository.get(claimed.id)
+        assert restored is not None
+        assert restored.state == HttpBridgeRowlessRecoveryState.APPROVED
+        assert restored.authorization_mode == ROWLESS_AUTHORIZATION_MODE_AUTOMATIC
+        reclaimed = await repository.claim_dispatch_preflight(
+            authority_id=restored.id,
+            generation=restored.generation,
+            request_id="request-automatic-retry",
+            wire_request_fingerprint=facts.actual_wire_fingerprint,
+            task_authority_digest=restored.captured_task_authority_digest,
+        )
+        assert reclaimed.state == HttpBridgeRowlessRecoveryState.UNKNOWN
+        assert await repository.active_automatic_authority_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_automatic_live_request_maps_flush_uniqueness_conflict_to_stable_rejection(
+    async_session_factory: Callable[[], AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = "task-automatic-flush-conflict"
+    task_authority_digest = rowless_task_authority_digest(
+        session_id=task_id,
+        prompt_cache_key=task_id,
+        thread_id=task_id,
+    )
+    facts = _facts(input_count=124)
+
+    async with async_session_factory() as session:
+        repository = RowlessRecoveryRepository(session)
+
+        async def raise_uniqueness_conflict(*args, **kwargs) -> None:
+            del args, kwargs
+            raise IntegrityError("INSERT", {}, RuntimeError("duplicate task contract"))
+
+        monkeypatch.setattr(session, "flush", raise_uniqueness_conflict)
+        with pytest.raises(RowlessRecoveryStateError, match="automatic_live_request_claim_conflict"):
+            await repository.capture_and_claim_automatic_preflight(
+                api_key_scope="key-scope",
+                session_key_kind="session_header",
+                strong_session_hash=rowless_strong_session_hash("task_authority", task_authority_digest),
+                stale_anchor_hash="d" * 64,
+                selected_account_intent="account-a",
+                task_identity=task_id,
+                session_identity=task_id,
+                task_authority_digest=task_authority_digest,
+                facts=facts,
+                request_id="request-flush-conflict",
+                wire_request_fingerprint=facts.actual_wire_fingerprint,
+            )
+        assert await session.scalar(select(HttpBridgeRowlessRecoveryAuthority.id)) is None
+
+
+@pytest.mark.asyncio
+async def test_automatic_live_request_cancellation_after_commit_restores_unsent_claim(
+    async_session_factory: Callable[[], AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = "task-automatic-cancel-after-commit"
+    task_authority_digest = rowless_task_authority_digest(
+        session_id=task_id,
+        prompt_cache_key=task_id,
+        thread_id=task_id,
+    )
+    strong_hash = rowless_strong_session_hash("task_authority", task_authority_digest)
+    facts = _facts(input_count=123)
+
+    async with async_session_factory() as session:
+        repository = RowlessRecoveryRepository(session)
+        real_commit = session.commit
+        commit_finished = asyncio.Event()
+        release_commit = asyncio.Event()
+
+        async def commit_then_pause() -> None:
+            await real_commit()
+            commit_finished.set()
+            await release_commit.wait()
+
+        monkeypatch.setattr(session, "commit", commit_then_pause)
+        claim_task = asyncio.create_task(
+            repository.capture_and_claim_automatic_preflight(
+                api_key_scope="key-scope",
+                session_key_kind="session_header",
+                strong_session_hash=strong_hash,
+                stale_anchor_hash="c" * 64,
+                selected_account_intent="account-a",
+                task_identity=task_id,
+                session_identity=task_id,
+                task_authority_digest=task_authority_digest,
+                facts=facts,
+                request_id="request-cancel-after-commit",
+                wire_request_fingerprint=facts.actual_wire_fingerprint,
+            )
+        )
+        await asyncio.wait_for(commit_finished.wait(), timeout=2.0)
+        claim_task.cancel()
+        release_commit.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await claim_task
+
+        restored = await session.scalar(select(HttpBridgeRowlessRecoveryAuthority))
+        assert restored is not None
+        assert restored.state == HttpBridgeRowlessRecoveryState.APPROVED
+        assert restored.dispatch_request_id is None
+        assert restored.wire_request_fingerprint is None
+        assert restored.dispatch_send_started_at is None
+
+
+@pytest.mark.asyncio
+async def test_automatic_live_request_supersedes_only_an_unsent_operator_generation(
+    async_session_factory: Callable[[], AsyncSession],
+) -> None:
+    task_id = "task-automatic-supersede"
+    async with async_session_factory() as session:
+        repository, captured, challenge = await _capture_and_challenge(
+            session,
+            task_id=task_id,
+            input_count=122,
+            stale_anchor_hash="b" * 64,
+        )
+        receipt = _receipt(
+            task_id=task_id,
+            strong_session_hash=captured.strong_session_hash,
+            full_ledger_pairs=120,
+            captured_input_item_count=122,
+        )
+        approved = await repository.approve(
+            authority_id=captured.id,
+            generation=captured.generation,
+            challenge=challenge,
+            declared_receipt_sha256=receipt.sha256(),
+            receipt=receipt,
+            acknowledgement=ROWLESS_SEMANTIC_REBASE_ACKNOWLEDGEMENT,
+            approved_actor="dashboard-admin",
+            request_id="approval-request",
+        )
+        changed_facts = _facts(input_count=124)
+        claimed = await repository.capture_and_claim_automatic_preflight(
+            api_key_scope=approved.api_key_scope,
+            session_key_kind=approved.session_key_kind,
+            strong_session_hash=approved.strong_session_hash,
+            stale_anchor_hash=approved.stale_anchor_hash,
+            selected_account_intent=approved.selected_account_intent,
+            task_identity=task_id,
+            session_identity=task_id,
+            task_authority_digest=approved.captured_task_authority_digest,
+            facts=changed_facts,
+            request_id="automatic-request",
+            wire_request_fingerprint=changed_facts.actual_wire_fingerprint,
+            expected_authority_id=approved.id,
+            expected_generation=approved.generation,
+        )
+
+        assert claimed.id == approved.id
+        assert claimed.generation == approved.generation + 1
+        assert claimed.state == HttpBridgeRowlessRecoveryState.UNKNOWN
+        assert claimed.captured_input_item_count == 124
+        assert claimed.authorization_mode == ROWLESS_AUTHORIZATION_MODE_AUTOMATIC
+        assert claimed.checkpoint_receipt_sha256 is None
+        assert claimed.authorization_proof_sha256 is not None
+        audit_actions = list(await session.scalars(select(AuditLog.action)))
+        assert "http_bridge_rowless_automatic_generation_superseded" in audit_actions
+        assert "http_bridge_rowless_automatic_live_request_claimed" in audit_actions
+
+        with pytest.raises(RowlessRecoveryStateError, match="automatic_unsent_generation_fence_rejected"):
+            await repository.capture_and_claim_automatic_preflight(
+                api_key_scope=claimed.api_key_scope,
+                session_key_kind=claimed.session_key_kind,
+                strong_session_hash=claimed.strong_session_hash,
+                stale_anchor_hash=claimed.stale_anchor_hash,
+                selected_account_intent=claimed.selected_account_intent,
+                task_identity=task_id,
+                session_identity=task_id,
+                task_authority_digest=claimed.captured_task_authority_digest,
+                facts=_facts(input_count=126),
+                request_id="unsafe-second-request",
+                wire_request_fingerprint=_facts(input_count=126).actual_wire_fingerprint,
+                expected_authority_id=claimed.id,
+                expected_generation=claimed.generation,
+            )
+
+
+@pytest.mark.asyncio
+async def test_automatic_live_request_ignores_historical_replayed_marker_journal(
+    async_session_factory: Callable[[], AsyncSession],
+) -> None:
+    task_id = "task-automatic-replayed-journal"
+    rejected_anchor = "resp-automatic-replayed-journal"
+    task_authority_digest = rowless_task_authority_digest(
+        session_id=task_id,
+        prompt_cache_key=task_id,
+        thread_id=task_id,
+    )
+    strong_hash = rowless_strong_session_hash("task_authority", task_authority_digest)
+
+    async with async_session_factory() as session:
+        marker = HttpBridgeSessionRecord(
+            session_key_kind="session_header",
+            session_key_value=task_id,
+            session_key_hash=canonical_json_sha256(task_id),
+            api_key_scope="key-scope",
+            account_id="account-a",
+            owner_instance_id="instance-a",
+            owner_epoch=3,
+            latest_response_id=rejected_anchor,
+            recovery_required_anchor_hash=durable_bridge_hash(rejected_anchor),
+            recovery_required_account_id="account-a",
+            recovery_required_at=datetime.now(timezone.utc),
+        )
+        session.add(marker)
+        await session.commit()
+
+        repository = RowlessRecoveryRepository(session)
+        captured = await repository.capture(
+            api_key_scope="key-scope",
+            session_key_kind="session_header",
+            strong_session_hash=strong_hash,
+            stale_anchor_hash=durable_bridge_hash(rejected_anchor),
+            selected_account_intent="account-a",
+            task_identity=task_id,
+            session_identity=task_id,
+            task_authority_digest=task_authority_digest,
+            facts=_facts(input_count=122),
+            origin_marker_session_id=marker.id,
+        )
+        challenge = await repository.issue_challenge(
+            authority_id=captured.id,
+            generation=captured.generation,
+        )
+        receipt = _receipt(
+            task_id=task_id,
+            strong_session_hash=strong_hash,
+            full_ledger_pairs=120,
+            captured_input_item_count=122,
+        )
+        approved = await repository.approve(
+            authority_id=captured.id,
+            generation=captured.generation,
+            challenge=challenge.challenge,
+            declared_receipt_sha256=receipt.sha256(),
+            receipt=receipt,
+            acknowledgement=ROWLESS_SEMANTIC_REBASE_ACKNOWLEDGEMENT,
+            approved_actor="dashboard-admin",
+            request_id="approval-request",
+        )
+        session.add(
+            HttpBridgeRecoveryAttemptRecord(
+                session_id=marker.id,
+                request_fingerprint="e" * 64,
+                request_id="historical-request",
+                account_id="account-a",
+                model="gpt-5.6",
+                replay_safe=False,
+                state=HttpBridgeRecoveryAttemptState.REPLAYED,
+                response_id="resp-historical-complete",
+            )
+        )
+        await session.commit()
+
+        changed_facts = _facts(input_count=124)
+        claimed = await repository.capture_and_claim_automatic_preflight(
+            api_key_scope=approved.api_key_scope,
+            session_key_kind=approved.session_key_kind,
+            strong_session_hash=approved.strong_session_hash,
+            stale_anchor_hash=approved.stale_anchor_hash,
+            selected_account_intent=approved.selected_account_intent,
+            task_identity=task_id,
+            session_identity=task_id,
+            task_authority_digest=approved.captured_task_authority_digest,
+            facts=changed_facts,
+            request_id="automatic-request",
+            wire_request_fingerprint=changed_facts.actual_wire_fingerprint,
+            origin_marker_session_id=marker.id,
+            expected_authority_id=approved.id,
+            expected_generation=approved.generation,
+        )
+
+        assert claimed.generation == approved.generation + 1
+        assert claimed.state == HttpBridgeRowlessRecoveryState.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_automatic_live_request_concurrent_claim_has_one_winner(
+    async_session_factory: Callable[[], AsyncSession],
+) -> None:
+    task_id = "task-automatic-concurrent"
+    task_authority_digest = rowless_task_authority_digest(
+        session_id=task_id,
+        prompt_cache_key=task_id,
+        thread_id=task_id,
+    )
+    strong_hash = rowless_strong_session_hash("task_authority", task_authority_digest)
+    facts = _facts(input_count=128)
+
+    async def claim(request_id: str) -> RowlessRecoveryAuthoritySnapshot | Exception:
+        try:
+            async with async_session_factory() as session:
+                return await RowlessRecoveryRepository(session).capture_and_claim_automatic_preflight(
+                    api_key_scope="key-scope",
+                    session_key_kind="session_header",
+                    strong_session_hash=strong_hash,
+                    stale_anchor_hash="d" * 64,
+                    selected_account_intent="account-a",
+                    task_identity=task_id,
+                    session_identity=task_id,
+                    task_authority_digest=task_authority_digest,
+                    facts=facts,
+                    request_id=request_id,
+                    wire_request_fingerprint=facts.actual_wire_fingerprint,
+                )
+        except Exception as exc:
+            return exc
+
+    outcomes = await asyncio.gather(claim("concurrent-a"), claim("concurrent-b"))
+    winners = [outcome for outcome in outcomes if isinstance(outcome, RowlessRecoveryAuthoritySnapshot)]
+    losers = [outcome for outcome in outcomes if isinstance(outcome, Exception)]
+
+    assert len(winners) == 1
+    assert winners[0].state == HttpBridgeRowlessRecoveryState.UNKNOWN
+    assert len(losers) == 1
+    assert isinstance(losers[0], RowlessRecoveryStateError)
+    assert "automatic_unsent_generation_fence_rejected" in str(losers[0])
 
 
 @pytest.mark.asyncio
@@ -500,6 +873,7 @@ async def test_marker_backed_admin_and_automatic_recovery_claims_are_mutually_ex
             account_id="account-a",
             rejected_response_id=rejected_anchor,
             attempt_fingerprint=automatic_wire_fingerprint,
+            request_id="generic-marker-loser",
         )
         assert await repository.rollback_preflight_setup_failure(
             authority_id=captured.id,
@@ -623,6 +997,16 @@ async def test_marker_backed_admin_and_automatic_recovery_claims_are_mutually_ex
             account_id="account-a",
             rejected_response_id=rejected_anchor,
             attempt_fingerprint=automatic_wire_fingerprint,
+            request_id="generic-marker-owner",
+        )
+        assert not await DurableBridgeRepository(session).claim_recovery_required_attempt(
+            session_id=marker_id,
+            instance_id="instance-a",
+            owner_epoch=7,
+            account_id="account-a",
+            rejected_response_id=rejected_anchor,
+            attempt_fingerprint=automatic_wire_fingerprint,
+            request_id="generic-marker-sibling",
         )
         with pytest.raises(RowlessRecoveryStateError, match="approved_generation_preflight_fence_rejected"):
             await repository.claim_dispatch_preflight(
@@ -634,6 +1018,52 @@ async def test_marker_backed_admin_and_automatic_recovery_claims_are_mutually_ex
             )
         await session.refresh(marker)
         assert marker.recovery_required_attempt_fingerprint == automatic_wire_fingerprint
+        marker_repository = DurableBridgeRepository(session)
+        assert not await marker_repository.rollback_recovery_required_attempt_before_dispatch(
+            session_id=marker_id,
+            api_key_scope="key-scope",
+            instance_id="instance-a",
+            owner_epoch=8,
+            account_id="account-a",
+            attempt_fingerprint=automatic_wire_fingerprint,
+            request_id="generic-marker-owner",
+            journal_request_id="generic-journal-owner",
+        )
+        assert not await marker_repository.rollback_recovery_required_attempt_before_dispatch(
+            session_id=marker_id,
+            api_key_scope="key-scope",
+            instance_id="instance-a",
+            owner_epoch=7,
+            account_id="account-a",
+            attempt_fingerprint=automatic_wire_fingerprint,
+            request_id="generic-marker-sibling",
+            journal_request_id="generic-journal-owner",
+        )
+        session.add(
+            HttpBridgeRecoveryAttemptRecord(
+                session_id=marker_id,
+                request_fingerprint=automatic_wire_fingerprint,
+                request_id="generic-journal-owner",
+                account_id="account-a",
+                model="gpt-5.6-sol",
+                replay_safe=True,
+                state=HttpBridgeRecoveryAttemptState.UNKNOWN,
+            )
+        )
+        await session.commit()
+        assert await marker_repository.rollback_recovery_required_attempt_before_dispatch(
+            session_id=marker_id,
+            api_key_scope="key-scope",
+            instance_id="instance-a",
+            owner_epoch=7,
+            account_id="account-a",
+            attempt_fingerprint=automatic_wire_fingerprint,
+            request_id="generic-marker-owner",
+            journal_request_id="generic-journal-owner",
+        )
+        await session.refresh(marker)
+        assert marker.recovery_required_attempt_fingerprint is None
+        assert await session.scalar(select(HttpBridgeRecoveryAttemptRecord)) is None
 
         await session.delete(marker)
         await session.commit()
@@ -722,6 +1152,7 @@ async def test_marker_admin_and_automatic_claims_have_one_concurrent_winner(
                 account_id="account-a",
                 rejected_response_id=rejected_anchor,
                 attempt_fingerprint=wire_fingerprint,
+                request_id="generic-concurrent",
             )
 
     winners = await asyncio.gather(claim_admin(), claim_automatic())
@@ -730,6 +1161,52 @@ async def test_marker_admin_and_automatic_claims_have_one_concurrent_winner(
         marker = await session.get(HttpBridgeSessionRecord, marker_id)
         assert marker is not None
         assert marker.recovery_required_attempt_fingerprint is not None
+
+
+@pytest.mark.asyncio
+async def test_marker_claim_snapshot_does_not_require_post_commit_refresh(
+    async_session_factory: Callable[[], AsyncSession],
+    monkeypatch,
+) -> None:
+    rejected_anchor = "resp-marker-no-post-commit-refresh"
+    task_id = "task-marker-no-post-commit-refresh"
+    async with async_session_factory() as session:
+        marker = HttpBridgeSessionRecord(
+            session_key_kind="session_header",
+            session_key_value=task_id,
+            session_key_hash=canonical_json_sha256(task_id),
+            api_key_scope="key-scope",
+            account_id="account-a",
+            owner_instance_id="instance-a",
+            owner_epoch=11,
+            latest_response_id=rejected_anchor,
+            recovery_required_anchor_hash=durable_bridge_hash(rejected_anchor),
+            recovery_required_account_id="account-a",
+            recovery_required_at=datetime.now(timezone.utc),
+        )
+        session.add(marker)
+        await session.commit()
+
+        async def fail_refresh(*args, **kwargs):
+            del args, kwargs
+            raise AssertionError("claim must not await after a successful commit")
+
+        monkeypatch.setattr(session, "refresh", fail_refresh)
+        claimed = await DurableBridgeRepository(session).claim_recovery_required_attempt_with_journal(
+            session_id=marker.id,
+            instance_id="instance-a",
+            owner_epoch=11,
+            account_id="account-a",
+            rejected_response_id=rejected_anchor,
+            attempt_fingerprint="e" * 64,
+            claim_request_id="claim-request",
+            journal_request_id="journal-request",
+            model="gpt-5.6",
+        )
+
+        assert claimed is not None
+        assert claimed.request_id == "journal-request"
+        assert claimed.state == HttpBridgeRecoveryAttemptState.UNKNOWN
 
 
 @pytest.mark.asyncio
@@ -1125,6 +1602,66 @@ def test_rowless_exact_three_sanitized_incident_shapes_are_self_contained_and_ex
         )
 
 
+def test_automatic_rowless_proof_requires_retained_output_before_fresh_followup() -> None:
+    common = {
+        "model": "gpt-5.1",
+        "instructions": "sanitized fixture",
+        "previous_response_id": "resp_stale_fixture",
+        "prompt_cache_key": "fixture-task",
+    }
+    incremental = build_rowless_recovery_capture_facts(
+        ResponsesRequest.model_validate(
+            {
+                **common,
+                "input": [{"role": "user", "content": "continue"}],
+            }
+        )
+    )
+    complete = build_rowless_recovery_capture_facts(
+        ResponsesRequest.model_validate(
+            {
+                **common,
+                "input": [
+                    {"role": "user", "content": "original"},
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "original result"}],
+                    },
+                    {"role": "user", "content": "continue"},
+                ],
+            }
+        )
+    )
+    compacted = build_rowless_recovery_capture_facts(
+        ResponsesRequest.model_validate(
+            {
+                **common,
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "compacted result"}],
+                    },
+                    {"role": "user", "content": "continue"},
+                ],
+            }
+        )
+    )
+
+    assert incremental is not None
+    assert incremental.self_contained
+    assert not incremental.retains_prior_output
+    assert complete is not None
+    assert complete.self_contained
+    assert complete.retains_prior_output
+    assert compacted is not None
+    assert compacted.self_contained
+    assert compacted.retains_prior_output
+
+
 def test_rowless_capture_normalizes_only_exact_empty_output_and_encrypted_agent_transport_parts() -> None:
     items: list[object] = [
         {
@@ -1181,6 +1718,7 @@ def test_rowless_capture_normalizes_only_exact_empty_output_and_encrypted_agent_
     assert facts is not None
     assert facts.self_contained
     assert facts.account_neutral
+    assert facts.retains_prior_output
     assert facts.unresolved_count == 0
     projected_output = next(
         cast(dict[str, object], item)
@@ -1199,6 +1737,7 @@ def test_rowless_capture_normalizes_only_exact_empty_output_and_encrypted_agent_
         for item in facts.projected_input
         if isinstance(item, dict) and item.get("type") == "agent_message"
     )
+    assert "id" not in projected_agent
     assert projected_agent["content"] == [{"type": "input_text", "text": "completed"}]
     assert (
         approved_rowless_recovery_projection(
@@ -1211,6 +1750,34 @@ def test_rowless_capture_normalizes_only_exact_empty_output_and_encrypted_agent_
         )
         == facts.projected_input
     )
+
+
+def test_rowless_capture_accepts_compacted_agent_output_at_index_zero() -> None:
+    payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.6-sol",
+            "instructions": "sanitized fixture",
+            "previous_response_id": "resp_stale_fixture",
+            "prompt_cache_key": "fixture-task",
+            "input": [
+                {
+                    "type": "agent_message",
+                    "id": "amsg_00000000-0000-4000-8000-000000000001",
+                    "author": "/root/worker",
+                    "recipient": "/root",
+                    "content": [{"type": "input_text", "text": "completed"}],
+                },
+                {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+            ],
+        }
+    )
+
+    facts = build_rowless_recovery_capture_facts(payload)
+
+    assert facts is not None
+    assert facts.self_contained
+    assert facts.account_neutral
+    assert facts.retains_prior_output
 
 
 @pytest.mark.parametrize(

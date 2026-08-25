@@ -41,7 +41,12 @@ REQUIRED_DURABLE_BRIDGE_TABLES = (
     "http_bridge_rowless_recovery_authorities",
 )
 REQUIRED_DURABLE_BRIDGE_COLUMNS = {
-    "http_bridge_rowless_recovery_authorities": ("origin_marker_session_id",),
+    "http_bridge_sessions": ("recovery_required_attempt_request_id",),
+    "http_bridge_rowless_recovery_authorities": (
+        "origin_marker_session_id",
+        "authorization_mode",
+        "authorization_proof_sha256",
+    ),
 }
 DURABLE_BRIDGE_RETRY_CIRCUIT_STATE_TTL_SECONDS = 3600.0
 _PURGE_CLOSED_BATCH_SIZE = 500
@@ -138,6 +143,7 @@ class DurableBridgeSessionSnapshot:
     recovery_required_anchor_hash: str | None = None
     recovery_required_account_id: str | None = None
     recovery_required_attempt_fingerprint: str | None = None
+    recovery_required_attempt_request_id: str | None = None
     recovery_required_at: datetime | None = None
 
     def recovery_is_required_for_latest_anchor(self) -> bool:
@@ -719,6 +725,7 @@ class DurableBridgeRepository:
             values["recovery_required_anchor_hash"] = None
             values["recovery_required_account_id"] = None
             values["recovery_required_attempt_fingerprint"] = None
+            values["recovery_required_attempt_request_id"] = None
             values["recovery_required_at"] = None
         if latest_input_item_count is not None and latest_input_full_fingerprint is not None:
             values["latest_input_item_count"] = latest_input_item_count
@@ -819,6 +826,7 @@ class DurableBridgeRepository:
             "recovery_required_anchor_hash": None,
             "recovery_required_account_id": None,
             "recovery_required_attempt_fingerprint": None,
+            "recovery_required_attempt_request_id": None,
             "recovery_required_at": None,
         }
         return await self._execute_fenced_session_update(
@@ -873,6 +881,7 @@ class DurableBridgeRepository:
         account_id: str,
         rejected_response_id: str,
         attempt_fingerprint: str,
+        request_id: str,
     ) -> bool:
         """Bind one exact wire payload to the active marker generation."""
 
@@ -894,14 +903,133 @@ class DurableBridgeRepository:
                 await self._session.rollback()
                 return False
             existing = marker.recovery_required_attempt_fingerprint
-            if existing is not None and existing != attempt_fingerprint:
+            existing_request_id = marker.recovery_required_attempt_request_id
+            if existing is not None and (existing != attempt_fingerprint or existing_request_id != request_id):
                 await self._session.rollback()
                 return False
             if existing is None:
                 marker.recovery_required_attempt_fingerprint = attempt_fingerprint
+                marker.recovery_required_attempt_request_id = request_id
                 await self._session.commit()
             else:
                 await self._session.rollback()
+            return True
+
+    async def claim_recovery_required_attempt_with_journal(
+        self,
+        *,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        account_id: str,
+        rejected_response_id: str,
+        attempt_fingerprint: str,
+        claim_request_id: str,
+        journal_request_id: str,
+        model: str | None,
+    ) -> DurableBridgeRecoveryAttemptSnapshot | None:
+        """Atomically bind a marker generation and create its send journal."""
+
+        async with sqlite_writer_section():
+            marker = await self._session.scalar(
+                select(HttpBridgeSessionRecord)
+                .where(
+                    HttpBridgeSessionRecord.id == session_id,
+                    HttpBridgeSessionRecord.owner_instance_id == instance_id,
+                    HttpBridgeSessionRecord.owner_epoch == owner_epoch,
+                    HttpBridgeSessionRecord.account_id == account_id,
+                    HttpBridgeSessionRecord.latest_response_id == rejected_response_id,
+                    HttpBridgeSessionRecord.recovery_required_anchor_hash == durable_bridge_hash(rejected_response_id),
+                    HttpBridgeSessionRecord.recovery_required_account_id == account_id,
+                )
+                .with_for_update()
+            )
+            if marker is None or marker.recovery_required_attempt_fingerprint is not None:
+                await self._session.rollback()
+                return None
+            existing_journal = await self._session.scalar(
+                select(HttpBridgeRecoveryAttemptRecord.id).where(
+                    HttpBridgeRecoveryAttemptRecord.session_id == session_id,
+                    HttpBridgeRecoveryAttemptRecord.request_fingerprint == attempt_fingerprint,
+                )
+            )
+            if existing_journal is not None:
+                await self._session.rollback()
+                return None
+
+            marker.recovery_required_attempt_fingerprint = attempt_fingerprint
+            marker.recovery_required_attempt_request_id = claim_request_id
+            attempt = HttpBridgeRecoveryAttemptRecord(
+                session_id=session_id,
+                request_fingerprint=attempt_fingerprint,
+                request_id=journal_request_id,
+                account_id=account_id,
+                model=model,
+                replay_safe=True,
+                state=HttpBridgeRecoveryAttemptState.UNKNOWN,
+            )
+            self._session.add(attempt)
+            try:
+                await self._session.commit()
+            except IntegrityError:
+                await self._session.rollback()
+                return None
+            return _to_recovery_attempt_snapshot(attempt)
+
+    async def rollback_recovery_required_attempt_before_dispatch(
+        self,
+        *,
+        session_id: str,
+        api_key_scope: str,
+        instance_id: str,
+        owner_epoch: int,
+        account_id: str,
+        attempt_fingerprint: str,
+        request_id: str,
+        journal_request_id: str,
+    ) -> bool:
+        """Release an exact marker claim that provably never reached dispatch."""
+
+        async with sqlite_writer_section():
+            marker = await self._session.scalar(
+                select(HttpBridgeSessionRecord)
+                .where(
+                    HttpBridgeSessionRecord.id == session_id,
+                    HttpBridgeSessionRecord.api_key_scope == api_key_scope,
+                    HttpBridgeSessionRecord.owner_instance_id == instance_id,
+                    HttpBridgeSessionRecord.owner_epoch == owner_epoch,
+                    HttpBridgeSessionRecord.account_id == account_id,
+                    HttpBridgeSessionRecord.recovery_required_account_id == account_id,
+                    HttpBridgeSessionRecord.recovery_required_attempt_fingerprint == attempt_fingerprint,
+                    HttpBridgeSessionRecord.recovery_required_attempt_request_id == request_id,
+                )
+                .with_for_update()
+            )
+            if (
+                marker is None
+                or marker.latest_response_id is None
+                or marker.recovery_required_anchor_hash != durable_bridge_hash(marker.latest_response_id)
+            ):
+                await self._session.rollback()
+                return False
+            journal = await self._session.scalar(
+                select(HttpBridgeRecoveryAttemptRecord)
+                .where(
+                    HttpBridgeRecoveryAttemptRecord.session_id == session_id,
+                    HttpBridgeRecoveryAttemptRecord.request_fingerprint == attempt_fingerprint,
+                )
+                .with_for_update()
+            )
+            if journal is not None and (
+                journal.request_id != journal_request_id or journal.state != HttpBridgeRecoveryAttemptState.UNKNOWN
+            ):
+                await self._session.rollback()
+                return False
+            if journal is not None:
+                await self._session.delete(journal)
+            marker.recovery_required_attempt_fingerprint = None
+            marker.recovery_required_attempt_request_id = None
+            await self._session.commit()
             return True
 
     async def record_recovery_attempt(
@@ -1517,6 +1645,7 @@ class DurableBridgeRepository:
                 session_values["recovery_required_anchor_hash"] = None
                 session_values["recovery_required_account_id"] = None
                 session_values["recovery_required_attempt_fingerprint"] = None
+                session_values["recovery_required_attempt_request_id"] = None
                 session_values["recovery_required_at"] = None
             elif latest_input_item_count is not None and latest_input_full_fingerprint is not None:
                 session_values["latest_input_item_count"] = latest_input_item_count
@@ -1566,6 +1695,7 @@ class DurableBridgeRepository:
         owner_epoch: int,
         account_id: str,
         request_fingerprint: str,
+        claim_request_id: str,
         request_id: str,
         response_id: str,
         input_item_count: int,
@@ -1602,6 +1732,7 @@ class DurableBridgeRepository:
                 or marker.recovery_required_anchor_hash != durable_bridge_hash(marker.latest_response_id)
                 or marker.recovery_required_account_id != account_id
                 or marker.recovery_required_attempt_fingerprint != request_fingerprint
+                or marker.recovery_required_attempt_request_id != claim_request_id
                 or journal is None
                 or journal.account_id != account_id
                 or journal.state != HttpBridgeRecoveryAttemptState.UNKNOWN
@@ -1620,6 +1751,7 @@ class DurableBridgeRepository:
             marker.recovery_required_anchor_hash = None
             marker.recovery_required_account_id = None
             marker.recovery_required_attempt_fingerprint = None
+            marker.recovery_required_attempt_request_id = None
             marker.recovery_required_at = None
             now = utcnow()
             marker.last_seen_at = now
@@ -2003,23 +2135,25 @@ async def missing_durable_bridge_tables(session: AsyncSession) -> tuple[str, ...
         )
     present = {str(row[0]) for row in result.fetchall()}
     missing = set(expected - present)
-    rowless_table = "http_bridge_rowless_recovery_authorities"
-    if rowless_table in present:
+    for table_name, required_columns in REQUIRED_DURABLE_BRIDGE_COLUMNS.items():
+        if table_name not in present:
+            continue
         if dialect == "sqlite":
-            column_result = await session.execute(text(f"PRAGMA table_info({rowless_table})"))
+            column_result = await session.execute(text(f"PRAGMA table_info({table_name})"))
             present_columns = {str(row[1]) for row in column_result.fetchall()}
         else:
             column_result = await session.execute(
                 text(
                     "SELECT column_name FROM information_schema.columns "
                     "WHERE table_schema = ANY (current_schemas(false)) "
-                    "AND table_name = 'http_bridge_rowless_recovery_authorities'"
-                )
+                    "AND table_name = :table_name"
+                ),
+                {"table_name": table_name},
             )
             present_columns = {str(row[0]) for row in column_result.fetchall()}
-        for column in REQUIRED_DURABLE_BRIDGE_COLUMNS[rowless_table]:
+        for column in required_columns:
             if column not in present_columns:
-                missing.add(f"{rowless_table}.{column}")
+                missing.add(f"{table_name}.{column}")
     return tuple(sorted(missing))
 
 
@@ -2045,6 +2179,7 @@ _SNAPSHOT_COLUMNS = (
     HttpBridgeSessionRecord.recovery_required_anchor_hash,
     HttpBridgeSessionRecord.recovery_required_account_id,
     HttpBridgeSessionRecord.recovery_required_attempt_fingerprint,
+    HttpBridgeSessionRecord.recovery_required_attempt_request_id,
     HttpBridgeSessionRecord.recovery_required_at,
     HttpBridgeSessionRecord.last_seen_at,
     HttpBridgeSessionRecord.closed_at,
@@ -2078,6 +2213,7 @@ def _returned_row_to_snapshot(row: Row[tuple[object, ...]]) -> DurableBridgeSess
         recovery_required_anchor_hash=mapping[HttpBridgeSessionRecord.recovery_required_anchor_hash],
         recovery_required_account_id=mapping[HttpBridgeSessionRecord.recovery_required_account_id],
         recovery_required_attempt_fingerprint=mapping[HttpBridgeSessionRecord.recovery_required_attempt_fingerprint],
+        recovery_required_attempt_request_id=mapping[HttpBridgeSessionRecord.recovery_required_attempt_request_id],
         recovery_required_at=mapping[HttpBridgeSessionRecord.recovery_required_at],
         last_seen_at=mapping[HttpBridgeSessionRecord.last_seen_at],
         closed_at=mapping[HttpBridgeSessionRecord.closed_at],
@@ -2112,6 +2248,7 @@ def _to_snapshot(row: HttpBridgeSessionRecord | None) -> DurableBridgeSessionSna
         recovery_required_anchor_hash=row.recovery_required_anchor_hash,
         recovery_required_account_id=row.recovery_required_account_id,
         recovery_required_attempt_fingerprint=row.recovery_required_attempt_fingerprint,
+        recovery_required_attempt_request_id=row.recovery_required_attempt_request_id,
         recovery_required_at=row.recovery_required_at,
         last_seen_at=row.last_seen_at,
         closed_at=row.closed_at,

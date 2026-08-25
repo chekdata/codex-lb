@@ -71,6 +71,7 @@ async def list_rowless_authorities(
             "taskAuthorityDigest": item.captured_task_authority_digest,
             "staleAnchorHash": item.stale_anchor_hash,
             "markerOriginBound": item.origin_marker_session_id is not None,
+            "authorizationMode": item.authorization_mode,
             "inputItemCount": item.captured_input_item_count,
             "createdAt": item.created_at,
             "updatedAt": item.updated_at,
@@ -88,6 +89,7 @@ async def rowless_recovery_status(
         repository = RowlessRecoveryRepository(session)
         counts = await repository.authority_state_counts()
         marker_bound_counts = await repository.authority_state_counts(marker_bound_only=True)
+        active_automatic_count = await repository.active_automatic_authority_count()
     replay_fence_count = counts["approved"] + counts["unknown"] + counts["consumed"]
     marker_bound_count = sum(marker_bound_counts.values())
     return {
@@ -95,12 +97,18 @@ async def rowless_recovery_status(
         "markerBoundStateCounts": marker_bound_counts,
         "replayFenceCount": replay_fence_count,
         "markerBoundAuthorityCount": marker_bound_count,
+        "activeAutomaticAuthorityCount": active_automatic_count,
         "preRowlessImageCompatible": replay_fence_count == 0 and marker_bound_count == 0,
         "preMarkerRecoveryImageCompatible": marker_bound_count == 0,
+        "preAutomaticRecoveryImageCompatible": active_automatic_count == 0,
         "minimumRollbackCapability": (
-            "rowless_marker_recovery_v2"
-            if marker_bound_count
-            else ("rowless_recovery_v1" if replay_fence_count else None)
+            "rowless_automatic_recovery_v3"
+            if active_automatic_count
+            else (
+                "rowless_marker_recovery_v2"
+                if marker_bound_count
+                else ("rowless_recovery_v1" if replay_fence_count else None)
+            )
         ),
     }
 

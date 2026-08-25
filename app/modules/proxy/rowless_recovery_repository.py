@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from hashlib import sha256
+from typing import TypeVar
 
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import IntegrityError
@@ -30,6 +32,8 @@ from app.modules.proxy.durable_bridge_repository import (
     durable_bridge_hash,
 )
 from app.modules.proxy.rowless_recovery import (
+    ROWLESS_AUTHORIZATION_MODE_AUTOMATIC,
+    ROWLESS_AUTHORIZATION_MODE_OPERATOR,
     ROWLESS_SEMANTIC_REBASE_ACKNOWLEDGEMENT,
     RowlessRecoveryCaptureFacts,
     canonical_json_sha256,
@@ -38,6 +42,22 @@ from app.modules.proxy.rowless_recovery import (
 ROWLESS_RECOVERY_CHALLENGE_TTL_SECONDS = 900
 ROWLESS_RECOVERY_CAPTURED_RETENTION_SECONDS = 7 * 24 * 3600
 ROWLESS_RECOVERY_MAX_CAPTURED_PER_API_SCOPE = 100
+_TaskResultT = TypeVar("_TaskResultT")
+
+
+async def _await_repository_task_deferring_cancellation(
+    task: asyncio.Task[_TaskResultT],
+) -> tuple[_TaskResultT, asyncio.CancelledError | None]:
+    """Finish one transaction-critical task while retaining cancellation."""
+
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            return await asyncio.shield(task), cancellation
+        except asyncio.CancelledError as exc:
+            if task.cancelled():
+                raise
+            cancellation = cancellation or exc
 
 
 class RowlessRecoveryConflictError(RuntimeError):
@@ -46,6 +66,16 @@ class RowlessRecoveryConflictError(RuntimeError):
 
 class RowlessRecoveryStateError(RuntimeError):
     """A fail-closed lifecycle precondition did not match."""
+
+
+async def _flush_automatic_claim_or_reject(session: AsyncSession) -> None:
+    """Map every pre-commit uniqueness race to one stable proof rejection."""
+
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise RowlessRecoveryStateError("automatic_live_request_claim_conflict") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +103,8 @@ class RowlessRecoveryAuthoritySnapshot:
     request_self_contained: bool
     request_account_neutral: bool
     checkpoint_receipt_sha256: str | None
+    authorization_mode: str | None
+    authorization_proof_sha256: str | None
     replacement_session_id: str | None
     dispatch_request_id: str | None
     dispatch_send_started_at: datetime | None
@@ -398,6 +430,22 @@ class RowlessRecoveryRepository:
             counts[state.value] = int(count)
         return counts
 
+    async def active_automatic_authority_count(self) -> int:
+        """Return automatic authorities that require v3 dispatch semantics."""
+
+        count = await self._session.scalar(
+            select(func.count(HttpBridgeRowlessRecoveryAuthority.id)).where(
+                HttpBridgeRowlessRecoveryAuthority.authorization_mode == ROWLESS_AUTHORIZATION_MODE_AUTOMATIC,
+                HttpBridgeRowlessRecoveryAuthority.state.in_(
+                    (
+                        HttpBridgeRowlessRecoveryState.APPROVED,
+                        HttpBridgeRowlessRecoveryState.UNKNOWN,
+                    )
+                ),
+            )
+        )
+        return int(count or 0)
+
     async def purge_expired_audit_rows(
         self,
         *,
@@ -532,6 +580,8 @@ class RowlessRecoveryRepository:
                 await self._session.rollback()
                 raise RowlessRecoveryStateError("checkpoint_receipt_contract_mismatch")
             row.state = HttpBridgeRowlessRecoveryState.APPROVED
+            row.authorization_mode = ROWLESS_AUTHORIZATION_MODE_OPERATOR
+            row.authorization_proof_sha256 = receipt_sha256
             row.checkpoint_receipt_sha256 = receipt_sha256
             row.checkpoint_jsonl_sha256 = receipt.remote_session_jsonl_sha256
             row.checkpoint_jsonl_size_bytes = receipt.remote_session_jsonl_size_bytes
@@ -565,6 +615,236 @@ class RowlessRecoveryRepository:
             await self._session.refresh(row)
             return _snapshot(row)
 
+    async def capture_and_claim_automatic_preflight(
+        self,
+        *,
+        api_key_scope: str,
+        session_key_kind: str,
+        strong_session_hash: str,
+        stale_anchor_hash: str,
+        selected_account_intent: str,
+        task_identity: str,
+        session_identity: str,
+        task_authority_digest: str,
+        facts: RowlessRecoveryCaptureFacts,
+        request_id: str,
+        wire_request_fingerprint: str,
+        origin_marker_session_id: str | None = None,
+        expected_authority_id: str | None = None,
+        expected_generation: int | None = None,
+    ) -> RowlessRecoveryAuthoritySnapshot:
+        """Capture one official live request and claim its only safe dispatch."""
+
+        if (
+            not api_key_scope
+            or not session_key_kind
+            or not selected_account_intent
+            or not task_identity
+            or not session_identity
+            or not request_id
+            or not _is_sha256(task_authority_digest)
+            or not _is_sha256(strong_session_hash)
+            or not _is_sha256(stale_anchor_hash)
+            or not _is_sha256(wire_request_fingerprint)
+            or facts.actual_wire_fingerprint != wire_request_fingerprint
+            or facts.unresolved_count != 0
+            or not facts.self_contained
+            or not facts.account_neutral
+            or not facts.retains_prior_output
+        ):
+            raise RowlessRecoveryStateError("automatic_live_request_proof_invalid")
+
+        async with sqlite_writer_section():
+            if self._session.get_bind().dialect.name == "postgresql":
+                await self._session.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                    {"key": f"http-bridge-rowless-auto:{api_key_scope}:{strong_session_hash}"},
+                )
+            row = await self._find_for_update(
+                api_key_scope=api_key_scope,
+                strong_session_hash=strong_session_hash,
+                stale_anchor_hash=stale_anchor_hash,
+            )
+            if row is None:
+                row = await self._find_exact_request_contract_for_update(
+                    api_key_scope=api_key_scope,
+                    strong_session_hash=strong_session_hash,
+                    facts=facts,
+                )
+            if row is None:
+                if expected_authority_id is not None or expected_generation is not None:
+                    await self._session.rollback()
+                    raise RowlessRecoveryStateError("automatic_expected_generation_not_found")
+                if origin_marker_session_id is not None:
+                    await self._require_live_origin_marker(
+                        session_id=origin_marker_session_id,
+                        api_key_scope=api_key_scope,
+                        selected_account_intent=selected_account_intent,
+                        stale_anchor_hash=stale_anchor_hash,
+                    )
+                row = HttpBridgeRowlessRecoveryAuthority(
+                    api_key_scope=api_key_scope,
+                    session_key_kind=session_key_kind,
+                    strong_session_hash=strong_session_hash,
+                    stale_anchor_hash=stale_anchor_hash,
+                    generation=1,
+                    generation_nonce=secrets.token_hex(32),
+                    state=HttpBridgeRowlessRecoveryState.CAPTURED,
+                    captured_input_item_count=facts.input_item_count,
+                    captured_input_fingerprint=facts.input_fingerprint,
+                    non_input_contract_fingerprint=facts.contract_fingerprint,
+                    settled_direct_call_ledger_digest=facts.direct_call_ledger_digest,
+                    projected_payload_fingerprint=facts.projected_payload_fingerprint,
+                    actual_wire_fingerprint=facts.actual_wire_fingerprint,
+                    origin_marker_session_id=origin_marker_session_id,
+                    settled_direct_call_unresolved_count=facts.unresolved_count,
+                    selected_account_intent=selected_account_intent,
+                    captured_task_identity_hash=canonical_json_sha256(task_identity),
+                    captured_session_identity_hash=canonical_json_sha256(session_identity),
+                    captured_task_authority_digest=task_authority_digest,
+                    request_self_contained=facts.self_contained,
+                    request_account_neutral=facts.account_neutral,
+                )
+                self._session.add(row)
+                await _flush_automatic_claim_or_reject(self._session)
+            else:
+                origin_marker = await self._load_origin_marker_for_update(row)
+                marker_journal_exists = False
+                if row.origin_marker_session_id is not None:
+                    marker_journal_exists = (
+                        await self._session.scalar(
+                            select(HttpBridgeRecoveryAttemptRecord.id)
+                            .where(
+                                HttpBridgeRecoveryAttemptRecord.session_id == row.origin_marker_session_id,
+                                HttpBridgeRecoveryAttemptRecord.state == HttpBridgeRecoveryAttemptState.UNKNOWN,
+                            )
+                            .limit(1)
+                        )
+                    ) is not None
+                if (
+                    row.stale_anchor_hash != stale_anchor_hash
+                    or row.state
+                    not in {
+                        HttpBridgeRowlessRecoveryState.CAPTURED,
+                        HttpBridgeRowlessRecoveryState.APPROVED,
+                    }
+                    or row.dispatch_request_id is not None
+                    or row.replacement_session_id is not None
+                    or row.dispatch_send_started_at is not None
+                    or row.wire_request_fingerprint is not None
+                    or row.consumed_at is not None
+                    or marker_journal_exists
+                    or row.selected_account_intent != selected_account_intent
+                    or row.origin_marker_session_id != origin_marker_session_id
+                    or row.captured_task_identity_hash != canonical_json_sha256(task_identity)
+                    or row.captured_session_identity_hash != canonical_json_sha256(session_identity)
+                    or row.captured_task_authority_digest != task_authority_digest
+                    or (expected_authority_id is not None and row.id != expected_authority_id)
+                    or (expected_generation is not None and row.generation != expected_generation)
+                    or (
+                        row.origin_marker_session_id is not None
+                        and not self._origin_marker_matches_authority(origin_marker, row)
+                    )
+                ):
+                    await self._session.rollback()
+                    raise RowlessRecoveryStateError("automatic_unsent_generation_fence_rejected")
+                if not _capture_matches(row, facts):
+                    self._session.add(
+                        AuditLog(
+                            action="http_bridge_rowless_automatic_generation_superseded",
+                            details=json.dumps(
+                                {
+                                    "authority_id": row.id,
+                                    "generation": row.generation,
+                                    "state": row.state.value,
+                                    "authorization_mode": row.authorization_mode,
+                                    "authorization_proof_sha256": row.authorization_proof_sha256,
+                                    "checkpoint_receipt_sha256": row.checkpoint_receipt_sha256,
+                                    "captured_input_fingerprint": row.captured_input_fingerprint,
+                                    "projected_payload_fingerprint": row.projected_payload_fingerprint,
+                                    "actual_wire_fingerprint": row.actual_wire_fingerprint,
+                                },
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ),
+                            request_id=request_id,
+                        )
+                    )
+                    row.generation += 1
+                    row.generation_nonce = secrets.token_hex(32)
+                    _replace_capture(row, facts)
+                    _clear_operator_authorization(row)
+
+            self._require_same_capture(
+                row,
+                selected_account_intent,
+                task_identity,
+                session_identity,
+                task_authority_digest,
+                facts,
+                origin_marker_session_id,
+            )
+            authorization_proof = _automatic_authorization_proof(
+                row,
+                wire_request_fingerprint=wire_request_fingerprint,
+            )
+            if row.origin_marker_session_id is not None:
+                origin_marker = await self._load_origin_marker_for_update(row)
+                if not self._origin_marker_matches_authority(origin_marker, row):
+                    await self._session.rollback()
+                    raise RowlessRecoveryStateError("automatic_origin_marker_fence_rejected")
+                if origin_marker is None:  # pragma: no cover - guarded above
+                    raise AssertionError("automatic marker authority requires its origin")
+                origin_marker.recovery_required_attempt_fingerprint = _origin_marker_attempt_fingerprint(
+                    row,
+                    wire_request_fingerprint,
+                )
+                origin_marker.recovery_required_attempt_request_id = request_id
+            row.authorization_mode = ROWLESS_AUTHORIZATION_MODE_AUTOMATIC
+            row.authorization_proof_sha256 = authorization_proof
+            row.state = HttpBridgeRowlessRecoveryState.UNKNOWN
+            row.dispatch_request_id = request_id
+            row.wire_request_fingerprint = wire_request_fingerprint
+            row.dispatch_send_started_at = None
+            self._session.add(
+                AuditLog(
+                    action="http_bridge_rowless_automatic_live_request_claimed",
+                    details=json.dumps(
+                        {
+                            "authority_id": row.id,
+                            "generation": row.generation,
+                            "authorization_proof_sha256": authorization_proof,
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    request_id=request_id,
+                )
+            )
+            try:
+                await _flush_automatic_claim_or_reject(self._session)
+                await self._session.refresh(row)
+                snapshot = _snapshot(row)
+                commit_task = asyncio.create_task(self._session.commit())
+                _, cancellation = await _await_repository_task_deferring_cancellation(commit_task)
+            except IntegrityError as exc:
+                await self._session.rollback()
+                raise RowlessRecoveryStateError("automatic_live_request_claim_conflict") from exc
+        if cancellation is not None:
+            rollback_task = asyncio.create_task(
+                self.rollback_preflight_setup_failure(
+                    authority_id=snapshot.id,
+                    generation=snapshot.generation,
+                    request_id=request_id,
+                    wire_request_fingerprint=wire_request_fingerprint,
+                )
+            )
+            restored, _rollback_cancellation = await _await_repository_task_deferring_cancellation(rollback_task)
+            if not restored:
+                raise RowlessRecoveryStateError("cancelled_automatic_claim_restore_failed") from cancellation
+            raise cancellation
+        return snapshot
+
     async def claim_dispatch(
         self,
         *,
@@ -592,7 +872,14 @@ class RowlessRecoveryRepository:
                         ("authority_missing", row is None),
                         ("generation", row is not None and row.generation != generation),
                         ("state", row is not None and row.state != HttpBridgeRowlessRecoveryState.UNKNOWN),
-                        ("receipt", row is not None and row.checkpoint_receipt_sha256 is None),
+                        (
+                            "authorization",
+                            row is not None
+                            and not _dispatch_authorized(
+                                row,
+                                wire_request_fingerprint=wire_request_fingerprint,
+                            ),
+                        ),
                         ("request_id", row is not None and row.dispatch_request_id != request_id),
                         (
                             "wire_fingerprint",
@@ -621,6 +908,7 @@ class RowlessRecoveryRepository:
                                     row,
                                     wire_request_fingerprint,
                                 ),
+                                expected_request_id=request_id,
                             ),
                         ),
                         ("replacement_missing", replacement is None),
@@ -699,7 +987,10 @@ class RowlessRecoveryRepository:
                 row is None
                 or row.generation != generation
                 or row.state != HttpBridgeRowlessRecoveryState.APPROVED
-                or row.checkpoint_receipt_sha256 is None
+                or not _dispatch_authorized(
+                    row,
+                    wire_request_fingerprint=wire_request_fingerprint,
+                )
                 or row.captured_task_authority_digest != task_authority_digest
                 or (
                     row.origin_marker_session_id is not None
@@ -713,6 +1004,7 @@ class RowlessRecoveryRepository:
                     row,
                     wire_request_fingerprint,
                 )
+                origin_marker.recovery_required_attempt_request_id = request_id
             row.state = HttpBridgeRowlessRecoveryState.UNKNOWN
             row.dispatch_request_id = request_id
             row.wire_request_fingerprint = wire_request_fingerprint
@@ -751,6 +1043,7 @@ class RowlessRecoveryRepository:
                             row,
                             wire_request_fingerprint,
                         ),
+                        expected_request_id=request_id,
                     )
                 )
             ):
@@ -770,6 +1063,7 @@ class RowlessRecoveryRepository:
             row.wire_request_fingerprint = None
             if origin_marker is not None:
                 origin_marker.recovery_required_attempt_fingerprint = None
+                origin_marker.recovery_required_attempt_request_id = None
             await self._session.commit()
             return True
 
@@ -816,6 +1110,7 @@ class RowlessRecoveryRepository:
                             row,
                             wire_request_fingerprint,
                         ),
+                        expected_request_id=request_id,
                     )
                 )
             ):
@@ -852,6 +1147,7 @@ class RowlessRecoveryRepository:
                             row,
                             wire_request_fingerprint,
                         ),
+                        expected_request_id=request_id,
                     )
                 )
             ):
@@ -880,6 +1176,7 @@ class RowlessRecoveryRepository:
             row.wire_request_fingerprint = None
             if origin_marker is not None:
                 origin_marker.recovery_required_attempt_fingerprint = None
+                origin_marker.recovery_required_attempt_request_id = None
             await self._session.commit()
             return True
 
@@ -916,6 +1213,7 @@ class RowlessRecoveryRepository:
                             row,
                             wire_request_fingerprint,
                         ),
+                        expected_request_id=request_id,
                     )
                 )
             ):
@@ -942,6 +1240,7 @@ class RowlessRecoveryRepository:
             row.wire_request_fingerprint = None
             if origin_marker is not None:
                 origin_marker.recovery_required_attempt_fingerprint = None
+                origin_marker.recovery_required_attempt_request_id = None
             await self._session.commit()
             return True
 
@@ -974,6 +1273,7 @@ class RowlessRecoveryRepository:
                             row,
                             wire_request_fingerprint,
                         ),
+                        expected_request_id=request_id,
                     )
                 )
             ):
@@ -1000,6 +1300,7 @@ class RowlessRecoveryRepository:
             row.wire_request_fingerprint = None
             if origin_marker is not None:
                 origin_marker.recovery_required_attempt_fingerprint = None
+                origin_marker.recovery_required_attempt_request_id = None
             await self._session.commit()
             return True
 
@@ -1063,6 +1364,7 @@ class RowlessRecoveryRepository:
                                 row,
                                 row.wire_request_fingerprint,
                             ),
+                            expected_request_id=request_id,
                         )
                     )
                 )
@@ -1079,6 +1381,7 @@ class RowlessRecoveryRepository:
             replacement.recovery_required_anchor_hash = None
             replacement.recovery_required_account_id = None
             replacement.recovery_required_attempt_fingerprint = None
+            replacement.recovery_required_attempt_request_id = None
             replacement.recovery_required_at = None
             registered = await DurableBridgeRepository(self._session)._execute_alias_upsert(
                 session_id=replacement_session_id,
@@ -1157,6 +1460,7 @@ class RowlessRecoveryRepository:
             or marker.latest_response_id is None
             or durable_bridge_hash(marker.latest_response_id) != stale_anchor_hash
             or marker.recovery_required_attempt_fingerprint is not None
+            or marker.recovery_required_attempt_request_id is not None
         ):
             raise RowlessRecoveryStateError("durable_marker_capture_fence_rejected")
 
@@ -1166,6 +1470,7 @@ class RowlessRecoveryRepository:
         authority: HttpBridgeRowlessRecoveryAuthority,
         *,
         expected_attempt_fingerprint: str | None = None,
+        expected_request_id: str | None = None,
     ) -> bool:
         return bool(
             marker is not None
@@ -1177,6 +1482,7 @@ class RowlessRecoveryRepository:
             and marker.latest_response_id is not None
             and durable_bridge_hash(marker.latest_response_id) == authority.stale_anchor_hash
             and marker.recovery_required_attempt_fingerprint == expected_attempt_fingerprint
+            and marker.recovery_required_attempt_request_id == expected_request_id
         )
 
     async def _load_origin_marker_for_update(
@@ -1265,6 +1571,8 @@ def _snapshot(row: HttpBridgeRowlessRecoveryAuthority) -> RowlessRecoveryAuthori
         request_self_contained=row.request_self_contained,
         request_account_neutral=row.request_account_neutral,
         checkpoint_receipt_sha256=row.checkpoint_receipt_sha256,
+        authorization_mode=row.authorization_mode,
+        authorization_proof_sha256=row.authorization_proof_sha256,
         replacement_session_id=row.replacement_session_id,
         dispatch_request_id=row.dispatch_request_id,
         dispatch_send_started_at=row.dispatch_send_started_at,
@@ -1272,6 +1580,101 @@ def _snapshot(row: HttpBridgeRowlessRecoveryAuthority) -> RowlessRecoveryAuthori
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
+
+
+def _capture_matches(
+    row: HttpBridgeRowlessRecoveryAuthority,
+    facts: RowlessRecoveryCaptureFacts,
+) -> bool:
+    return bool(
+        row.captured_input_item_count == facts.input_item_count
+        and row.captured_input_fingerprint == facts.input_fingerprint
+        and row.non_input_contract_fingerprint == facts.contract_fingerprint
+        and row.settled_direct_call_ledger_digest == facts.direct_call_ledger_digest
+        and row.projected_payload_fingerprint == facts.projected_payload_fingerprint
+        and row.actual_wire_fingerprint == facts.actual_wire_fingerprint
+        and row.settled_direct_call_unresolved_count == facts.unresolved_count
+        and row.request_self_contained == facts.self_contained
+        and row.request_account_neutral == facts.account_neutral
+    )
+
+
+def _replace_capture(
+    row: HttpBridgeRowlessRecoveryAuthority,
+    facts: RowlessRecoveryCaptureFacts,
+) -> None:
+    row.captured_input_item_count = facts.input_item_count
+    row.captured_input_fingerprint = facts.input_fingerprint
+    row.non_input_contract_fingerprint = facts.contract_fingerprint
+    row.settled_direct_call_ledger_digest = facts.direct_call_ledger_digest
+    row.projected_payload_fingerprint = facts.projected_payload_fingerprint
+    row.actual_wire_fingerprint = facts.actual_wire_fingerprint
+    row.settled_direct_call_unresolved_count = facts.unresolved_count
+    row.request_self_contained = facts.self_contained
+    row.request_account_neutral = facts.account_neutral
+
+
+def _clear_operator_authorization(row: HttpBridgeRowlessRecoveryAuthority) -> None:
+    row.authorization_mode = None
+    row.authorization_proof_sha256 = None
+    row.challenge_nonce_hash = None
+    row.challenge_expires_at = None
+    row.checkpoint_receipt_sha256 = None
+    row.checkpoint_jsonl_sha256 = None
+    row.checkpoint_jsonl_size_bytes = None
+    row.checkpoint_jsonl_last_offset = None
+    row.checkpoint_task_identity_hash = None
+    row.checkpoint_session_identity_hash = None
+    row.checkpoint_strong_session_hash = None
+    row.checkpoint_task_authority_digest = None
+    row.checkpoint_tool_ledger_digest = None
+    row.approved_by_actor = None
+    row.approved_at = None
+
+
+def _automatic_authorization_proof(
+    row: HttpBridgeRowlessRecoveryAuthority,
+    *,
+    wire_request_fingerprint: str,
+) -> str:
+    return canonical_json_sha256(
+        {
+            "schema": "qk_http_bridge_rowless_live_request_authorization_v1",
+            "authority_id": row.id,
+            "generation": row.generation,
+            "generation_nonce": row.generation_nonce,
+            "strong_session_hash": row.strong_session_hash,
+            "task_authority_digest": row.captured_task_authority_digest,
+            "captured_input_item_count": row.captured_input_item_count,
+            "captured_input_fingerprint": row.captured_input_fingerprint,
+            "non_input_contract_fingerprint": row.non_input_contract_fingerprint,
+            "direct_call_ledger_digest": row.settled_direct_call_ledger_digest,
+            "projected_payload_fingerprint": row.projected_payload_fingerprint,
+            "actual_wire_fingerprint": row.actual_wire_fingerprint,
+            "selected_account_intent": row.selected_account_intent,
+            "wire_request_fingerprint": wire_request_fingerprint,
+        }
+    )
+
+
+def _dispatch_authorized(
+    row: HttpBridgeRowlessRecoveryAuthority,
+    *,
+    wire_request_fingerprint: str,
+) -> bool:
+    if row.authorization_mode == ROWLESS_AUTHORIZATION_MODE_AUTOMATIC:
+        if not _is_sha256(row.authorization_proof_sha256 or "") or not _is_sha256(wire_request_fingerprint):
+            return False
+        return secrets.compare_digest(
+            row.authorization_proof_sha256 or "",
+            _automatic_authorization_proof(
+                row,
+                wire_request_fingerprint=wire_request_fingerprint,
+            ),
+        )
+    if row.authorization_mode in {None, ROWLESS_AUTHORIZATION_MODE_OPERATOR}:
+        return _is_sha256(row.checkpoint_receipt_sha256 or "")
+    return False
 
 
 def _origin_marker_attempt_fingerprint(

@@ -220,6 +220,7 @@ async def test_recovery_required_marker_is_owner_anchor_bound_durable_and_termin
                 account_id="acc-recovery-required",
                 rejected_response_id="resp-rejected-anchor",
                 attempt_fingerprint=fingerprint,
+                request_id=f"claim-{fingerprint[0]}",
             )
             for fingerprint in wire_fingerprints
         )
@@ -277,6 +278,7 @@ async def test_recovery_required_marker_is_owner_anchor_bound_durable_and_termin
             account_id="acc-recovery-required",
             rejected_response_id="resp-rejected-anchor",
             attempt_fingerprint=claimed_fingerprint,
+            request_id=f"claim-{claimed_fingerprint[0]}",
         )
         is True
     )
@@ -288,6 +290,7 @@ async def test_recovery_required_marker_is_owner_anchor_bound_durable_and_termin
             account_id="acc-recovery-required",
             rejected_response_id="resp-rejected-anchor",
             attempt_fingerprint=rejected_fingerprint,
+            request_id=f"claim-{rejected_fingerprint[0]}",
         )
         is False
     )
@@ -377,6 +380,7 @@ async def test_marker_terminal_alias_conflict_rolls_back_checkpoint_and_journal(
         account_id="acc-marker-terminal-atomic",
         rejected_response_id="resp-marker-terminal-old",
         attempt_fingerprint=request_fingerprint,
+        request_id="claim-marker-terminal-atomic",
     )
     attempt = await coordinator.record_recovery_attempt(
         session_id=marker.session_id,
@@ -426,6 +430,7 @@ async def test_marker_terminal_alias_conflict_rolls_back_checkpoint_and_journal(
             owner_epoch=marker.owner_epoch,
             account_id="acc-marker-terminal-atomic",
             request_fingerprint=request_fingerprint,
+            claim_request_id="claim-marker-terminal-atomic",
             request_id="request-marker-terminal-atomic",
             response_id="resp-marker-terminal-new",
             input_item_count=5,
@@ -600,7 +605,8 @@ async def test_missing_durable_bridge_tables_checks_current_postgres_schemas() -
         def get_bind(self) -> SimpleNamespace:
             return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
 
-        async def execute(self, statement: object) -> SimpleNamespace:
+        async def execute(self, statement: object, *args: object) -> SimpleNamespace:
+            del args
             captured_sql.append(str(statement))
             return SimpleNamespace(fetchall=lambda: [("http_bridge_sessions",)])
 
@@ -614,7 +620,7 @@ async def test_missing_durable_bridge_tables_checks_current_postgres_schemas() -
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("dialect", ("sqlite", "postgresql"))
-async def test_missing_durable_bridge_tables_reports_marker_origin_column(
+async def test_missing_durable_bridge_tables_reports_required_rowless_columns(
     dialect: str,
 ) -> None:
     captured_sql: list[str] = []
@@ -623,7 +629,8 @@ async def test_missing_durable_bridge_tables_reports_marker_origin_column(
         def get_bind(self) -> SimpleNamespace:
             return SimpleNamespace(dialect=SimpleNamespace(name=dialect))
 
-        async def execute(self, statement: object) -> SimpleNamespace:
+        async def execute(self, statement: object, *args: object) -> SimpleNamespace:
+            del args
             rendered = str(statement)
             captured_sql.append(rendered)
             if "sqlite_master" in rendered or "information_schema.tables" in rendered:
@@ -636,8 +643,13 @@ async def test_missing_durable_bridge_tables_reports_marker_origin_column(
 
     missing = await missing_durable_bridge_tables(cast(AsyncSession, _SchemaSession()))
 
-    assert missing == ("http_bridge_rowless_recovery_authorities.origin_marker_session_id",)
-    assert len(captured_sql) == 2
+    assert missing == (
+        "http_bridge_rowless_recovery_authorities.authorization_mode",
+        "http_bridge_rowless_recovery_authorities.authorization_proof_sha256",
+        "http_bridge_rowless_recovery_authorities.origin_marker_session_id",
+        "http_bridge_sessions.recovery_required_attempt_request_id",
+    )
+    assert len(captured_sql) == 3
 
 
 @pytest.mark.asyncio

@@ -1012,8 +1012,10 @@ async def test_rowless_recovery_admin_surface_requires_trusted_proxy_operator(
         "markerBoundStateCounts": {"captured": 0, "approved": 0, "unknown": 0, "consumed": 0},
         "replayFenceCount": 0,
         "markerBoundAuthorityCount": 0,
+        "activeAutomaticAuthorityCount": 0,
         "preRowlessImageCompatible": True,
         "preMarkerRecoveryImageCompatible": True,
+        "preAutomaticRecoveryImageCompatible": True,
         "minimumRollbackCapability": None,
     }
 
@@ -1036,7 +1038,23 @@ async def test_rowless_recovery_admin_surface_requires_trusted_proxy_operator(
     assert marker_status.json()["markerBoundAuthorityCount"] == 1
     assert marker_status.json()["preRowlessImageCompatible"] is False
     assert marker_status.json()["preMarkerRecoveryImageCompatible"] is False
+    assert marker_status.json()["preAutomaticRecoveryImageCompatible"] is True
     assert marker_status.json()["minimumRollbackCapability"] == "rowless_marker_recovery_v2"
+
+    async def one_active_automatic(self):
+        del self
+        return 1
+
+    with monkeypatch.context() as status_patch:
+        status_patch.setattr(RowlessRecoveryRepository, "active_automatic_authority_count", one_active_automatic)
+        automatic_status = await async_client.get(
+            "/api/http-bridge/rowless-recovery/status",
+            headers={"Remote-User": "operator@example.com"},
+        )
+    assert automatic_status.status_code == 200
+    assert automatic_status.json()["activeAutomaticAuthorityCount"] == 1
+    assert automatic_status.json()["preAutomaticRecoveryImageCompatible"] is False
+    assert automatic_status.json()["minimumRollbackCapability"] == "rowless_automatic_recovery_v3"
 
     _set_dashboard_auth_env(
         monkeypatch,

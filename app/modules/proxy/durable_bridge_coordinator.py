@@ -50,6 +50,7 @@ class DurableBridgeLookup:
     recovery_required_anchor_hash: str | None = None
     recovery_required_account_id: str | None = None
     recovery_required_attempt_fingerprint: str | None = None
+    recovery_required_attempt_request_id: str | None = None
     recovery_required_at: datetime | None = None
 
     def lease_is_active(self, *, now: datetime) -> bool:
@@ -457,6 +458,7 @@ class DurableBridgeSessionCoordinator:
         account_id: str,
         rejected_response_id: str,
         attempt_fingerprint: str,
+        request_id: str,
     ) -> bool:
         async with self._session() as session:
             return await DurableBridgeRepository(session).claim_recovery_required_attempt(
@@ -466,6 +468,57 @@ class DurableBridgeSessionCoordinator:
                 account_id=account_id,
                 rejected_response_id=rejected_response_id,
                 attempt_fingerprint=attempt_fingerprint,
+                request_id=request_id,
+            )
+
+    async def rollback_live_session_recovery_attempt_before_dispatch(
+        self,
+        *,
+        session_id: str,
+        api_key_id: str | None,
+        instance_id: str,
+        owner_epoch: int,
+        account_id: str,
+        attempt_fingerprint: str,
+        request_id: str,
+        journal_request_id: str,
+    ) -> bool:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).rollback_recovery_required_attempt_before_dispatch(
+                session_id=session_id,
+                api_key_scope=durable_bridge_api_key_scope(api_key_id),
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+                account_id=account_id,
+                attempt_fingerprint=attempt_fingerprint,
+                request_id=request_id,
+                journal_request_id=journal_request_id,
+            )
+
+    async def claim_and_record_live_session_recovery_attempt(
+        self,
+        *,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        account_id: str,
+        rejected_response_id: str,
+        attempt_fingerprint: str,
+        claim_request_id: str,
+        journal_request_id: str,
+        model: str | None,
+    ) -> DurableBridgeRecoveryAttemptSnapshot | None:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).claim_recovery_required_attempt_with_journal(
+                session_id=session_id,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+                account_id=account_id,
+                rejected_response_id=rejected_response_id,
+                attempt_fingerprint=attempt_fingerprint,
+                claim_request_id=claim_request_id,
+                journal_request_id=journal_request_id,
+                model=model,
             )
 
     async def record_recovery_attempt(
@@ -535,6 +588,7 @@ class DurableBridgeSessionCoordinator:
         owner_epoch: int,
         account_id: str,
         request_fingerprint: str,
+        claim_request_id: str,
         request_id: str,
         response_id: str,
         input_item_count: int,
@@ -550,6 +604,7 @@ class DurableBridgeSessionCoordinator:
                 owner_epoch=owner_epoch,
                 account_id=account_id,
                 request_fingerprint=request_fingerprint,
+                claim_request_id=claim_request_id,
                 request_id=request_id,
                 response_id=response_id,
                 input_item_count=input_item_count,
@@ -723,5 +778,6 @@ def _to_lookup(snapshot: DurableBridgeSessionSnapshot) -> DurableBridgeLookup:
         recovery_required_anchor_hash=snapshot.recovery_required_anchor_hash,
         recovery_required_account_id=snapshot.recovery_required_account_id,
         recovery_required_attempt_fingerprint=snapshot.recovery_required_attempt_fingerprint,
+        recovery_required_attempt_request_id=snapshot.recovery_required_attempt_request_id,
         recovery_required_at=snapshot.recovery_required_at,
     )

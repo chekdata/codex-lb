@@ -14,11 +14,14 @@ from app.modules.proxy.replay_safety import (
     project_responses_input_for_account_neutral_fresh_replay,
     responses_direct_call_ledger_summary,
     responses_input_items_are_self_contained_rowless_replay,
+    responses_input_retains_prior_output_and_fresh_followup,
     responses_payload_is_account_neutral_fresh_replay,
 )
 
 ROWLESS_SEMANTIC_REBASE_ACKNOWLEDGEMENT = "operator_acknowledged_semantic_rebase"
 ROWLESS_FORWARDING_PAYLOAD_SCHEMA = "qk_http_bridge_rowless_forwarding_payload_v1"
+ROWLESS_AUTHORIZATION_MODE_AUTOMATIC = "automatic_live_request"
+ROWLESS_AUTHORIZATION_MODE_OPERATOR = "operator_checkpoint"
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +36,7 @@ class RowlessRecoveryCaptureFacts:
     projected_input: list[JsonValue]
     self_contained: bool
     account_neutral: bool
+    retains_prior_output: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +48,7 @@ class RowlessRecoveryCaptureIntent:
     task_identity: str
     session_identity: str
     facts: RowlessRecoveryCaptureFacts
+    automatic_live_recovery: bool = False
 
 
 def canonical_json_sha256(value: object) -> str:
@@ -111,13 +116,21 @@ def rowless_projected_actual_wire_fingerprint(
 ) -> str:
     """Hash the exact transformed first wire after applying the approved rebase projection."""
 
+    return rowless_actual_wire_fingerprint(rowless_projected_actual_wire_text(request_text, projected_input))
+
+
+def rowless_projected_actual_wire_text(
+    request_text: str,
+    projected_input: list[JsonValue],
+) -> str:
+    """Return the exact anchor-free wire retained only by the live request."""
+
     payload = json.loads(request_text)
     if not isinstance(payload, dict):
         raise ValueError("rowless wire payload must be an object")
     payload["input"] = projected_input
     payload.pop("previous_response_id", None)
-    projected_text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
-    return rowless_actual_wire_fingerprint(projected_text)
+    return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
 
 
 def _contains_transformable_external_image(value: JsonValue) -> bool:
@@ -150,16 +163,25 @@ def build_rowless_recovery_capture_facts(
         input_items,
         stored_count=len(input_items),
     )
-    if projection is None:
+    evidence_projection = project_responses_input_for_account_neutral_fresh_replay(
+        input_items,
+        stored_count=len(input_items),
+        preserve_response_owned_agent_message_ids=True,
+    )
+    if projection is None or evidence_projection is None:
         return None
     projected_input = normalize_responses_input_for_rowless_replay(projection.input_items)
-    if projected_input is None:
+    evidence_input = normalize_responses_input_for_rowless_replay(evidence_projection.input_items)
+    if projected_input is None or evidence_input is None:
         return None
     projected_payload = payload.model_copy(update={"input": projected_input, "previous_response_id": None})
     self_contained = responses_input_items_are_self_contained_rowless_replay(
         input_items,
         projected_input,
     )
+    # The wire projection strips response-owned IDs. Keep them only in this
+    # classification copy so retained agent output can still be proven.
+    retains_prior_output = responses_input_retains_prior_output_and_fresh_followup(evidence_input)
     account_neutral_input = [
         item for item in projected_input if not (isinstance(item, dict) and item.get("type") == "agent_message")
     ]
@@ -182,6 +204,7 @@ def build_rowless_recovery_capture_facts(
                 expected_task_identity=expected_task_identity,
             )
         ),
+        retains_prior_output=retains_prior_output,
     )
 
 

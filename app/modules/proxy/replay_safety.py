@@ -253,6 +253,8 @@ class AccountNeutralCodexTurnMetadataEvidence:
     root_turn_identity: str | None
     installation_identity: str | None
     window_identity: str | None
+    workspace_kind: str | None
+    forked_from_thread_identity: str | None
     shared_projection_fingerprint: str
 
 
@@ -772,10 +774,11 @@ def responses_input_suffix_retains_prior_output(
     canonical_lite_developer_index: int | None = None,
     exact_stored_prefix_without_pending_manifest: bool = False,
     allow_response_owned_agent_message: bool = True,
+    allow_empty_stored_prefix: bool = False,
 ) -> bool:
     """Prove that a stored input prefix is followed by prior output and new input."""
 
-    if stored_count <= 0 or len(input_items) <= stored_count:
+    if stored_count < 0 or (stored_count == 0 and not allow_empty_stored_prefix) or len(input_items) <= stored_count:
         return False
     stored_prefix = input_items[:stored_count]
     if exact_stored_prefix_without_pending_manifest:
@@ -884,6 +887,29 @@ def responses_input_suffix_retains_prior_output(
             continue
         return False
     return retained_output_seen and fresh_followup_seen and not pending_suffix_calls
+
+
+def responses_input_retains_prior_output_and_fresh_followup(
+    input_items: list[JsonValue],
+) -> bool:
+    """Prove a full resend retains completed output before its new user turn."""
+
+    for index in range(len(input_items) - 2, -1, -1):
+        item = input_items[index]
+        if not isinstance(item, dict):
+            continue
+        if not (
+            (item.get("type") in (None, "message") and item.get("role") == "assistant")
+            or item.get("type") == "agent_message"
+        ):
+            continue
+        return responses_input_suffix_retains_prior_output(
+            input_items,
+            stored_count=index,
+            exact_stored_prefix_without_pending_manifest=True,
+            allow_empty_stored_prefix=index == 0,
+        )
+    return False
 
 
 def responses_input_suffix_matches_pending_tool_calls(
@@ -1861,6 +1887,8 @@ def account_neutral_codex_turn_metadata_identity(
         root_turn_identity=cast(str | None, root_turn_id),
         installation_identity=cast(str | None, decoded.get("installation_id")),
         window_identity=cast(str | None, decoded.get("window_id")),
+        workspace_kind=cast(str | None, decoded.get("workspace_kind")),
+        forked_from_thread_identity=cast(str | None, decoded.get("forked_from_thread_id")),
         shared_projection_fingerprint=shared_projection_fingerprint,
     )
 

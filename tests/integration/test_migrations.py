@@ -64,7 +64,8 @@ async def test_rowless_recovery_authority_migration_round_trip(tmp_path):
     db_url = f"sqlite+aiosqlite:///{tmp_path / 'rowless-recovery.sqlite'}"
     parent_revision = "20260823_000000_add_http_bridge_recovery_required_marker"
     authority_revision = "20260824_000000_add_http_bridge_rowless_recovery_authorities"
-    revision = "20260824_010000_bind_rowless_authority_to_recovery_marker"
+    marker_revision = "20260824_010000_bind_rowless_authority_to_recovery_marker"
+    revision = "20260825_000000_add_rowless_authorization_provenance"
     table = "http_bridge_rowless_recovery_authorities"
 
     def schema_state(sync_conn):
@@ -74,6 +75,7 @@ async def test_rowless_recovery_authority_migration_round_trip(tmp_path):
         return {
             "has_table": True,
             "columns": {column["name"] for column in inspector.get_columns(table)},
+            "session_columns": {column["name"] for column in inspector.get_columns("http_bridge_sessions")},
             "uniques": {item["name"] for item in inspector.get_unique_constraints(table)},
             "indexes": {item["name"] for item in inspector.get_indexes(table)},
         }
@@ -102,10 +104,152 @@ async def test_rowless_recovery_authority_migration_round_trip(tmp_path):
         assert "idx_http_bridge_rowless_recovery_state" in state["indexes"]
         assert "origin_marker_session_id" not in state["columns"]
 
-        await to_thread.run_sync(lambda: run_upgrade(db_url, revision, bootstrap_legacy=False))
+        await to_thread.run_sync(lambda: run_upgrade(db_url, marker_revision, bootstrap_legacy=False))
         async with engine.connect() as conn:
             state = await conn.run_sync(schema_state)
         assert "origin_marker_session_id" in state["columns"]
+        assert "authorization_mode" not in state["columns"]
+        assert "recovery_required_attempt_request_id" not in state["session_columns"]
+
+        historical_authority_id = str(uuid4())
+        journal_backed_session_id = str(uuid4())
+        journal_free_session_id = str(uuid4())
+        journal_backed_fingerprint = "1" * 64
+        journal_free_fingerprint = "2" * 64
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    f"INSERT INTO {table} ("
+                    "id,api_key_scope,session_key_kind,strong_session_hash,stale_anchor_hash,"
+                    "generation,generation_nonce,state,captured_input_item_count,"
+                    "captured_input_fingerprint,non_input_contract_fingerprint,"
+                    "settled_direct_call_ledger_digest,projected_payload_fingerprint,actual_wire_fingerprint,"
+                    "settled_direct_call_unresolved_count,selected_account_intent,"
+                    "captured_task_identity_hash,captured_session_identity_hash,"
+                    "captured_task_authority_digest,request_self_contained,request_account_neutral,"
+                    "checkpoint_receipt_sha256,created_at,updated_at) VALUES ("
+                    ":id,'scope','session_header',:hash,:hash,1,:nonce,'approved',1,"
+                    ":hash,:hash,:hash,:hash,:hash,0,'account-a',:hash,:hash,:hash,1,1,:receipt,"
+                    "CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+                ),
+                {
+                    "id": historical_authority_id,
+                    "hash": "a" * 64,
+                    "nonce": "b" * 64,
+                    "receipt": "c" * 64,
+                },
+            )
+            for session_id, suffix, fingerprint in (
+                (journal_backed_session_id, "journal", journal_backed_fingerprint),
+                (journal_free_session_id, "free", journal_free_fingerprint),
+            ):
+                await conn.execute(
+                    text(
+                        "INSERT INTO http_bridge_sessions ("
+                        "id,session_key_kind,session_key_value,session_key_hash,api_key_scope,"
+                        "owner_instance_id,owner_epoch,state,latest_response_id,"
+                        "recovery_required_anchor_hash,recovery_required_account_id,"
+                        "recovery_required_attempt_fingerprint) VALUES ("
+                        ":id,'session_header',:value,:hash,'scope','instance-a',1,'active',"
+                        ":response_id,:anchor_hash,'account-a',:fingerprint)"
+                    ),
+                    {
+                        "id": session_id,
+                        "value": f"session-{suffix}",
+                        "hash": ("3" if suffix == "journal" else "4") * 64,
+                        "response_id": f"resp-{suffix}",
+                        "anchor_hash": ("5" if suffix == "journal" else "6") * 64,
+                        "fingerprint": fingerprint,
+                    },
+                )
+            await conn.execute(
+                text(
+                    "INSERT INTO http_bridge_recovery_attempts ("
+                    "id,session_id,request_fingerprint,request_id,replay_safe,state) VALUES ("
+                    ":id,:session_id,:fingerprint,'journal-owner',1,'unknown')"
+                ),
+                {
+                    "id": str(uuid4()),
+                    "session_id": journal_backed_session_id,
+                    "fingerprint": journal_backed_fingerprint,
+                },
+            )
+
+        await to_thread.run_sync(lambda: run_upgrade(db_url, revision, bootstrap_legacy=False))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(schema_state)
+            backfilled = (
+                await conn.execute(
+                    text(f"SELECT authorization_mode, authorization_proof_sha256 FROM {table} WHERE id = :id"),
+                    {"id": historical_authority_id},
+                )
+            ).one()
+            marker_claims = (
+                await conn.execute(
+                    text(
+                        "SELECT id,recovery_required_attempt_fingerprint,recovery_required_attempt_request_id "
+                        "FROM http_bridge_sessions WHERE id IN (:journal_backed,:journal_free) ORDER BY id"
+                    ),
+                    {
+                        "journal_backed": journal_backed_session_id,
+                        "journal_free": journal_free_session_id,
+                    },
+                )
+            ).all()
+        assert {"authorization_mode", "authorization_proof_sha256"} <= state["columns"]
+        assert "recovery_required_attempt_request_id" in state["session_columns"]
+        assert backfilled == ("operator_checkpoint", "c" * 64)
+        claims_by_id = {row[0]: (row[1], row[2]) for row in marker_claims}
+        assert claims_by_id[journal_backed_session_id] == (journal_backed_fingerprint, "journal-owner")
+        assert claims_by_id[journal_free_session_id] == (None, None)
+
+        automatic_authority_id = str(uuid4())
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    f"INSERT INTO {table} ("
+                    "id,api_key_scope,session_key_kind,strong_session_hash,stale_anchor_hash,"
+                    "generation,generation_nonce,state,captured_input_item_count,"
+                    "captured_input_fingerprint,non_input_contract_fingerprint,"
+                    "settled_direct_call_ledger_digest,projected_payload_fingerprint,actual_wire_fingerprint,"
+                    "settled_direct_call_unresolved_count,selected_account_intent,"
+                    "captured_task_identity_hash,captured_session_identity_hash,"
+                    "captured_task_authority_digest,request_self_contained,request_account_neutral,"
+                    "authorization_mode,authorization_proof_sha256,created_at,updated_at) VALUES ("
+                    ":id,'scope-auto','session_header',:hash,:hash,1,:nonce,'approved',1,"
+                    ":hash,:hash,:hash,:hash,:hash,0,'account-a',:hash,:hash,:hash,1,1,"
+                    "'automatic_live_request',:proof,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+                ),
+                {
+                    "id": automatic_authority_id,
+                    "hash": "d" * 64,
+                    "nonce": "e" * 64,
+                    "proof": "f" * 64,
+                },
+            )
+
+        with pytest.raises(RuntimeError, match="active automatic rowless recovery authorities exist"):
+            await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), marker_revision))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(schema_state)
+        assert {"authorization_mode", "authorization_proof_sha256"} <= state["columns"]
+
+        async with engine.begin() as conn:
+            await conn.execute(text(f"DELETE FROM {table} WHERE id = :id"), {"id": historical_authority_id})
+            await conn.execute(
+                text(f"UPDATE {table} SET state = 'consumed' WHERE id = :id"),
+                {"id": automatic_authority_id},
+            )
+
+        await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), marker_revision))
+        async with engine.connect() as conn:
+            state = await conn.run_sync(schema_state)
+        assert "authorization_mode" not in state["columns"]
+        assert "authorization_proof_sha256" not in state["columns"]
+        assert "recovery_required_attempt_request_id" not in state["session_columns"]
+
+        async with engine.begin() as conn:
+            await conn.execute(text(f"DELETE FROM {table} WHERE id = :id"), {"id": automatic_authority_id})
 
         await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), authority_revision))
         async with engine.connect() as conn:

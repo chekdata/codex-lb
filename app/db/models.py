@@ -1847,6 +1847,7 @@ class HttpBridgeSessionRecord(Base):
     recovery_required_anchor_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     recovery_required_account_id: Mapped[str | None] = mapped_column(String, nullable=True)
     recovery_required_attempt_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    recovery_required_attempt_request_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     recovery_required_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -1968,6 +1969,8 @@ class HttpBridgeRowlessRecoveryAuthority(Base):
     challenge_nonce_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     challenge_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     checkpoint_receipt_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    authorization_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    authorization_proof_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     checkpoint_jsonl_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     checkpoint_jsonl_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     checkpoint_jsonl_last_offset: Mapped[int | None] = mapped_column(Integer, nullable=True)
