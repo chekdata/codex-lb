@@ -620,10 +620,17 @@ class _HTTPBridgeRequestSubmitMixin:
                 recovery_turn_state=recovery_turn_state,
             )
         finally:
-            _release_http_bridge_unanchored_handoff(
-                session,
-                request_scope_id=request_scope_id,
-            )
+            with anyio.CancelScope(shield=True):
+                await self._rollback_marker_recovery_claim_before_dispatch(
+                    request_state,
+                    api_key_id=session.key.api_key_id,
+                    durable_session_id=session.durable_session_id,
+                    durable_owner_epoch=session.durable_owner_epoch,
+                )
+                _release_http_bridge_unanchored_handoff(
+                    session,
+                    request_scope_id=request_scope_id,
+                )
 
     async def _submit_http_bridge_request_with_handoff(
         self: Any,
@@ -700,17 +707,62 @@ class _HTTPBridgeRequestSubmitMixin:
                     raise RuntimeError("replay-safe recovery request lost its serialized body")
                 attempt_fingerprint = durable_bridge_hash(fresh_request_text)
             try:
-                attempt = await self._durable_bridge.record_recovery_attempt(
-                    session_id=session.durable_session_id,
-                    api_key_id=session.key.api_key_id,
-                    instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
-                    owner_epoch=session.durable_owner_epoch,
-                    request_fingerprint=attempt_fingerprint,
-                    request_id=request_state.request_id,
-                    account_id=session.account.id,
-                    model=request_state.model,
-                    replay_safe=True,
-                )
+                if request_state.marker_recovery_terminal_settlement_required:
+                    rejected_response_id = request_state.marker_recovery_rejected_response_id
+                    claim_request_id = request_state.marker_recovery_claim_request_id
+                    if rejected_response_id is None or claim_request_id is None:
+                        raise ProxyResponseError(
+                            502,
+                            openai_error(
+                                "bridge_continuity_persistence_failed",
+                                "The marker recovery generation lost its durable identity.",
+                            ),
+                        )
+                    if request_state.marker_recovery_claimed:
+                        attempt = await self._durable_bridge.record_recovery_attempt(
+                            session_id=session.durable_session_id,
+                            api_key_id=session.key.api_key_id,
+                            instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+                            owner_epoch=session.durable_owner_epoch,
+                            request_fingerprint=attempt_fingerprint,
+                            request_id=request_state.request_id,
+                            account_id=session.account.id,
+                            model=request_state.model,
+                            replay_safe=True,
+                        )
+                    else:
+                        attempt = await self._durable_bridge.claim_and_record_live_session_recovery_attempt(
+                            session_id=session.durable_session_id,
+                            instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+                            owner_epoch=session.durable_owner_epoch,
+                            account_id=session.account.id,
+                            rejected_response_id=rejected_response_id,
+                            attempt_fingerprint=attempt_fingerprint,
+                            claim_request_id=claim_request_id,
+                            journal_request_id=request_state.request_id,
+                            model=request_state.model,
+                        )
+                        if attempt is None:
+                            raise ProxyResponseError(
+                                502,
+                                openai_error(
+                                    "bridge_continuity_persistence_failed",
+                                    "Another complete-context request already owns this recovery generation.",
+                                ),
+                            )
+                        request_state.marker_recovery_claimed = True
+                else:
+                    attempt = await self._durable_bridge.record_recovery_attempt(
+                        session_id=session.durable_session_id,
+                        api_key_id=session.key.api_key_id,
+                        instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+                        owner_epoch=session.durable_owner_epoch,
+                        request_fingerprint=attempt_fingerprint,
+                        request_id=request_state.request_id,
+                        account_id=session.account.id,
+                        model=request_state.model,
+                        replay_safe=True,
+                    )
                 if attempt is None:
                     # ``None`` is the durable owner fence rejecting this
                     # worker, not an unavailable journal (which raises and
@@ -1984,6 +2036,57 @@ class _HTTPBridgeRequestSubmitMixin:
                 ),
             )
 
+    async def _rollback_marker_recovery_claim_before_dispatch(
+        self: Any,
+        request_state: _WebSocketRequestState,
+        *,
+        api_key_id: str | None,
+        durable_session_id: str | None,
+        durable_owner_epoch: int | None,
+    ) -> None:
+        if not (request_state.marker_recovery_terminal_settlement_required and request_state.marker_recovery_claimed):
+            return
+        if request_state.rowless_recovery_send_primitive_reached or request_state.recovery_attempt_dispatched:
+            return
+        session_id = request_state.recovery_attempt_session_id
+        account_id = request_state.preferred_account_id
+        attempt_fingerprint = request_state.recovery_attempt_fingerprint
+        claim_request_id = request_state.marker_recovery_claim_request_id
+        if (
+            session_id is None
+            or durable_session_id != session_id
+            or durable_owner_epoch is None
+            or account_id is None
+            or attempt_fingerprint is None
+            or claim_request_id is None
+        ):
+            raise ProxyResponseError(
+                502,
+                openai_error(
+                    "bridge_continuity_persistence_failed",
+                    "The unsent marker recovery claim lost its durable identity.",
+                ),
+            )
+        restored = await self._durable_bridge.rollback_live_session_recovery_attempt_before_dispatch(
+            session_id=session_id,
+            api_key_id=api_key_id,
+            instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+            owner_epoch=durable_owner_epoch,
+            account_id=account_id,
+            attempt_fingerprint=attempt_fingerprint,
+            request_id=claim_request_id,
+            journal_request_id=request_state.request_id,
+        )
+        if not restored:
+            raise ProxyResponseError(
+                502,
+                openai_error(
+                    "bridge_continuity_persistence_failed",
+                    "The unsent marker recovery claim could not be restored safely.",
+                ),
+            )
+        request_state.marker_recovery_claimed = False
+
     async def _rollback_rowless_cancelled_before_fresh_send(
         self,
         request_state: _WebSocketRequestState,
@@ -2545,31 +2648,43 @@ class _HTTPBridgeRequestSubmitMixin:
                 return False
             if request_state.previous_response_id is not None:
                 require_preferred_reconnect = False
-                if account_neutral_recovery:
-                    request_state.preferred_account_id = session.account.id
-                    switch_text = None
-                else:
-                    switch_text = _prepare_websocket_request_state_for_account_switch(request_state)
-                if switch_text is None:
-                    # The retained full body may be retry-safe for continuity
-                    # while still naming an account-scoped uploaded file.  In
-                    # that case retry on the same owner-bound anchor instead of
-                    # letting visible-output replay strip the anchor and migrate.
-                    fresh_retry_safe = request_state.fresh_upstream_request_is_retry_safe
-                    request_state.fresh_upstream_request_is_retry_safe = False
-                    try:
-                        request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
-                    finally:
-                        request_state.fresh_upstream_request_is_retry_safe = fresh_retry_safe
-                    if request_text is None:
-                        return False
-                    require_preferred_reconnect = request_state.preferred_account_id is not None
-                else:
+                if request_state.rowless_recovery_authority_id is not None:
+                    captured_input_item_count = request_state.input_item_count
+                    captured_input_fingerprint = request_state.input_full_fingerprint
                     request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
+                    # Rowless settlement binds the complete client checkpoint,
+                    # not the normalized anchor-free projection sent upstream.
+                    request_state.input_item_count = captured_input_item_count
+                    request_state.input_full_fingerprint = captured_input_fingerprint
                     if request_text is None:
                         return False
-                    if not hard_owner_bound:
-                        request_state.excluded_account_ids.add(session.account.id)
+                    require_preferred_reconnect = True
+                else:
+                    if account_neutral_recovery:
+                        request_state.preferred_account_id = session.account.id
+                        switch_text = None
+                    else:
+                        switch_text = _prepare_websocket_request_state_for_account_switch(request_state)
+                    if switch_text is None:
+                        # The retained full body may be retry-safe for continuity
+                        # while still naming an account-scoped uploaded file.  In
+                        # that case retry on the same owner-bound anchor instead of
+                        # letting visible-output replay strip the anchor and migrate.
+                        fresh_retry_safe = request_state.fresh_upstream_request_is_retry_safe
+                        request_state.fresh_upstream_request_is_retry_safe = False
+                        try:
+                            request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
+                        finally:
+                            request_state.fresh_upstream_request_is_retry_safe = fresh_retry_safe
+                        if request_text is None:
+                            return False
+                        require_preferred_reconnect = request_state.preferred_account_id is not None
+                    else:
+                        request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
+                        if request_text is None:
+                            return False
+                        if not hard_owner_bound:
+                            request_state.excluded_account_ids.add(session.account.id)
             else:
                 # Account-scoped uploaded files cannot be replayed on a
                 # different owner. Keep the preferred account mandatory for
@@ -2729,18 +2844,86 @@ class _HTTPBridgeRequestSubmitMixin:
                     await self._release_request_state_account_response_create_lease(request_state)
                     return False
             request_text = self._http_bridge_text_with_account_installation_id(session, request_state, request_text)
+            if request_state.rowless_recovery_authority_id is not None:
+                if (
+                    request_state.rowless_recovery_generation is None
+                    or request_state.rowless_recovery_task_authority_digest is None
+                    or request_state.rowless_recovery_wire_fingerprint is None
+                    or session.durable_session_id is None
+                    or session.durable_owner_epoch is None
+                    or rowless_actual_wire_fingerprint(request_text) != request_state.rowless_recovery_wire_fingerprint
+                ):
+                    raise ProxyResponseError(
+                        502,
+                        openai_error(
+                            "bridge_continuity_persistence_failed",
+                            "The automatic semantic-rebase wire or durable owner changed before dispatch.",
+                        ),
+                    )
+                async with SessionLocal() as rowless_session:
+                    repository = RowlessRecoveryRepository(rowless_session)
+                    await repository.claim_dispatch(
+                        authority_id=request_state.rowless_recovery_authority_id,
+                        generation=request_state.rowless_recovery_generation,
+                        replacement_session_id=session.durable_session_id,
+                        request_id=request_state.request_id,
+                        wire_request_fingerprint=request_state.rowless_recovery_wire_fingerprint,
+                        model=request_state.model,
+                        task_authority_digest=request_state.rowless_recovery_task_authority_digest,
+                    )
+                    send_started = await repository.mark_dispatch_send_started(
+                        authority_id=request_state.rowless_recovery_authority_id,
+                        generation=request_state.rowless_recovery_generation,
+                        request_id=request_state.request_id,
+                        wire_request_fingerprint=request_state.rowless_recovery_wire_fingerprint,
+                    )
+                if not send_started:
+                    raise ProxyResponseError(
+                        502,
+                        openai_error(
+                            "bridge_continuity_persistence_failed",
+                            "The automatic semantic-rebase send fence could not be persisted.",
+                        ),
+                    )
+                request_state.rowless_recovery_send_primitive_reached = True
             await _send_http_bridge_request_text_with_archive_id(session, request_state, request_text)
             session.last_used_at = _service_time().monotonic()
             request_state.clean_close_retry_result = True
             return True
         except asyncio.CancelledError:
             request_state.clean_close_retry_result = False
+            if (
+                request_state.rowless_recovery_authority_id is not None
+                and not request_state.rowless_recovery_send_primitive_reached
+            ):
+                rollback_task = asyncio.create_task(
+                    self._rollback_rowless_preflight_setup_failure_if_unbound(request_state)
+                )
+                await _await_task_deferring_cancellation(rollback_task)
             raise
-        except UpstreamWebSocketTransportError:
+        except UpstreamWebSocketTransportError as exc:
             request_state.clean_close_retry_result = False
+            if request_state.rowless_recovery_authority_id is not None:
+                if exc.error_code == UPSTREAM_WEBSOCKET_CLOSED_BEFORE_SEND_CODE:
+                    restored = await self._rollback_rowless_cancelled_before_fresh_send(request_state)
+                    if not restored:
+                        raise ProxyResponseError(
+                            502,
+                            openai_error(
+                                "bridge_continuity_persistence_failed",
+                                "The physically-unsent automatic semantic rebase could not be restored.",
+                            ),
+                        ) from exc
+                elif not request_state.rowless_recovery_send_primitive_reached:
+                    await self._rollback_rowless_preflight_setup_failure_if_unbound(request_state)
             raise
         except Exception as exc:
             request_state.clean_close_retry_result = False
+            if (
+                request_state.rowless_recovery_authority_id is not None
+                and not request_state.rowless_recovery_send_primitive_reached
+            ):
+                await self._rollback_rowless_preflight_setup_failure_if_unbound(request_state)
             (
                 request_state.error_http_status_override,
                 request_state.error_code_override,

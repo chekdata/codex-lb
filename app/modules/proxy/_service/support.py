@@ -905,6 +905,16 @@ class _WebSocketRequestState:
     # the replacement anchor, alias, marker clear, and recovery journal in one
     # durable transaction before downstream success is delivered.
     marker_recovery_terminal_settlement_required: bool = False
+    # True only after this concrete request successfully claimed the active
+    # marker generation. Cleanup must not attempt a rollback before this flips.
+    marker_recovery_claimed: bool = False
+    # The outer HTTP request that owns the durable marker claim. This differs
+    # from request_id, which identifies the concrete upstream dispatch journal.
+    marker_recovery_claim_request_id: str | None = None
+    # Plaintext anchor is kept only in request memory so the delayed marker
+    # claim can revalidate the exact durable generation immediately before the
+    # recovery journal is written.
+    marker_recovery_rejected_response_id: str | None = None
     # Responses-Lite model advertised by ``fresh_upstream_request_text``. A
     # fresh replay built from a trusted marker-only frame has the reserved
     # marker stripped, so swapping to the fresh body must also swap this onto
@@ -1331,10 +1341,18 @@ def _websocket_request_can_replay_before_visible_output(
     allow_clean_close_retry: bool = False,
 ) -> bool:
     if request_state.rowless_recovery_authority_id is not None:
-        # The authority is UNKNOWN before the physical send.  Any transport,
-        # auth, or capacity error after that point is ambiguous and must never
-        # replay the operator-approved semantic turn.
-        return False
+        # Automatic authorization is claimed before its first physical send.
+        # Admit only that retained in-memory projection; once the send marker
+        # is durable, every outcome is ambiguous and remains non-replayable.
+        return bool(
+            not request_state.rowless_recovery_send_primitive_reached
+            and request_state.replay_count == 0
+            and request_state.response_event_count == 0
+            and not request_state.downstream_visible
+            and not request_state.upstream_model_output_seen
+            and request_state.fresh_upstream_request_is_retry_safe
+            and request_state.fresh_upstream_request_text is not None
+        )
     if not request_state.request_text:
         return False
     if request_state.transport == _REQUEST_TRANSPORT_WEBSOCKET and request_state.response_create_sent_at is None:

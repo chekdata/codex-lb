@@ -72,6 +72,7 @@ from app.modules.proxy._service.compact import (
     _sticky_key_from_compact_payload as _sticky_key_from_compact_payload,
 )
 from app.modules.proxy._service.http_bridge.helpers import (
+    _await_task_deferring_cancellation,
     _effective_http_bridge_idle_ttl_seconds,
     _http_bridge_durable_lease_ttl_seconds,
     _http_bridge_durable_lookup_allows_turn_state_takeover,
@@ -1164,7 +1165,7 @@ def _rowless_client_metadata_evidence(
     normalized_headers: Mapping[str, str],
     session_id: str,
     task_identity: str,
-) -> tuple[bool, bool, bool]:
+) -> tuple[bool, bool, bool, bool]:
     """Validate body and direct-header Codex identity carriers."""
 
     if raw_client_metadata is None:
@@ -1172,7 +1173,7 @@ def _rowless_client_metadata_evidence(
     elif isinstance(raw_client_metadata, Mapping):
         client_metadata = raw_client_metadata
     else:
-        return False, False, False
+        return False, False, False, False
 
     child_signal = any(
         key in normalized_headers or key in client_metadata for key in ("x-codex-parent-thread-id", "x-openai-subagent")
@@ -1184,13 +1185,13 @@ def _rowless_client_metadata_evidence(
             continue
         value = client_metadata[key]
         if not isinstance(value, str) or not value.strip() or value.strip() != expected:
-            return False, child_signal, metadata_thread_present
+            return False, child_signal, metadata_thread_present, False
         if key == "thread_id":
             metadata_thread_present = True
 
     flat_turn_id = client_metadata.get("turn_id")
     if flat_turn_id is not None and not (isinstance(flat_turn_id, str) and bool(flat_turn_id.strip())):
-        return False, child_signal, metadata_thread_present
+        return False, child_signal, metadata_thread_present, False
     turn_metadata_carriers: list[tuple[JsonValue, Literal["body", "direct"]]] = []
     if "x-codex-turn-metadata" in client_metadata:
         turn_metadata_carriers.append((client_metadata["x-codex-turn-metadata"], "body"))
@@ -1206,11 +1207,11 @@ def _rowless_client_metadata_evidence(
             expected_turn_identity=flat_turn_id,
         )
         if identity is None:
-            return False, child_signal, metadata_thread_present
+            return False, child_signal, metadata_thread_present, False
         carrier_identities.append(identity)
         metadata_thread_present = True
     if len(set(carrier_identities)) > 1:
-        return False, child_signal, metadata_thread_present
+        return False, child_signal, metadata_thread_present, False
     if carrier_identities:
         canonical = carrier_identities[0]
         flat_projection_pairs = (
@@ -1221,9 +1222,15 @@ def _rowless_client_metadata_evidence(
             (normalized_headers.get("x-codex-window-id"), canonical.window_identity),
         )
         if any(flat is not None and flat != nested for flat, nested in flat_projection_pairs):
-            return False, child_signal, metadata_thread_present
+            return False, child_signal, metadata_thread_present, False
 
-    return True, child_signal, metadata_thread_present
+    automatic_live_recovery = bool(
+        carrier_identities
+        and carrier_identities[0].workspace_kind is not None
+        and carrier_identities[0].workspace_kind.strip()
+        and carrier_identities[0].forked_from_thread_identity is None
+    )
+    return True, child_signal, metadata_thread_present, automatic_live_recovery
 
 
 class _HTTPBridgeStreamingMixin:
@@ -1794,6 +1801,7 @@ class _HTTPBridgeStreamingMixin:
         raw_client_metadata = bridge_payload.get("client_metadata")
         rowless_fallback_metadata_valid = True
         rowless_metadata_thread_present = False
+        rowless_official_workspace_metadata = False
         rowless_explicit_child_signal = any(
             header_name in normalized_ingress_headers
             or (isinstance(raw_client_metadata, Mapping) and header_name in raw_client_metadata)
@@ -1807,6 +1815,7 @@ class _HTTPBridgeStreamingMixin:
                 rowless_fallback_metadata_valid,
                 rowless_explicit_child_signal,
                 rowless_metadata_thread_present,
+                rowless_official_workspace_metadata,
             ) = _rowless_client_metadata_evidence(
                 raw_client_metadata=raw_client_metadata,
                 normalized_headers=normalized_ingress_headers,
@@ -1862,6 +1871,9 @@ class _HTTPBridgeStreamingMixin:
             and not conflicting_session_alias
             and (rowless_client_request_identity is None or rowless_client_request_identity == rowless_task_identity)
         )
+        rowless_automatic_live_recovery_eligible = bool(
+            rowless_dispatch_identity_eligible and rowless_official_workspace_metadata
+        )
         rowless_capture_facts = (
             build_rowless_recovery_capture_facts(
                 untrimmed_effective_payload,
@@ -1882,6 +1894,11 @@ class _HTTPBridgeStreamingMixin:
             and explicit_prompt_cache_key is not None
             and rowless_task_identity is not None
             else None
+        )
+        rowless_automatic_live_recovery_eligible = bool(
+            rowless_automatic_live_recovery_eligible
+            and rowless_capture_facts is not None
+            and rowless_capture_facts.retains_prior_output
         )
         rowless_api_key_scope = (
             durable_bridge_api_key_scope(bridge_session_key.api_key_id) if task_authority_digest is not None else None
@@ -2208,6 +2225,12 @@ class _HTTPBridgeStreamingMixin:
                     )
                     rowless_api_key_scope = durable_bridge_api_key_scope(bridge_session_key.api_key_id)
                     rowless_strong_hash = rowless_strong_session_hash("task_authority", task_authority_digest)
+                rowless_automatic_live_recovery_eligible = bool(
+                    rowless_official_workspace_metadata
+                    and (rowless_dispatch_identity_eligible or marker_rowless_dispatch_identity_eligible)
+                    and rowless_capture_facts is not None
+                    and rowless_capture_facts.retains_prior_output
+                )
                 if (
                     task_authority_digest is not None
                     and rowless_api_key_scope is not None
@@ -2289,6 +2312,28 @@ class _HTTPBridgeStreamingMixin:
                             ),
                         ) from exc
                 if rowless_authority is not None:
+                    # Legacy authorities can predate marker-origin binding.
+                    # Their terminal state is already sufficient to reject any
+                    # replay, so report that stronger fence before provenance.
+                    if rowless_authority.state == HttpBridgeRowlessRecoveryState.UNKNOWN:
+                        raise ProxyResponseError(
+                            400,
+                            openai_error(
+                                "rowless_recovery_dispatch_outcome_unknown",
+                                "The semantic-rebase dispatch outcome is unknown and cannot be replayed.",
+                                error_type="invalid_request_error",
+                            ),
+                        )
+                    if rowless_authority.state == HttpBridgeRowlessRecoveryState.CONSUMED:
+                        raise ProxyResponseError(
+                            400,
+                            openai_error(
+                                "rowless_recovery_already_consumed",
+                                "This stale semantic-rebase turn was already consumed; "
+                                "continue from its new checkpoint.",
+                                error_type="invalid_request_error",
+                            ),
+                        )
                     if rowless_authority.origin_marker_session_id != durable_lookup.session_id:
                         raise ProxyResponseError(
                             400,
@@ -2401,7 +2446,11 @@ class _HTTPBridgeStreamingMixin:
                         failure_detail="durable_recovery_required",
                         upstream_error_code="previous_response_not_found",
                     )
-            if durable_recovery_marker_active and verified_marker_full_resend:
+            if (
+                durable_recovery_marker_active
+                and verified_marker_full_resend
+                and not (rowless_automatic_live_recovery_eligible and rowless_authority is not None)
+            ):
                 # A prior request already supplied the physical stale-anchor
                 # rejection.  The durable marker is therefore equivalent to
                 # the process-local quarantine for this exact owner/anchor,
@@ -2536,31 +2585,6 @@ class _HTTPBridgeStreamingMixin:
                 durable_recovery_attempt_fingerprint = durable_bridge_hash(marker_request_text)
                 if durable_lookup.latest_response_id is None or durable_lookup.account_id is None:
                     raise RuntimeError("sealed marker recovery lost its owner-bound rejected anchor")
-                try:
-                    marker_attempt_claimed = await self._durable_bridge.claim_live_session_recovery_attempt(
-                        session_id=durable_lookup.session_id,
-                        instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
-                        owner_epoch=durable_lookup.owner_epoch,
-                        account_id=durable_lookup.account_id,
-                        rejected_response_id=durable_lookup.latest_response_id,
-                        attempt_fingerprint=durable_recovery_attempt_fingerprint,
-                    )
-                except Exception as exc:
-                    raise ProxyResponseError(
-                        502,
-                        openai_error(
-                            "bridge_continuity_persistence_failed",
-                            "The recovery generation could not be claimed; retrying is unsafe.",
-                        ),
-                    ) from exc
-                if not marker_attempt_claimed:
-                    raise ProxyResponseError(
-                        502,
-                        openai_error(
-                            "bridge_continuity_persistence_failed",
-                            "Another complete-context request already owns this recovery generation.",
-                        ),
-                    )
                 existing_marker_attempt = await self._durable_bridge.lookup_recovery_attempt(
                     session_id=durable_lookup.session_id,
                     request_fingerprint=durable_recovery_attempt_fingerprint,
@@ -2735,6 +2759,7 @@ class _HTTPBridgeStreamingMixin:
                 task_identity=rowless_task_identity,
                 session_identity=official_session_id,
                 facts=rowless_capture_facts,
+                automatic_live_recovery=rowless_automatic_live_recovery_eligible,
             )
         if task_authority_digest is not None and rowless_api_key_scope is not None and rowless_strong_hash is not None:
             if rowless_authority is None:
@@ -2772,14 +2797,6 @@ class _HTTPBridgeStreamingMixin:
                             error_type="invalid_request_error",
                         ),
                     )
-                if rowless_authority.state == HttpBridgeRowlessRecoveryState.CAPTURED:
-                    envelope = openai_error(
-                        "previous_response_recovery_authorization_required",
-                        "A dashboard administrator must approve this same-turn semantic rebase.",
-                        error_type="invalid_request_error",
-                    )
-                    envelope["error"]["action"] = "retry_same_turn_after_admin_approval"
-                    raise ProxyResponseError(400, envelope)
                 if rowless_authority.state == HttpBridgeRowlessRecoveryState.UNKNOWN:
                     raise ProxyResponseError(
                         400,
@@ -2798,6 +2815,141 @@ class _HTTPBridgeStreamingMixin:
                             error_type="invalid_request_error",
                         ),
                     )
+                automatic_preflight_claimed = False
+                automatic_request_state = None
+                automatic_text = None
+                if (
+                    rowless_automatic_live_recovery_eligible
+                    and rowless_authority.state
+                    in {
+                        HttpBridgeRowlessRecoveryState.CAPTURED,
+                        HttpBridgeRowlessRecoveryState.APPROVED,
+                    }
+                    and rowless_capture_facts is not None
+                    and rowless_capture_facts.unresolved_count == 0
+                    and rowless_capture_facts.self_contained
+                    and rowless_capture_facts.account_neutral
+                    and rowless_task_identity is not None
+                    and official_session_id is not None
+                    and untrimmed_effective_payload.previous_response_id is not None
+                ):
+                    automatic_payload = untrimmed_effective_payload.model_copy(
+                        update={
+                            "input": rowless_capture_facts.projected_input,
+                            "previous_response_id": None,
+                        }
+                    )
+                    automatic_request_state, automatic_text = prepare_bridge_request(automatic_payload)
+                    async with SessionLocal() as rowless_session:
+                        installation_id = await rowless_session.scalar(
+                            select(Account.codex_installation_id).where(
+                                Account.id == rowless_authority.selected_account_intent
+                            )
+                        )
+                    if not installation_id:
+                        raise ProxyResponseError(
+                            400,
+                            openai_error(
+                                "rowless_recovery_pinned_account_changed",
+                                "The pinned account metadata is unavailable; the semantic rebase remains unsent.",
+                                error_type="invalid_request_error",
+                            ),
+                        )
+                    automatic_text = _text_with_account_installation_id(automatic_text, installation_id)
+                    automatic_facts = dataclasses.replace(
+                        rowless_capture_facts,
+                        actual_wire_fingerprint=rowless_actual_wire_fingerprint(automatic_text),
+                    )
+                    claimed_automatic_authority = None
+                    try:
+                        async with SessionLocal() as rowless_session:
+                            claimed_automatic_authority = await RowlessRecoveryRepository(
+                                rowless_session
+                            ).capture_and_claim_automatic_preflight(
+                                api_key_scope=rowless_api_key_scope,
+                                session_key_kind=bridge_session_key.affinity_kind,
+                                strong_session_hash=rowless_strong_hash,
+                                stale_anchor_hash=durable_bridge_hash(untrimmed_effective_payload.previous_response_id),
+                                selected_account_intent=rowless_authority.selected_account_intent,
+                                task_identity=rowless_task_identity,
+                                session_identity=official_session_id,
+                                task_authority_digest=task_authority_digest,
+                                facts=automatic_facts,
+                                request_id=automatic_request_state.request_id,
+                                wire_request_fingerprint=automatic_facts.actual_wire_fingerprint,
+                                origin_marker_session_id=rowless_authority.origin_marker_session_id,
+                                expected_authority_id=rowless_authority.id,
+                                expected_generation=rowless_authority.generation,
+                            )
+                            # Bind the committed claim before AsyncSession.__aexit__
+                            # can observe cancellation, so cleanup can prove the
+                            # request remained physically unsent.
+                            automatic_request_state.rowless_recovery_authority_id = claimed_automatic_authority.id
+                            automatic_request_state.rowless_recovery_generation = claimed_automatic_authority.generation
+                            automatic_request_state.rowless_recovery_wire_fingerprint = (
+                                claimed_automatic_authority.actual_wire_fingerprint
+                            )
+                    except asyncio.CancelledError:
+                        if claimed_automatic_authority is not None:
+                            rollback_task = asyncio.create_task(
+                                self._rollback_rowless_preflight_setup_failure_if_unbound(automatic_request_state)
+                            )
+                            await _await_task_deferring_cancellation(rollback_task)
+                        raise
+                    except RowlessRecoveryStateError as exc:
+                        raise ProxyResponseError(
+                            400,
+                            openai_error(
+                                "rowless_automatic_recovery_proof_rejected",
+                                "The live Codex turn could not prove a physically-unsent semantic rebase.",
+                                error_type="invalid_request_error",
+                            ),
+                        ) from exc
+                    except Exception as exc:
+                        if claimed_automatic_authority is not None:
+                            rollback_task = asyncio.create_task(
+                                self._rollback_rowless_preflight_setup_failure_if_unbound(automatic_request_state)
+                            )
+                            try:
+                                _, rollback_cancellation = await _await_task_deferring_cancellation(rollback_task)
+                            except Exception:
+                                logger.warning(
+                                    "Failed to restore request-start unsent rowless authority",
+                                    exc_info=True,
+                                )
+                            else:
+                                if rollback_cancellation is not None:
+                                    raise rollback_cancellation
+                        raise ProxyResponseError(
+                            502,
+                            openai_error(
+                                "bridge_continuity_persistence_failed",
+                                "The semantic-rebase authority could not be persisted; retrying is unsafe.",
+                            ),
+                        ) from exc
+                    rowless_authority = claimed_automatic_authority
+                    automatic_preflight_claimed = True
+                if rowless_authority.state == HttpBridgeRowlessRecoveryState.CAPTURED:
+                    envelope = openai_error(
+                        "previous_response_recovery_authorization_required",
+                        "A dashboard administrator must approve this same-turn semantic rebase.",
+                        error_type="invalid_request_error",
+                    )
+                    envelope["error"]["action"] = "retry_same_turn_after_admin_approval"
+                    raise ProxyResponseError(400, envelope)
+                if automatic_preflight_claimed:
+                    if rowless_capture_facts is None:  # pragma: no cover - eligibility requires it
+                        raise AssertionError("automatic rowless recovery lost its captured projection")
+                    projected_input = rowless_capture_facts.projected_input
+                else:
+                    projected_input = approved_rowless_recovery_projection(
+                        untrimmed_effective_payload,
+                        captured_input_item_count=rowless_authority.captured_input_item_count,
+                        captured_input_fingerprint=rowless_authority.captured_input_fingerprint,
+                        non_input_contract_fingerprint=rowless_authority.non_input_contract_fingerprint,
+                        direct_call_ledger_digest=rowless_authority.settled_direct_call_ledger_digest,
+                        projected_payload_fingerprint=rowless_authority.projected_payload_fingerprint,
+                    )
                 if not (
                     rowless_dispatch_identity_eligible
                     or (
@@ -2813,14 +2965,6 @@ class _HTTPBridgeStreamingMixin:
                             error_type="invalid_request_error",
                         ),
                     )
-                projected_input = approved_rowless_recovery_projection(
-                    untrimmed_effective_payload,
-                    captured_input_item_count=rowless_authority.captured_input_item_count,
-                    captured_input_fingerprint=rowless_authority.captured_input_fingerprint,
-                    non_input_contract_fingerprint=rowless_authority.non_input_contract_fingerprint,
-                    direct_call_ledger_digest=rowless_authority.settled_direct_call_ledger_digest,
-                    projected_payload_fingerprint=rowless_authority.projected_payload_fingerprint,
-                )
                 if projected_input is None:
                     raise ProxyResponseError(
                         400,
@@ -2834,24 +2978,30 @@ class _HTTPBridgeStreamingMixin:
                 effective_payload = untrimmed_effective_payload.model_copy(
                     update={"input": projected_input, "previous_response_id": None}
                 )
-                request_state, text_data = prepare_bridge_request(effective_payload)
-                async with SessionLocal() as rowless_session:
-                    installation_id = await rowless_session.scalar(
-                        select(Account.codex_installation_id).where(
-                            Account.id == rowless_authority.selected_account_intent
+                if automatic_preflight_claimed:
+                    if automatic_request_state is None or automatic_text is None:  # pragma: no cover
+                        raise AssertionError("automatic rowless recovery lost its in-memory wire")
+                    request_state = automatic_request_state
+                    text_data = automatic_text
+                else:
+                    request_state, text_data = prepare_bridge_request(effective_payload)
+                    async with SessionLocal() as rowless_session:
+                        installation_id = await rowless_session.scalar(
+                            select(Account.codex_installation_id).where(
+                                Account.id == rowless_authority.selected_account_intent
+                            )
                         )
-                    )
-                if not installation_id:
-                    raise ProxyResponseError(
-                        400,
-                        openai_error(
-                            "rowless_recovery_pinned_account_changed",
-                            "The pinned account metadata is unavailable; the semantic rebase remains unsent.",
-                            error_type="invalid_request_error",
-                        ),
-                    )
-                actual_text_data = _text_with_account_installation_id(text_data, installation_id)
-                if rowless_actual_wire_fingerprint(actual_text_data) != rowless_authority.actual_wire_fingerprint:
+                    if not installation_id:
+                        raise ProxyResponseError(
+                            400,
+                            openai_error(
+                                "rowless_recovery_pinned_account_changed",
+                                "The pinned account metadata is unavailable; the semantic rebase remains unsent.",
+                                error_type="invalid_request_error",
+                            ),
+                        )
+                    text_data = _text_with_account_installation_id(text_data, installation_id)
+                if rowless_actual_wire_fingerprint(text_data) != rowless_authority.actual_wire_fingerprint:
                     raise ProxyResponseError(
                         400,
                         openai_error(
@@ -2860,8 +3010,7 @@ class _HTTPBridgeStreamingMixin:
                             error_type="invalid_request_error",
                         ),
                     )
-                text_data = actual_text_data
-                request_state.request_text = actual_text_data
+                request_state.request_text = text_data
                 request_state.rowless_recovery_authority_id = rowless_authority.id
                 request_state.rowless_recovery_generation = rowless_authority.generation
                 request_state.rowless_recovery_task_authority_digest = rowless_authority.captured_task_authority_digest
@@ -2870,32 +3019,34 @@ class _HTTPBridgeStreamingMixin:
                 request_state.preferred_account_id = rowless_authority.selected_account_intent
                 request_state.input_item_count = rowless_authority.captured_input_item_count
                 request_state.input_full_fingerprint = rowless_authority.captured_input_fingerprint
-                try:
-                    async with SessionLocal() as rowless_session:
-                        await RowlessRecoveryRepository(rowless_session).claim_dispatch_preflight(
-                            authority_id=rowless_authority.id,
-                            generation=rowless_authority.generation,
-                            request_id=request_state.request_id,
-                            wire_request_fingerprint=rowless_wire_fingerprint,
-                            task_authority_digest=rowless_authority.captured_task_authority_digest,
-                        )
-                except RowlessRecoveryStateError as exc:
-                    raise ProxyResponseError(
-                        400,
-                        openai_error(
-                            "rowless_recovery_dispatch_already_claimed",
-                            "This semantic-rebase generation has already been claimed and cannot be replayed.",
-                            error_type="invalid_request_error",
-                        ),
-                    ) from exc
-                except Exception as exc:
-                    raise ProxyResponseError(
-                        502,
-                        openai_error(
-                            "bridge_continuity_persistence_failed",
-                            "The semantic-rebase dispatch fence could not be persisted.",
-                        ),
-                    ) from exc
+                request_state.rowless_recovery_capture_intent = None
+                if not automatic_preflight_claimed:
+                    try:
+                        async with SessionLocal() as rowless_session:
+                            await RowlessRecoveryRepository(rowless_session).claim_dispatch_preflight(
+                                authority_id=rowless_authority.id,
+                                generation=rowless_authority.generation,
+                                request_id=request_state.request_id,
+                                wire_request_fingerprint=rowless_wire_fingerprint,
+                                task_authority_digest=rowless_authority.captured_task_authority_digest,
+                            )
+                    except RowlessRecoveryStateError as exc:
+                        raise ProxyResponseError(
+                            400,
+                            openai_error(
+                                "rowless_recovery_dispatch_already_claimed",
+                                "This semantic-rebase generation has already been claimed and cannot be replayed.",
+                                error_type="invalid_request_error",
+                            ),
+                        ) from exc
+                    except Exception as exc:
+                        raise ProxyResponseError(
+                            502,
+                            openai_error(
+                                "bridge_continuity_persistence_failed",
+                                "The semantic-rebase dispatch fence could not be persisted.",
+                            ),
+                        ) from exc
                 force_local_recovery_creation = True
             elif durable_lookup is not None:
                 # A normal durable checkpoint is not eligible for a new
@@ -3041,6 +3192,57 @@ class _HTTPBridgeStreamingMixin:
             request_state.recovery_attempt_session_id = durable_lookup.session_id
             request_state.recovery_attempt_owner_epoch = durable_lookup.owner_epoch
             request_state.marker_recovery_terminal_settlement_required = True
+            request_state.marker_recovery_claim_request_id = request_id
+            request_state.marker_recovery_rejected_response_id = durable_lookup.latest_response_id
+            request_state.marker_recovery_claimed = True
+            marker_session_id = durable_lookup.session_id
+            marker_owner_epoch = durable_lookup.owner_epoch
+
+            async def rollback_failed_marker_claim() -> None:
+                await self._rollback_marker_recovery_claim_before_dispatch(
+                    request_state,
+                    api_key_id=bridge_session_key.api_key_id,
+                    durable_session_id=marker_session_id,
+                    durable_owner_epoch=marker_owner_epoch,
+                )
+
+            try:
+                marker_attempt = await self._durable_bridge.claim_and_record_live_session_recovery_attempt(
+                    session_id=durable_lookup.session_id,
+                    instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+                    owner_epoch=durable_lookup.owner_epoch,
+                    account_id=durable_lookup.account_id,
+                    rejected_response_id=durable_lookup.latest_response_id,
+                    attempt_fingerprint=durable_recovery_attempt_fingerprint,
+                    claim_request_id=request_id,
+                    journal_request_id=request_state.request_id,
+                    model=request_state.model,
+                )
+            except asyncio.CancelledError:
+                rollback_task = asyncio.create_task(rollback_failed_marker_claim())
+                try:
+                    await asyncio.shield(rollback_task)
+                except asyncio.CancelledError:
+                    await rollback_task
+                raise
+            except Exception as exc:
+                await rollback_failed_marker_claim()
+                raise ProxyResponseError(
+                    502,
+                    openai_error(
+                        "bridge_continuity_persistence_failed",
+                        "The recovery generation could not be journaled; retrying is unsafe.",
+                    ),
+                ) from exc
+            if marker_attempt is None:
+                request_state.marker_recovery_claimed = False
+                raise ProxyResponseError(
+                    502,
+                    openai_error(
+                        "bridge_continuity_persistence_failed",
+                        "Another complete-context request already owns this recovery generation.",
+                    ),
+                )
         elif (
             effective_payload.previous_response_id is not None
             and payload_looks_like_full_resend
@@ -3062,6 +3264,17 @@ class _HTTPBridgeStreamingMixin:
             request_state.fresh_upstream_request_is_account_neutral = (
                 _http_bridge_payload_is_account_neutral_fresh_replay(client_full_resend_payload)
             )
+
+        async def rollback_marker_recovery_setup_failure() -> None:
+            if not request_state.marker_recovery_claimed or durable_lookup is None:
+                return
+            await self._rollback_marker_recovery_claim_before_dispatch(
+                request_state,
+                api_key_id=bridge_session_key.api_key_id,
+                durable_session_id=durable_lookup.session_id,
+                durable_owner_epoch=durable_lookup.owner_epoch,
+            )
+
         settings = _service_get_settings()
         request_deadline = request_state.started_at + _http_bridge_request_budget_seconds(settings)
         session_creation_headers = (
@@ -3290,9 +3503,12 @@ class _HTTPBridgeStreamingMixin:
                     defer_account_health_writes=request_state.api_key_reservation is not None,
                 )
             except asyncio.CancelledError:
-                rollback_task = asyncio.create_task(
-                    self._rollback_rowless_preflight_setup_failure_if_unbound(request_state)
-                )
+
+                async def rollback_cancelled_setup() -> None:
+                    await self._rollback_rowless_preflight_setup_failure_if_unbound(request_state)
+                    await rollback_marker_recovery_setup_failure()
+
+                rollback_task = asyncio.create_task(rollback_cancelled_setup())
                 try:
                     await asyncio.shield(rollback_task)
                 except asyncio.CancelledError:
@@ -3365,8 +3581,10 @@ class _HTTPBridgeStreamingMixin:
                         ):
                             yield line
                         if _service_time().monotonic() >= request_deadline:
+                            await rollback_marker_recovery_setup_failure()
                             raise
                         continue
+                    await rollback_marker_recovery_setup_failure()
                     raise
                 _log_http_bridge_event(
                     "owner_unavailable_fresh_resend",
@@ -3381,9 +3599,11 @@ class _HTTPBridgeStreamingMixin:
                 continue
             except Exception:
                 await self._rollback_rowless_preflight_setup_failure_if_unbound(request_state)
+                await rollback_marker_recovery_setup_failure()
                 raise
             break
         if isinstance(session_or_forward, _HTTPBridgeOwnerForward):
+            await rollback_marker_recovery_setup_failure()
             await _current_origin_legacy_owner_anchor_lookup(
                 durable_bridge=self._durable_bridge,
                 bridge_session_key=session_or_forward.key,
@@ -4105,6 +4325,11 @@ class _HTTPBridgeStreamingMixin:
                 request_state.recovery_attempt_claimed = previous_request_state.recovery_attempt_claimed
                 request_state.marker_recovery_terminal_settlement_required = (
                     previous_request_state.marker_recovery_terminal_settlement_required
+                )
+                request_state.marker_recovery_claimed = previous_request_state.marker_recovery_claimed
+                request_state.marker_recovery_claim_request_id = previous_request_state.marker_recovery_claim_request_id
+                request_state.marker_recovery_rejected_response_id = (
+                    previous_request_state.marker_recovery_rejected_response_id
                 )
                 request_state.input_item_count = previous_request_state.input_item_count
                 request_state.input_full_fingerprint = previous_request_state.input_full_fingerprint
@@ -4907,6 +5132,13 @@ class _HTTPBridgeStreamingMixin:
                     retry_request_state.marker_recovery_terminal_settlement_required = (
                         request_state.marker_recovery_terminal_settlement_required
                     )
+                    retry_request_state.marker_recovery_claimed = request_state.marker_recovery_claimed
+                    retry_request_state.marker_recovery_claim_request_id = (
+                        request_state.marker_recovery_claim_request_id
+                    )
+                    retry_request_state.marker_recovery_rejected_response_id = (
+                        request_state.marker_recovery_rejected_response_id
+                    )
                 _apply_http_bridge_downstream_turn_state(
                     retry_request_state,
                     downstream_turn_state=downstream_turn_state,
@@ -5102,6 +5334,20 @@ class _HTTPBridgeStreamingMixin:
                 request_state.request_id,
                 retry_cooldown_seconds,
             )
+
+            async def rollback_unsent_recovery_claims() -> None:
+                await self._rollback_rowless_preflight_setup_failure_if_unbound(request_state)
+                await self._rollback_marker_recovery_claim_before_dispatch(
+                    request_state,
+                    api_key_id=session.key.api_key_id,
+                    durable_session_id=session.durable_session_id,
+                    durable_owner_epoch=session.durable_owner_epoch,
+                )
+
+            rollback_task = asyncio.create_task(rollback_unsent_recovery_claims())
+            _, rollback_cancellation = await _await_task_deferring_cancellation(rollback_task)
+            if rollback_cancellation is not None:
+                raise rollback_cancellation
             # This path returns before the request is submitted, so the normal
             # detach/finally cleanup cannot settle an API-key reservation.
             # Release it before handing the synthetic terminal event to the

@@ -55,6 +55,7 @@ from app.modules.proxy._service.compact import (
 )
 from app.modules.proxy._service.http_bridge.helpers import (
     _HTTP_BRIDGE_MISSING_RESPONSE_CREATED_TIMEOUT_DETAIL,
+    _await_task_deferring_cancellation,
     _http_bridge_durable_lease_ttl_seconds,
     _http_bridge_eventless_precreated_deadline,
     _http_bridge_request_budget_seconds,
@@ -189,8 +190,14 @@ from app.modules.proxy.helpers import (
     _normalize_error_code,
     is_upstream_model_capacity_error,
 )
-from app.modules.proxy.rowless_recovery import rowless_projected_actual_wire_fingerprint
-from app.modules.proxy.rowless_recovery_repository import RowlessRecoveryRepository
+from app.modules.proxy.rowless_recovery import (
+    rowless_actual_wire_fingerprint,
+    rowless_projected_actual_wire_text,
+)
+from app.modules.proxy.rowless_recovery_repository import (
+    RowlessRecoveryRepository,
+    RowlessRecoveryStateError,
+)
 from app.modules.proxy.tool_call_dedupe import (
     mark_duplicate_tool_call_downstream_event,
     rewrite_parallel_tool_call_text,
@@ -751,6 +758,24 @@ async def _abandon_durable_http_bridge_continuity(
 
 
 class _HTTPBridgeUpstreamEventsMixin:
+    async def _restore_unsent_rowless_retry_setup(
+        self: Any,
+        session: "_HTTPBridgeSession",
+        request_state: _WebSocketRequestState,
+        *,
+        detach: bool,
+    ) -> None:
+        """Restore a claimed-but-unsent authority and optionally detach its retry."""
+
+        await self._rollback_rowless_preflight_setup_failure_if_unbound(request_state)
+        if not detach:
+            return
+        async with session.pending_lock:
+            if request_state in session.pending_requests:
+                session.pending_requests.remove(request_state)
+                if _http_bridge_request_counts_against_queue(request_state):
+                    session.queued_request_count = max(0, session.queued_request_count - 1)
+
     async def _fail_http_bridge_reader_and_maybe_retire(
         self: Any,
         session: "_HTTPBridgeSession",
@@ -1796,26 +1821,99 @@ class _HTTPBridgeUpstreamEventsMixin:
                 and status_request_state.previous_response_id is not None
                 and isinstance(status_request_state.request_text, str)
             ):
+                projected_wire_text = rowless_projected_actual_wire_text(
+                    status_request_state.request_text,
+                    capture_intent.facts.projected_input,
+                )
+                capture_facts = replace(
+                    capture_intent.facts,
+                    actual_wire_fingerprint=rowless_actual_wire_fingerprint(projected_wire_text),
+                )
+                authority = None
                 try:
                     async with SessionLocal() as rowless_session:
-                        authority = await RowlessRecoveryRepository(rowless_session).capture(
-                            api_key_scope=capture_intent.api_key_scope,
-                            session_key_kind=capture_intent.session_key_kind,
-                            strong_session_hash=capture_intent.strong_session_hash,
-                            stale_anchor_hash=durable_bridge_hash(status_request_state.previous_response_id),
-                            selected_account_intent=session.account.id,
-                            task_identity=capture_intent.task_identity,
-                            session_identity=capture_intent.session_identity,
-                            task_authority_digest=capture_intent.task_authority_digest,
-                            facts=replace(
-                                capture_intent.facts,
-                                actual_wire_fingerprint=rowless_projected_actual_wire_fingerprint(
-                                    status_request_state.request_text,
-                                    capture_intent.facts.projected_input,
-                                ),
+                        repository = RowlessRecoveryRepository(rowless_session)
+                        if capture_intent.automatic_live_recovery:
+                            authority = await repository.capture_and_claim_automatic_preflight(
+                                api_key_scope=capture_intent.api_key_scope,
+                                session_key_kind=capture_intent.session_key_kind,
+                                strong_session_hash=capture_intent.strong_session_hash,
+                                stale_anchor_hash=durable_bridge_hash(status_request_state.previous_response_id),
+                                selected_account_intent=session.account.id,
+                                task_identity=capture_intent.task_identity,
+                                session_identity=capture_intent.session_identity,
+                                task_authority_digest=capture_intent.task_authority_digest,
+                                facts=capture_facts,
+                                request_id=status_request_state.request_id,
+                                wire_request_fingerprint=capture_facts.actual_wire_fingerprint,
+                            )
+                            # Persist the cleanup identity before session exit;
+                            # cancellation during __aexit__ must not strand an
+                            # unsent automatic claim in UNKNOWN.
+                            status_request_state.rowless_recovery_authority_id = authority.id
+                            status_request_state.rowless_recovery_generation = authority.generation
+                            status_request_state.rowless_recovery_wire_fingerprint = authority.actual_wire_fingerprint
+                        else:
+                            authority = await repository.capture(
+                                api_key_scope=capture_intent.api_key_scope,
+                                session_key_kind=capture_intent.session_key_kind,
+                                strong_session_hash=capture_intent.strong_session_hash,
+                                stale_anchor_hash=durable_bridge_hash(status_request_state.previous_response_id),
+                                selected_account_intent=session.account.id,
+                                task_identity=capture_intent.task_identity,
+                                session_identity=capture_intent.session_identity,
+                                task_authority_digest=capture_intent.task_authority_digest,
+                                facts=capture_facts,
+                            )
+                except asyncio.CancelledError:
+                    if capture_intent.automatic_live_recovery and authority is not None:
+                        rollback_task = asyncio.create_task(
+                            self._rollback_rowless_preflight_setup_failure_if_unbound(status_request_state)
+                        )
+                        await _await_task_deferring_cancellation(rollback_task)
+                    raise
+                except RowlessRecoveryStateError:
+                    if capture_intent.automatic_live_recovery:
+                        status_request_state.error_http_status_override = 400
+                        payload = cast(
+                            dict[str, JsonValue],
+                            dict(
+                                response_failed_event(
+                                    "rowless_automatic_recovery_proof_rejected",
+                                    "The live Codex turn could not prove a physically-unsent semantic rebase.",
+                                    error_type="invalid_request_error",
+                                    response_id=status_request_state.request_id,
+                                )
+                            ),
+                        )
+                    else:
+                        logger.warning("Failed to persist legacy rowless recovery authority", exc_info=True)
+                        status_request_state.error_http_status_override = 502
+                        payload = cast(
+                            dict[str, JsonValue],
+                            dict(
+                                response_failed_event(
+                                    "bridge_continuity_persistence_failed",
+                                    "The semantic-rebase authority could not be persisted; retrying is unsafe.",
+                                    response_id=status_request_state.request_id,
+                                )
                             ),
                         )
                 except Exception:
+                    if capture_intent.automatic_live_recovery and authority is not None:
+                        rollback_task = asyncio.create_task(
+                            self._rollback_rowless_preflight_setup_failure_if_unbound(status_request_state)
+                        )
+                        try:
+                            _, rollback_cancellation = await _await_task_deferring_cancellation(rollback_task)
+                        except Exception:
+                            logger.warning(
+                                "Failed to restore unsent rowless authority after persistence failure",
+                                exc_info=True,
+                            )
+                        else:
+                            if rollback_cancellation is not None:
+                                raise rollback_cancellation
                     logger.warning("Failed to persist rowless recovery authority", exc_info=True)
                     status_request_state.error_http_status_override = 502
                     payload = cast(
@@ -1830,33 +1928,127 @@ class _HTTPBridgeUpstreamEventsMixin:
                     )
                 else:
                     status_request_state.rowless_recovery_authority_id = authority.id
-                    # The failed turn may have created a transient durable
-                    # bridge row.  Retire it so an approved retry must bind a
-                    # fresh durable replacement instead of inheriting a row
-                    # already settled by the stale-anchor failure.
-                    session.closed = True
-                    session.upstream_control.reconnect_requested = True
-                    session.upstream_control.retire_after_drain = True
-                    status_request_state.error_http_status_override = 400
-                    payload = cast(
-                        dict[str, JsonValue],
-                        dict(
-                            response_failed_event(
-                                "previous_response_recovery_authorization_required",
-                                (
-                                    "The saved response anchor no longer has a durable checkpoint. "
-                                    "A dashboard administrator must approve a same-turn semantic rebase."
-                                ),
-                                error_type="invalid_request_error",
-                                response_id=status_request_state.request_id,
+                    if capture_intent.automatic_live_recovery:
+                        status_request_state.rowless_recovery_generation = authority.generation
+                        status_request_state.rowless_recovery_task_authority_digest = (
+                            authority.captured_task_authority_digest
+                        )
+                        status_request_state.rowless_recovery_wire_fingerprint = authority.actual_wire_fingerprint
+                        status_request_state.fresh_upstream_request_text = projected_wire_text
+                        status_request_state.fresh_upstream_request_is_retry_safe = True
+                        status_request_state.fresh_upstream_request_is_account_neutral = True
+                        status_request_state.fresh_upstream_request_responses_lite_model = (
+                            status_request_state.responses_lite_model
+                        )
+                        status_request_state.preferred_account_id = authority.selected_account_intent
+                        status_request_state.input_item_count = authority.captured_input_item_count
+                        status_request_state.input_full_fingerprint = authority.captured_input_fingerprint
+                        status_request_state.rowless_recovery_capture_intent = None
+                        retry_consumer_attached = False
+                        try:
+                            async with session.pending_lock:
+                                if (
+                                    status_request_state.event_queue is not None
+                                    and not status_request_state.draining_until_terminal
+                                ):
+                                    retry_consumer_attached = True
+                                    if status_request_state not in session.pending_requests:
+                                        session.pending_requests.appendleft(status_request_state)
+                                        session.queued_request_count += 1
+                                    status_request_state.awaiting_response_created = True
+                                    status_request_state.response_id = None
+                            retried = retry_consumer_attached and await self._retry_http_bridge_precreated_request(
+                                session,
+                                request_state=status_request_state,
                             )
-                        ),
-                    )
-                    response = payload.get("response")
-                    if isinstance(response, dict):
-                        error_detail = response.get("error")
-                        if isinstance(error_detail, dict):
-                            error_detail["action"] = "retry_same_turn_after_admin_approval"
+                        except asyncio.CancelledError:
+                            cleanup_task = asyncio.create_task(
+                                self._restore_unsent_rowless_retry_setup(
+                                    session,
+                                    status_request_state,
+                                    detach=True,
+                                )
+                            )
+                            await _await_task_deferring_cancellation(cleanup_task)
+                            raise
+                        except Exception:
+                            cleanup_task = asyncio.create_task(
+                                self._restore_unsent_rowless_retry_setup(
+                                    session,
+                                    status_request_state,
+                                    detach=False,
+                                )
+                            )
+                            await _await_task_deferring_cancellation(cleanup_task)
+                            raise
+                        if retried:
+                            _log_http_bridge_event(
+                                "rowless_automatic_live_rebase_submitted",
+                                session.key,
+                                account_id=session.account.id,
+                                model=status_request_state.model,
+                                detail=f"generation={authority.generation}",
+                                cache_key_family=session.key.affinity_kind,
+                                model_class=(
+                                    _extract_model_class(status_request_state.model)
+                                    if status_request_state.model
+                                    else None
+                                ),
+                                owner_check_applied=True,
+                            )
+                            return
+                        rollback_task = asyncio.create_task(
+                            self._restore_unsent_rowless_retry_setup(
+                                session,
+                                status_request_state,
+                                detach=True,
+                            )
+                        )
+                        _, rollback_cancellation = await _await_task_deferring_cancellation(rollback_task)
+                        if rollback_cancellation is not None:
+                            raise rollback_cancellation
+                        status_request_state.error_http_status_override = 502
+                        payload = cast(
+                            dict[str, JsonValue],
+                            dict(
+                                response_failed_event(
+                                    "bridge_continuity_persistence_failed",
+                                    "The automatic semantic rebase could not be submitted safely.",
+                                    response_id=status_request_state.request_id,
+                                )
+                            ),
+                        )
+                        event_block = format_sse_event(payload)
+                        event = parse_sse_event_payload(payload)
+                        event_type = "response.failed"
+                        capture_intent = None
+                    else:
+                        # The failed turn may have created a transient durable
+                        # bridge row. Retire it so an approved retry must bind
+                        # a fresh durable replacement.
+                        session.closed = True
+                        session.upstream_control.reconnect_requested = True
+                        session.upstream_control.retire_after_drain = True
+                        status_request_state.error_http_status_override = 400
+                        payload = cast(
+                            dict[str, JsonValue],
+                            dict(
+                                response_failed_event(
+                                    "previous_response_recovery_authorization_required",
+                                    (
+                                        "The saved response anchor no longer has a durable checkpoint. "
+                                        "A dashboard administrator must approve a same-turn semantic rebase."
+                                    ),
+                                    error_type="invalid_request_error",
+                                    response_id=status_request_state.request_id,
+                                )
+                            ),
+                        )
+                        response = payload.get("response")
+                        if isinstance(response, dict):
+                            error_detail = response.get("error")
+                            if isinstance(error_detail, dict):
+                                error_detail["action"] = "retry_same_turn_after_admin_approval"
                 event_block = format_sse_event(payload)
                 event = parse_sse_event_payload(payload)
                 event_type = "response.failed"
@@ -2201,19 +2393,29 @@ class _HTTPBridgeUpstreamEventsMixin:
                     and matched_request_state.input_full_fingerprint is not None
                     and completed_pending_tool_call_manifest is not None
                 ):
-                    async with SessionLocal() as rowless_session:
-                        rowless_settled = await RowlessRecoveryRepository(rowless_session).settle_completed(
-                            authority_id=matched_request_state.rowless_recovery_authority_id,
-                            generation=matched_request_state.rowless_recovery_generation,
-                            replacement_session_id=session.durable_session_id,
-                            owner_instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
-                            owner_epoch=session.durable_owner_epoch,
-                            request_id=matched_request_state.request_id,
-                            response_id=response_id,
-                            input_item_count=matched_request_state.input_item_count,
-                            input_full_fingerprint=matched_request_state.input_full_fingerprint,
-                            pending_tool_calls=completed_pending_tool_call_manifest,
+                    try:
+                        async with SessionLocal() as rowless_session:
+                            rowless_settled = await RowlessRecoveryRepository(rowless_session).settle_completed(
+                                authority_id=matched_request_state.rowless_recovery_authority_id,
+                                generation=matched_request_state.rowless_recovery_generation,
+                                replacement_session_id=session.durable_session_id,
+                                owner_instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+                                owner_epoch=session.durable_owner_epoch,
+                                request_id=matched_request_state.request_id,
+                                response_id=response_id,
+                                input_item_count=matched_request_state.input_item_count,
+                                input_full_fingerprint=matched_request_state.input_full_fingerprint,
+                                pending_tool_calls=completed_pending_tool_call_manifest,
+                            )
+                    except Exception:
+                        logger.warning(
+                            "Failed to atomically settle rowless recovery",
+                            exc_info=True,
                         )
+                # Rowless recovery owns its journal and authority as one
+                # transaction. Never let generic settlement consume an UNKNOWN
+                # row when that transaction failed.
+                matched_request_state.recovery_attempt_event_observed = True
                 if rowless_settled:
                     # The durable transaction above owns publication.  This
                     # second idempotent call publishes the in-memory alias
@@ -2239,11 +2441,13 @@ class _HTTPBridgeUpstreamEventsMixin:
                 marker_session_id = matched_request_state.recovery_attempt_session_id
                 marker_owner_epoch = matched_request_state.recovery_attempt_owner_epoch
                 marker_fingerprint = matched_request_state.recovery_attempt_fingerprint
+                marker_claim_request_id = matched_request_state.marker_recovery_claim_request_id
                 marker_settled = False
                 if (
                     marker_session_id is not None
                     and marker_owner_epoch is not None
                     and marker_fingerprint is not None
+                    and marker_claim_request_id is not None
                     and matched_request_state.input_item_count > 0
                     and matched_request_state.input_full_fingerprint is not None
                     and completed_pending_tool_call_manifest is not None
@@ -2256,6 +2460,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                             owner_epoch=marker_owner_epoch,
                             account_id=session.account.id,
                             request_fingerprint=marker_fingerprint,
+                            claim_request_id=marker_claim_request_id,
                             request_id=matched_request_state.request_id,
                             response_id=response_id,
                             input_item_count=matched_request_state.input_item_count,
@@ -2347,6 +2552,7 @@ class _HTTPBridgeUpstreamEventsMixin:
             and matched_request_state.recovery_attempt_fingerprint is not None
             and recovery_attempt_session_id is not None
             and recovery_attempt_owner_epoch is not None
+            and matched_request_state.rowless_recovery_authority_id is None
             and not matched_request_state.marker_recovery_terminal_settlement_required
             and (event_type == "response.completed" or not matched_request_state.recovery_attempt_event_observed)
         ):
