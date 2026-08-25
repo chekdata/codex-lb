@@ -50,6 +50,21 @@ employee MUST NOT need to visit the dashboard or retry the turn.
 - **THEN** the service MUST NOT automatically claim or replay the request
 - **AND** MUST preserve the operator-authorized semantic-rebase flow.
 
+#### Scenario: Canonical failed root-turn retries remain recoverable
+
+- **GIVEN** an official root turn retains a completed assistant final answer
+- **AND** subsequent failed retries contain only response-owned user and
+  developer messages with unique valid message identifiers
+- **AND** the retry chain contains at least two user messages, starts and ends
+  with user input, and has no consecutive developer messages
+- **WHEN** the next live retry independently satisfies every automatic
+  recovery identity, settlement, account-neutrality, and at-most-once gate
+- **THEN** the service MAY supersede a physically unsent CAPTURED or APPROVED
+  generation and claim the exact new request automatically
+- **BUT** any assistant output, tool activity, unknown item, duplicate message
+  identifier, leading developer message, or trailing developer message in the
+  retry tail MUST keep the request fail closed.
+
 #### Scenario: Active automatic authority raises the rollback floor
 
 - **GIVEN** at least one automatically authorized APPROVED or UNKNOWN authority

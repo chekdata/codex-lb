@@ -17,6 +17,15 @@ that contains only the incremental user input is insufficient proof that
 completed output and settled call results were retained, even if it is
 otherwise self-contained.
 
+Official Codex may persist several failed root-turn inputs after a completed
+assistant final answer before another live recovery request reaches the
+gateway. Such a tail remains eligible only when every item is a canonical
+response-owned user or developer message with a unique valid message ID, the
+tail contains at least two user messages, starts and ends with user input, and
+never contains consecutive developer messages. Assistant output, tool
+activity, unknown items, duplicate IDs, and malformed ordering remain
+ineligible. All other automatic recovery gates still apply independently.
+
 ## Live first-attempt recovery
 
 When upstream rejects the explicit anchor before `response.created` and before
