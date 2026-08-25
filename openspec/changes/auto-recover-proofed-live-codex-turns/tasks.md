@@ -11,6 +11,8 @@
 - [x] Admit only canonical response-owned failed root-turn retry chains while
   rejecting assistant output, tool activity, unknown items, and malformed
   user/developer ordering in the retry tail.
+- [x] Carry a verified marker-injected stale anchor through anchorless
+  automatic preflight without trimming or rebuilding the claimed wire.
 - [x] Expose the automatic-authority rollback floor and map all uniqueness
   flush races to a stable fail-closed rejection.
 - [x] Validate OpenSpec, lint, type checks, and focused/full test gates.

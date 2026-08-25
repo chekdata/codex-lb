@@ -2737,6 +2737,13 @@ class _HTTPBridgeStreamingMixin:
                 previous_response_trimmed_input_fingerprint = _fingerprint_input_items(previous_response_input_items)
                 effective_payload = effective_payload.model_copy(update={"input": trimmed_input_items})
         request_state, text_data = prepare_bridge_request(effective_payload)
+        # A hard-session reattach can inject the marker's stale anchor after
+        # rowless capture facts are built. Keep the original client payload for
+        # contract proof, but let exactly-once preflight bind that verified
+        # owner-backed anchor.
+        rowless_recovery_stale_anchor_id = untrimmed_effective_payload.previous_response_id
+        if rowless_recovery_stale_anchor_id is None and proxy_injected_previous_response_id:
+            rowless_recovery_stale_anchor_id = effective_payload.previous_response_id
         if (
             not durable_marker_verified_recovery
             and task_authority_digest is not None
@@ -2749,7 +2756,7 @@ class _HTTPBridgeStreamingMixin:
             and rowless_capture_facts.account_neutral
             and rowless_task_identity is not None
             and official_session_id is not None
-            and untrimmed_effective_payload.previous_response_id is not None
+            and rowless_recovery_stale_anchor_id is not None
         ):
             request_state.rowless_recovery_capture_intent = RowlessRecoveryCaptureIntent(
                 api_key_scope=rowless_api_key_scope,
@@ -2765,11 +2772,11 @@ class _HTTPBridgeStreamingMixin:
             if rowless_authority is None:
                 async with SessionLocal() as rowless_session:
                     rowless_repository = RowlessRecoveryRepository(rowless_session)
-                    if untrimmed_effective_payload.previous_response_id is not None:
+                    if rowless_recovery_stale_anchor_id is not None:
                         rowless_authority = await rowless_repository.lookup(
                             api_key_scope=rowless_api_key_scope,
                             strong_session_hash=rowless_strong_hash,
-                            stale_anchor_hash=durable_bridge_hash(untrimmed_effective_payload.previous_response_id),
+                            stale_anchor_hash=durable_bridge_hash(rowless_recovery_stale_anchor_id),
                         )
                     if rowless_authority is None and rowless_capture_facts is not None:
                         try:
@@ -2831,7 +2838,7 @@ class _HTTPBridgeStreamingMixin:
                     and rowless_capture_facts.account_neutral
                     and rowless_task_identity is not None
                     and official_session_id is not None
-                    and untrimmed_effective_payload.previous_response_id is not None
+                    and rowless_recovery_stale_anchor_id is not None
                 ):
                     automatic_payload = untrimmed_effective_payload.model_copy(
                         update={
@@ -2869,7 +2876,7 @@ class _HTTPBridgeStreamingMixin:
                                 api_key_scope=rowless_api_key_scope,
                                 session_key_kind=bridge_session_key.affinity_kind,
                                 strong_session_hash=rowless_strong_hash,
-                                stale_anchor_hash=durable_bridge_hash(untrimmed_effective_payload.previous_response_id),
+                                stale_anchor_hash=durable_bridge_hash(rowless_recovery_stale_anchor_id),
                                 selected_account_intent=rowless_authority.selected_account_intent,
                                 task_identity=rowless_task_identity,
                                 session_identity=official_session_id,
@@ -2978,6 +2985,11 @@ class _HTTPBridgeStreamingMixin:
                 effective_payload = untrimmed_effective_payload.model_copy(
                     update={"input": projected_input, "previous_response_id": None}
                 )
+                # The semantic rebase has replaced the temporary reattach
+                # anchor with a claimed, self-contained wire. Do not let the
+                # later store-context path trim or rebuild that exact wire.
+                proxy_injected_previous_response_id = False
+                fresh_upstream_request_text = None
                 if automatic_preflight_claimed:
                     if automatic_request_state is None or automatic_text is None:  # pragma: no cover
                         raise AssertionError("automatic rowless recovery lost its in-memory wire")
