@@ -1927,6 +1927,8 @@ async def test_rowless_child_thread_sharing_root_bridge_identity_fails_closed_wi
         "administrator_child_client_request_id",
         "automatic",
         "automatic_root_retry_chain",
+        "automatic_root_retry_chain_operator_approved",
+        "automatic_root_retry_chain_operator_approved_anchorless",
         "automatic_legacy_unknown",
         "automatic_legacy_consumed",
         "automatic_legacy_unknown_missing_thread",
@@ -2300,6 +2302,49 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
         assert authority.origin_marker_session_id == marker_id
         assert authority.request_account_neutral
 
+    if resolution_mode in {
+        "automatic_root_retry_chain_operator_approved",
+        "automatic_root_retry_chain_operator_approved_anchorless",
+    }:
+        async with SessionLocal() as db_session:
+            repository = RowlessRecoveryRepository(db_session)
+            authority = await db_session.get(HttpBridgeRowlessRecoveryAuthority, authority.id)
+            assert authority is not None
+            challenge = await repository.issue_challenge(
+                authority_id=authority.id,
+                generation=authority.generation,
+            )
+            receipt = RowlessCheckpointReceipt(
+                schema="qk_http_bridge_rowless_checkpoint_receipt_v1",
+                remote_session_jsonl_sha256="a" * 64,
+                remote_session_jsonl_size_bytes=2048,
+                remote_session_jsonl_last_offset=2048,
+                full_checkpoint_tool_ledger_digest="b" * 64,
+                unresolved_count=0,
+                task_identity=task_id,
+                session_identity=task_id,
+                strong_session_hash=authority.strong_session_hash,
+                task_authority_digest=authority.captured_task_authority_digest,
+                captured_input_item_count=authority.captured_input_item_count,
+                captured_input_fingerprint=authority.captured_input_fingerprint,
+                non_input_contract_fingerprint=authority.non_input_contract_fingerprint,
+                retained_request_direct_call_ledger_digest=authority.settled_direct_call_ledger_digest,
+                captured_projected_payload_fingerprint=authority.projected_payload_fingerprint,
+                captured_actual_wire_fingerprint=authority.actual_wire_fingerprint,
+                captured_request_binding_provenance="server_challenge",
+            )
+            approved = await repository.approve(
+                authority_id=authority.id,
+                generation=authority.generation,
+                challenge=challenge.challenge,
+                declared_receipt_sha256=receipt.sha256(),
+                receipt=receipt,
+                acknowledgement="operator_acknowledged_semantic_rebase",
+                approved_actor="trusted-dashboard-operator",
+                request_id="marker-rowless-automatic-supersession-approval",
+            )
+            assert approved.state == HttpBridgeRowlessRecoveryState.APPROVED
+
     if resolution_mode.startswith("automatic"):
         if resolution_mode.startswith("automatic_legacy_"):
             async with SessionLocal() as db_session:
@@ -2392,7 +2437,11 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
             },
             {"role": "user", "content": "continue the original task"},
         ]
-        if resolution_mode == "automatic_root_retry_chain":
+        if resolution_mode in {
+            "automatic_root_retry_chain",
+            "automatic_root_retry_chain_operator_approved",
+            "automatic_root_retry_chain_operator_approved_anchorless",
+        }:
             automatic_full_resend = [
                 *automatic_full_resend[:-1],
                 {
@@ -2467,6 +2516,8 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
         }
         if automatic_client_metadata is not None:
             automatic_request["client_metadata"] = automatic_client_metadata
+        if resolution_mode == "automatic_root_retry_chain_operator_approved_anchorless":
+            automatic_request.pop("previous_response_id")
         automatic_request_task = asyncio.create_task(
             async_client.post(
                 "/v1/responses",

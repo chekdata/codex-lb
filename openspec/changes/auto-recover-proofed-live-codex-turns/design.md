@@ -68,6 +68,14 @@ with the new request/wire preflight claim. Concurrent requests lose the CAS.
 UNKNOWN and CONSUMED authorities are never replaceable. An operator-approved
 generation that already started any dispatch is also never replaceable.
 
+Official Codex can omit `previous_response_id` while a hard-session durable
+marker still requires reattachment. After owner and marker validation inject
+the stale anchor, automatic preflight may use that verified anchor while
+retaining the original anchorless payload as the request-contract evidence.
+Once the semantic rebase claims its anchor-free wire, the temporary injection
+state is cleared so store-context trimming cannot rewrite the claimed wire or
+discard its authority settlement identity.
+
 ## Authorization provenance
 
 Two nullable columns distinguish `operator_checkpoint` from

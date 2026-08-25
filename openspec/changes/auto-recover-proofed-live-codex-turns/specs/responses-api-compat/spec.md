@@ -65,6 +65,18 @@ employee MUST NOT need to visit the dashboard or retry the turn.
   identifier, leading developer message, or trailing developer message in the
   retry tail MUST keep the request fail closed.
 
+#### Scenario: Marker-backed anchorless retry uses the verified stale anchor
+
+- **GIVEN** an eligible official root turn omits `previous_response_id`
+- **AND** a hard-session durable marker verifies the task, account, and stale
+  anchor before the gateway injects that anchor for reattach
+- **WHEN** a physically unsent CAPTURED or APPROVED authority is superseded by
+  the live request
+- **THEN** automatic preflight MUST bind the marker's verified stale anchor
+- **AND** the exact claimed anchor-free projection MUST reach upstream once
+- **AND** later store-context processing MUST NOT trim or rebuild that wire
+- **AND** `response.completed` MUST consume the authority and clear the marker.
+
 #### Scenario: Active automatic authority raises the rollback floor
 
 - **GIVEN** at least one automatically authorized APPROVED or UNKNOWN authority
