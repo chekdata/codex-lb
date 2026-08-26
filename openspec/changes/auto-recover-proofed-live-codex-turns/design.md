@@ -17,41 +17,6 @@ that contains only the incremental user input is insufficient proof that
 completed output and settled call results were retained, even if it is
 otherwise self-contained.
 
-Official Codex may persist several failed root-turn inputs after a completed
-assistant final answer before another live recovery request reaches the
-gateway. Such a tail remains eligible only when every item is a canonical
-response-owned user or developer message with a unique valid message ID, the
-tail contains at least two user messages, starts and ends with user input, and
-never contains consecutive developer messages. Assistant output, tool
-activity, unknown items, duplicate IDs, and malformed ordering remain
-ineligible. All other automatic recovery gates still apply independently.
-
-One narrower continuation shape is also eligible after a completed assistant
-final answer: canonical response-owned reasoning, at least one adjacent
-`custom_tool_call`/`custom_tool_call_output` pair with exact unique call-ID
-matching and a self-contained completed or failed output, at most one bounded
-account-neutral developer refresh, and then at least two response-owned user
-retry messages. The reasoning and settled pair are retained history, not a
-request to execute the tool again. Missing, reordered, duplicated, unknown, or
-unsettled calls remain ineligible.
-
-Official Codex Responses Lite can also retain an earlier canonical failed-retry
-message chain, make substantive progress in a partial response, and then
-persist another failed-retry chain. That staged shape is eligible only when a
-canonical Lite tool bundle keeps developer messages in the input instead of
-letting request normalization hoist them; the earlier chain contains at least
-two response-owned user messages with bounded developer interleaves; the
-partial response contains canonical reasoning, at least one response-owned
-assistant commentary message, and one or more immediately settled completed
-custom-tool pairs; and the final chain contains an optional single
-response-owned developer message followed by at least two response-owned user
-messages. Tool metadata may be absent, contain only a nonblank turn ID, or use
-the exact response-owned turn-ID plus finite create-time shape already accepted
-by replay projection. Message IDs, call IDs, call-item IDs, and output IDs must
-be valid and unique within the proofed tail. Any arbitrary assistant phase,
-malformed developer ordering, unknown tool type, non-completed call or output,
-or missing/mismatched output keeps the request ineligible.
-
 ## Live first-attempt recovery
 
 When upstream rejects the explicit anchor before `response.created` and before

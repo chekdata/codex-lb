@@ -22,11 +22,8 @@ rebase was attempted.
   automatic live semantic rebase. The request must still pass every existing
   self-contained, account-neutral, exact-identity, zero-unresolved-call, and
   eventless stale-anchor proof. Its complete resend must also retain prior
-  assistant or agent output before a fresh user follow-up. It may retain a
-  canonical chain of failed root-turn user/developer inputs after a completed
-  assistant final answer only when every input is response-owned, uniquely
-  identified, and contains no assistant output or tool activity. An
-  incremental-only input remains on the operator path.
+  assistant or agent output before a fresh user follow-up; an incremental-only
+  input remains on the operator path.
 - Keep the exact anchor-free wire in memory and use the existing durable
   authority, preflight CAS, replacement journal, send marker, and terminal
   settlement before performing one in-place replay on the same downstream
