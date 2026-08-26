@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import copy
 
+from app.core.openai.public_output import (
+    MAX_PUBLIC_RESPONSE_OUTPUT_ITEMS,
+    collect_public_output_item_event,
+    merge_public_response_output_items,
+)
 from app.core.types import JsonValue
 from app.modules.proxy.response_transition_manifest import (
     build_response_transition_manifest,
@@ -44,6 +49,50 @@ def _completed_payload() -> dict[str, JsonValue]:
             ],
         },
     }
+
+
+def test_streamed_output_item_collection_is_bounded_and_ordered() -> None:
+    output_items: dict[int, dict[str, JsonValue]] = {}
+    second_item: dict[str, JsonValue] = {"type": "message", "role": "assistant", "content": []}
+    first_item: dict[str, JsonValue] = {"type": "reasoning", "summary": []}
+
+    assert collect_public_output_item_event(
+        {
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": second_item,
+        },
+        output_items,
+    )
+    assert collect_public_output_item_event(
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": first_item,
+        },
+        output_items,
+    )
+    assert merge_public_response_output_items(
+        {"id": "resp_streamed", "status": "completed", "output": []},
+        output_items,
+    )["output"] == [first_item, second_item]
+
+    assert not collect_public_output_item_event(
+        {
+            "type": "response.output_item.done",
+            "output_index": MAX_PUBLIC_RESPONSE_OUTPUT_ITEMS,
+            "item": first_item,
+        },
+        output_items,
+    )
+    assert not collect_public_output_item_event(
+        {
+            "type": "response.output_item.done",
+            "output_index": True,
+            "item": first_item,
+        },
+        output_items,
+    )
 
 
 def test_response_transition_manifest_round_trip_is_content_free() -> None:

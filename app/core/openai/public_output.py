@@ -26,6 +26,53 @@ _PUBLIC_RESPONSE_OUTPUT_ITEM_TYPES = frozenset(
 )
 PUBLIC_RESPONSE_TEXT_PART_TYPES = frozenset({"output_text", "input_text", "text", "refusal"})
 _REASONING_SUMMARY_BLANK_HTML_COMMENT_RE = re.compile(r"(?m)^[ \t]*<!--\s*-->[ \t]*(?:\r?\n|\Z)")
+MAX_PUBLIC_RESPONSE_OUTPUT_ITEMS = 4096
+
+
+def collect_public_output_item_event(
+    payload: Mapping[str, JsonValue],
+    output_items: dict[int, dict[str, JsonValue]],
+) -> bool:
+    """Collect one bounded streamed output item for terminal backfill.
+
+    Returns False only when an output-item lifecycle event is malformed or
+    exceeds the bound. Callers that persist replay proofs use that result to
+    fail closed; public response rendering may simply ignore the bad item.
+    """
+
+    event_type = payload.get("type")
+    if event_type not in ("response.output_item.added", "response.output_item.done"):
+        return True
+    output_index = payload.get("output_index")
+    item = payload.get("item")
+    if (
+        not isinstance(output_index, int)
+        or isinstance(output_index, bool)
+        or output_index < 0
+        or output_index >= MAX_PUBLIC_RESPONSE_OUTPUT_ITEMS
+        or not is_json_mapping(item)
+    ):
+        return False
+    if output_index not in output_items and len(output_items) >= MAX_PUBLIC_RESPONSE_OUTPUT_ITEMS:
+        return False
+    output_items[output_index] = dict(item)
+    return True
+
+
+def merge_public_response_output_items(
+    response: Mapping[str, JsonValue],
+    output_items: Mapping[int, dict[str, JsonValue]],
+) -> dict[str, JsonValue]:
+    """Backfill an empty terminal response from streamed output items."""
+
+    merged = dict(response)
+    if not output_items:
+        return merged
+    existing_output = response.get("output")
+    if isinstance(existing_output, list) and existing_output:
+        return merged
+    merged["output"] = [item for _, item in sorted(output_items.items())]
+    return merged
 
 
 def strip_blank_html_comment_lines(text: str) -> str:

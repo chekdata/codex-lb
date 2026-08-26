@@ -38,6 +38,10 @@ from app.core.clients.proxy_websocket import (
 from app.core.errors import response_failed_event
 from app.core.openai.models import OpenAIEvent
 from app.core.openai.parsing import parse_sse_event_payload
+from app.core.openai.public_output import (
+    collect_public_output_item_event,
+    merge_public_response_output_items,
+)
 from app.core.types import JsonValue
 from app.core.usage.live_hub import publish_live_usage
 from app.core.usage.live_snapshots import EVENT_MARKER, parse_rate_limit_event_text
@@ -359,6 +363,8 @@ def _record_http_bridge_tool_call_lifecycle(
 ) -> None:
     if event_type not in {"response.output_item.added", "response.output_item.done"}:
         return
+    if payload is None or not collect_public_output_item_event(payload, request_state.response_output_items):
+        request_state.response_output_items_invalid = True
     item = payload.get("item") if isinstance(payload, dict) else None
     if not isinstance(item, dict):
         request_state.tool_call_manifest_invalid = True
@@ -390,6 +396,23 @@ def _record_http_bridge_tool_call_lifecycle(
         request_state.tool_call_manifest_invalid = True
         return
     target[call_id] = item_type
+
+
+def _response_transition_payload(
+    request_state: _WebSocketRequestState,
+    payload: dict[str, JsonValue] | None,
+) -> dict[str, JsonValue] | None:
+    if request_state.response_output_items_invalid or not isinstance(payload, dict):
+        return None
+    response = payload.get("response")
+    if not isinstance(response, dict):
+        return None
+    merged_payload = dict(payload)
+    merged_payload["response"] = merge_public_response_output_items(
+        response,
+        request_state.response_output_items,
+    )
+    return merged_payload
 
 
 def _response_completed_tool_call_types(payload: dict[str, JsonValue] | None) -> dict[str, str] | None:
@@ -2389,8 +2412,12 @@ class _HTTPBridgeUpstreamEventsMixin:
                 payload,
             )
             if completed_pending_tool_call_manifest is not None:
-                completed_response_transition_manifest = build_response_transition_manifest(
+                transition_payload = _response_transition_payload(
+                    matched_request_state,
                     payload,
+                )
+                completed_response_transition_manifest = build_response_transition_manifest(
+                    transition_payload,
                     pending_tool_calls=completed_pending_tool_call_manifest,
                     normalize_for_public_contract=matched_request_state.enforce_openai_sdk_contract,
                 )

@@ -3352,11 +3352,13 @@ class _InterruptedCustomToolUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
         emit_added: bool = False,
         tool_call_type: str = "custom_tool_call",
         include_full_transition_output: bool = False,
+        empty_terminal_output: bool = False,
     ) -> None:
         super().__init__(response_id_prefix)
         self._emit_added = emit_added
         self._tool_call_type = tool_call_type
         self._include_full_transition_output = include_full_transition_output
+        self._empty_terminal_output = empty_terminal_output
 
     def _pending_call_item(self, *, status: str) -> dict[str, Any]:
         item: dict[str, Any] = {
@@ -3430,7 +3432,9 @@ class _InterruptedCustomToolUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
                             "object": "response",
                             "status": "completed",
                             "output": (
-                                [
+                                []
+                                if self._empty_terminal_output and len(self.sent_text) == 1
+                                else [
                                     {
                                         "type": "reasoning",
                                         "id": "rs_transition",
@@ -17356,7 +17360,7 @@ async def test_v1_responses_http_bridge_recovers_manifest_bound_codex_retry_once
     first_upstream = _InterruptedCustomToolUpstreamWebSocket(
         "resp_manifest_recovery",
         emit_added=True,
-        include_full_transition_output=True,
+        empty_terminal_output=True,
     )
     stale_upstream: _RejectStalePreviousResponseUpstreamWebSocket | None = None
     recovered_upstream: _RejectStalePreviousResponseUpstreamWebSocket | None = None
