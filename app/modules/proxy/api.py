@@ -6330,7 +6330,7 @@ async def _compact_responses(
             await reservation_cleanup.release(action="compact response")
     result_payload = result.model_dump(mode="json", exclude_none=True)
     if codex_session_affinity:
-        result_payload = _normalize_codex_remote_compaction_v2_result(result, result_payload)
+        result_payload = _normalize_codex_remote_compaction_v2_result(result)
     return JSONResponse(
         content=result_payload,
         headers=rate_limit_headers,
@@ -6338,14 +6338,58 @@ async def _compact_responses(
 
 
 def _normalize_codex_remote_compaction_v2_result(
-    payload: CompactResponsePayload,
-    result_payload: dict[str, JsonValue],
+    payload: CompactResponsePayload | OpenAIResponsePayload,
 ) -> dict[str, JsonValue]:
+    if isinstance(payload, OpenAIResponsePayload):
+        normalized: dict[str, JsonValue] = {}
+        if payload.id is not None:
+            normalized["id"] = payload.id
+        if payload.status is not None:
+            normalized["status"] = payload.status
+        if payload.usage is not None:
+            normalized["usage"] = cast(JsonValue, payload.usage.model_dump(mode="json", exclude_none=True))
+        if payload.error is not None:
+            normalized["error"] = cast(JsonValue, payload.error.model_dump(mode="json", exclude_none=True))
+        extra = payload.model_extra or {}
+        output = extra.get("output")
+        if isinstance(output, list) and not output:
+            normalized["output"] = []
+        return normalized
+
     compaction_item = _compact_response_output_item(payload)
-    if compaction_item is None:
-        return result_payload
-    normalized = dict(result_payload)
-    normalized["output"] = [compaction_item]
+    normalized: dict[str, JsonValue] = {"object": payload.object}
+    if payload.id is not None:
+        normalized["id"] = payload.id
+    if payload.status is not None:
+        normalized["status"] = payload.status
+    if payload.usage is not None:
+        normalized["usage"] = cast(JsonValue, payload.usage.model_dump(mode="json", exclude_none=True))
+    if payload.error is not None:
+        normalized["error"] = cast(JsonValue, payload.error.model_dump(mode="json", exclude_none=True))
+    if compaction_item is not None:
+        normalized["output"] = [compaction_item]
+    else:
+        extra = payload.model_extra or {}
+        output = extra.get("output")
+        if isinstance(output, list) and not output:
+            normalized["output"] = []
+    retained_items = _normalize_compact_retained_items((payload.model_extra or {}).get("retained_items"))
+    if retained_items is not None:
+        normalized["retained_items"] = retained_items
+    return normalized
+
+
+def _normalize_compact_retained_items(value: object) -> list[JsonValue] | None:
+    if not isinstance(value, list):
+        return None
+    normalized: list[JsonValue] = []
+    for raw_item in value:
+        item = _json_mapping_from_model_or_mapping(raw_item)
+        if item is None or item.get("type") != "item_reference":
+            continue
+        item_id = item.get("id")
+        if isinstance(item_id, str) and item_id:
+            normalized.append({"type": "item_reference", "id": item_id})
     return normalized
 
 
