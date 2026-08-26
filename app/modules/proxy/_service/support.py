@@ -950,6 +950,8 @@ class _WebSocketRequestState:
     pending_tool_call_types: dict[str, str] = field(default_factory=dict)
     added_tool_call_types: dict[str, str] = field(default_factory=dict)
     tool_call_manifest_invalid: bool = False
+    response_output_items: dict[int, dict[str, JsonValue]] = field(default_factory=dict)
+    response_output_items_invalid: bool = False
     seen_tool_call_keys: dict[ToolCallDedupeKey, None] = field(default_factory=dict)
     input_item_count: int = 0
     input_full_fingerprint: str | None = None

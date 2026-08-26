@@ -131,10 +131,16 @@ from app.core.openai.public_output import (
     PUBLIC_RESPONSE_TEXT_PART_TYPES as _PUBLIC_RESPONSE_TEXT_PART_TYPES,
 )
 from app.core.openai.public_output import (
+    collect_public_output_item_event as _collect_public_output_item_event_shared,
+)
+from app.core.openai.public_output import (
     extract_public_output_item_text as _extract_public_output_item_text,
 )
 from app.core.openai.public_output import (
     is_public_passthrough_output_item_type as _is_public_passthrough_output_item_type,
+)
+from app.core.openai.public_output import (
+    merge_public_response_output_items as _merge_public_response_output_items,
 )
 from app.core.openai.public_output import (
     normalize_public_output_item as _normalize_public_output_item,
@@ -6827,30 +6833,14 @@ def _collect_output_item_event(
     payload: dict[str, JsonValue],
     output_items: dict[int, dict[str, JsonValue]],
 ) -> None:
-    event_type = payload.get("type")
-    if event_type not in ("response.output_item.added", "response.output_item.done"):
-        return
-    output_index = payload.get("output_index")
-    item = payload.get("item")
-    if not isinstance(output_index, int) or not isinstance(item, dict):
-        return
-    output_items[output_index] = dict(item)
+    _collect_public_output_item_event_shared(payload, output_items)
 
 
 def _merge_collected_output_items(
     response: Mapping[str, JsonValue],
     output_items: dict[int, dict[str, JsonValue]],
 ) -> dict[str, JsonValue]:
-    merged = dict(response)
-    if not output_items:
-        return merged
-
-    existing_output = response.get("output")
-    if isinstance(existing_output, list) and existing_output:
-        return merged
-
-    merged["output"] = [item for _, item in sorted(output_items.items())]
-    return merged
+    return _merge_public_response_output_items(response, output_items)
 
 
 async def _normalize_public_responses_stream(

@@ -3274,6 +3274,121 @@ def test_durable_tool_call_manifest_requires_complete_added_and_done_lifecycle()
     assert duplicate_done_state.tool_call_manifest_invalid is True
 
 
+@pytest.mark.asyncio
+async def test_http_bridge_backfills_transition_manifest_from_streamed_output_items(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    register_previous = AsyncMock(return_value=True)
+    monkeypatch.setattr(service, "_register_http_bridge_previous_response_id", register_previous)
+    monkeypatch.setattr(service, "_finalize_websocket_request_state", AsyncMock())
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-streamed-transition-manifest",
+        response_id="resp_streamed_transition_manifest",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+        transport="http",
+        skip_request_log=True,
+    )
+    session = _make_bridge_session(
+        key_value="bridge-streamed-transition-manifest",
+        pending_requests=deque([request_state]),
+        queued_request_count=1,
+    )
+    output_items: list[dict[str, proxy_service.JsonValue]] = [
+        {
+            "type": "reasoning",
+            "id": "rs_streamed_transition_manifest",
+            "summary": [],
+            "status": "completed",
+        },
+        {
+            "type": "custom_tool_call",
+            "id": "ctc_streamed_transition_manifest",
+            "call_id": "call_streamed_transition_manifest",
+            "name": "shell",
+            "input": "content-not-persisted",
+            "status": "completed",
+        },
+    ]
+
+    for output_index, item in enumerate(output_items):
+        for event_type in ("response.output_item.added", "response.output_item.done"):
+            await service._process_http_bridge_upstream_text(
+                session,
+                json.dumps(
+                    {
+                        "type": event_type,
+                        "response_id": "resp_streamed_transition_manifest",
+                        "output_index": output_index,
+                        "item": item,
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+    await service._process_http_bridge_upstream_text(
+        session,
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_streamed_transition_manifest",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [],
+                },
+            },
+            separators=(",", ":"),
+        ),
+    )
+
+    registration = register_previous.await_args
+    assert registration is not None
+    assert registration.kwargs["pending_tool_calls"] == {"call_streamed_transition_manifest": "custom_tool_call"}
+    manifest = registration.kwargs["response_transition_manifest"]
+    assert manifest is not None
+    assert manifest.item_kinds == ("reasoning", "custom_tool_call")
+    assert "content-not-persisted" not in str(manifest.canonical_payload())
+
+
+def test_http_bridge_transition_manifest_collection_fails_closed_on_missing_index() -> None:
+    state = proxy_service._WebSocketRequestState(
+        request_id="req-invalid-streamed-transition-manifest",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+    )
+    http_bridge_upstream_events_module._record_http_bridge_tool_call_lifecycle(
+        state,
+        event_type="response.output_item.done",
+        payload={
+            "type": "response.output_item.done",
+            "item": {"type": "reasoning", "summary": []},
+        },
+    )
+
+    assert state.response_output_items_invalid is True
+    assert (
+        http_bridge_upstream_events_module._response_transition_payload(
+            state,
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_invalid_streamed_transition_manifest",
+                    "status": "completed",
+                    "output": [],
+                },
+            },
+        )
+        is None
+    )
+
+
 def test_durable_tool_call_manifest_rejects_unobserved_terminal_call() -> None:
     state = proxy_service._WebSocketRequestState(
         request_id="req-terminal-manifest",
