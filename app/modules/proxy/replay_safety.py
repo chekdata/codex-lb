@@ -1491,6 +1491,15 @@ def _is_retained_response_message(item: Mapping[str, JsonValue]) -> bool:
     return _message_has_valid_account_neutral_content(item)
 
 
+def _response_owned_tool_metadata_is_account_neutral(value: JsonValue | None) -> bool:
+    return _internal_chat_message_metadata_is_account_neutral(value) or (
+        isinstance(value, dict)
+        and set(value) == _RESPONSE_OWNED_AGENT_MESSAGE_METADATA_FIELDS
+        and _is_nonblank_string(value.get("turn_id"))
+        and _is_finite_nonnegative_number(value.get("create_time"))
+    )
+
+
 def _is_retained_agent_message(item: Mapping[str, JsonValue]) -> bool:
     """Validate the exact response-owned Codex inter-agent delivery shape."""
 
