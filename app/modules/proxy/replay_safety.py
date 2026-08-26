@@ -920,12 +920,13 @@ def responses_input_retains_prior_output_and_fresh_followup(
 def responses_input_retains_prior_output_and_root_retry_chain(
     input_items: list[JsonValue],
 ) -> bool:
-    """Prove a completed answer followed only by canonical failed-turn inputs.
+    """Prove a completed answer or agent delivery before failed-turn inputs.
 
     Official Codex can persist several failed root-turn retries before a live
     rowless recovery reaches the gateway. Those retries are safe evidence only
     when they contain response-owned user/developer messages and no assistant
-    output or tool activity. Requiring two user messages keeps the ordinary
+    output or tool activity. Agent-delivery boundaries additionally require the
+    canonical Lite tool prefix. Requiring two user messages keeps the ordinary
     single-follow-up path on its existing stricter proof.
     """
 
@@ -933,7 +934,16 @@ def responses_input_retains_prior_output_and_root_retry_chain(
         item = input_items[index]
         if not isinstance(item, dict):
             continue
-        if item.get("type") not in (None, "message") or item.get("role") != "assistant":
+        item_type = item.get("type")
+        if item_type == "agent_message":
+            if (
+                not input_items
+                or not _is_canonical_lite_tool_bundle(input_items[0])
+                or not _is_retained_agent_message(item)
+            ):
+                return False
+            return _response_owned_failed_turn_chain_is_bounded(input_items[index + 1 :])
+        if item_type not in (None, "message") or item.get("role") != "assistant":
             continue
         if item.get("phase") != "final_answer":
             continue
@@ -954,28 +964,34 @@ def responses_input_retains_prior_output_and_root_retry_chain(
             return True
         if _settled_custom_tool_root_retry_chain_is_bounded(followups):
             return True
-        user_count = 0
-        developer_pending_user = False
-        message_ids: set[str] = set()
-        for followup in followups:
-            if not isinstance(followup, dict):
-                return False
-            message_id = followup.get("id")
-            if not isinstance(message_id, str) or message_id in message_ids:
-                return False
-            message_ids.add(message_id)
-            if _is_response_owned_user_message(followup):
-                user_count += 1
-                developer_pending_user = False
-                continue
-            if _is_response_owned_developer_message(followup):
-                if user_count == 0 or developer_pending_user:
-                    return False
-                developer_pending_user = True
-                continue
-            return False
-        return user_count >= 2 and not developer_pending_user
+        return _response_owned_failed_turn_chain_is_bounded(followups)
     return False
+
+
+def _response_owned_failed_turn_chain_is_bounded(followups: list[JsonValue]) -> bool:
+    """Accept only persisted user/developer bookkeeping from failed root retries."""
+
+    user_count = 0
+    developer_pending_user = False
+    message_ids: set[str] = set()
+    for followup in followups:
+        if not isinstance(followup, dict):
+            return False
+        message_id = followup.get("id")
+        if not isinstance(message_id, str) or message_id in message_ids:
+            return False
+        message_ids.add(message_id)
+        if _is_response_owned_user_message(followup):
+            user_count += 1
+            developer_pending_user = False
+            continue
+        if _is_response_owned_developer_message(followup):
+            if user_count == 0 or developer_pending_user:
+                return False
+            developer_pending_user = True
+            continue
+        return False
+    return user_count >= 2 and not developer_pending_user
 
 
 def _staged_settled_custom_tool_root_retry_chain_is_bounded(

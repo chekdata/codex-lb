@@ -4578,6 +4578,63 @@ def test_rowless_root_retry_chain_accepts_only_response_owned_failed_turn_inputs
     assert responses_input_retains_prior_output_and_root_retry_chain(input_items)
 
 
+def _agent_delivery_failed_root_retry_chain() -> list[JsonValue]:
+    return [
+        {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "shell",
+                    "description": "Run a bounded shell command.",
+                    "format": {"type": "text"},
+                }
+            ],
+        },
+        _canonical_agent_message(),
+        _canonical_response_owned_user_message(
+            message_id="msg_01a02c43-4980-7afb-97f5-2e2d30aa7301",
+            turn_id="01a02c43-4980-7afb-97f5-2e2d30aa7301",
+            text="first failed retry",
+        ),
+        _canonical_response_owned_developer_message(),
+        _canonical_response_owned_user_message(
+            message_id="msg_01a02c43-4980-7afb-97f5-2e2d30aa7302",
+            turn_id="01a02c43-4980-7afb-97f5-2e2d30aa7302",
+            text="live retry",
+        ),
+    ]
+
+
+def test_rowless_root_retry_chain_accepts_agent_delivery_before_failed_turns() -> None:
+    assert responses_input_retains_prior_output_and_root_retry_chain(_agent_delivery_failed_root_retry_chain())
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing-lite-prefix", "malformed-agent", "unowned-user", "duplicate-id", "foreign-tail"),
+)
+def test_rowless_agent_delivery_retry_chain_rejects_unproven_tail(mutation: str) -> None:
+    input_items = _agent_delivery_failed_root_retry_chain()
+    if mutation == "missing-lite-prefix":
+        input_items.pop(0)
+    elif mutation == "malformed-agent":
+        assert isinstance(input_items[1], dict)
+        input_items[1].pop("recipient")
+    elif mutation == "unowned-user":
+        assert isinstance(input_items[2], dict)
+        input_items[2].pop("id")
+    elif mutation == "duplicate-id":
+        assert isinstance(input_items[2], dict)
+        assert isinstance(input_items[4], dict)
+        input_items[4]["id"] = input_items[2]["id"]
+    else:
+        input_items.insert(-1, {"type": "reasoning", "id": "rs_unproven"})
+
+    assert not responses_input_retains_prior_output_and_root_retry_chain(input_items)
+
+
 def test_rowless_root_retry_chain_accepts_settled_custom_tool_tail_before_failed_turns() -> None:
     input_items: list[JsonValue] = [
         {

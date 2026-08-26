@@ -1709,6 +1709,28 @@ def test_rowless_capture_accepts_canonical_root_retry_chain_for_automatic_recove
     assert facts.retains_prior_output
 
 
+def test_rowless_capture_accepts_agent_delivery_retry_chain_for_automatic_recovery() -> None:
+    from tests.unit.test_replay_safety import _agent_delivery_failed_root_retry_chain
+
+    payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.6-sol",
+            "instructions": "sanitized fixture",
+            "previous_response_id": "resp_stale_fixture",
+            "prompt_cache_key": "fixture-task",
+            "input": _agent_delivery_failed_root_retry_chain(),
+        }
+    )
+
+    facts = build_rowless_recovery_capture_facts(payload)
+
+    assert facts is not None
+    assert facts.unresolved_count == 0
+    assert facts.self_contained
+    assert facts.account_neutral
+    assert facts.retains_prior_output
+
+
 def test_staged_settled_retry_requires_lite_bundle_to_preserve_developer_order() -> None:
     from tests.unit.test_replay_safety import _staged_settled_custom_tool_retry_chain
 
