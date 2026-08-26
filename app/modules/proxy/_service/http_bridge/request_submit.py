@@ -95,6 +95,7 @@ from app.modules.proxy._service.http_bridge.quarantine import (
     _record_http_bridge_quarantine_wedged_pending,
 )
 from app.modules.proxy._service.http_bridge.retry_circuit import (
+    _http_bridge_anchor_poison_detail,
     _http_bridge_retry_circuit_error_message,
 )
 from app.modules.proxy._service.http_bridge.service_stubs import (
@@ -124,6 +125,9 @@ from app.modules.proxy._service.http_bridge.service_stubs import (
     _upstream_response_create_max_bytes,
     _websocket_auth_failure_permanent_code,
     _websocket_auth_failure_requires_reauth,
+)
+from app.modules.proxy._service.http_bridge.upstream_events import (
+    _abandon_durable_http_bridge_continuity,
 )
 from app.modules.proxy._service.observability import (
     _hash_identifier as _hash_identifier,
@@ -2394,15 +2398,39 @@ class _HTTPBridgeRequestSubmitMixin:
         # transport cleanup, not another failed request. Recording it with an
         # empty retired set double-counts one semantic failure and can open the
         # durable retry circuit before the verified recovery turn is admitted.
-        if (
-            not retry_circuit_already_recorded
-            and retired_request_states
-            and (response_events_seen is None or response_events_seen == 0)
-        ):
-            await self._record_http_bridge_retry_circuit_failure(
-                session,
-                detail=retry_circuit_detail or detail,
-            )
+        if retired_request_states and (response_events_seen is None or response_events_seen == 0):
+            failure_detail = retry_circuit_detail or detail
+            if retry_circuit_already_recorded:
+                circuit_snapshot = await self._http_bridge_retry_circuit_snapshot(session)
+                consecutive_failures = circuit_snapshot.consecutive_failures
+            else:
+                consecutive_failures = await self._record_http_bridge_retry_circuit_failure(
+                    session,
+                    detail=failure_detail,
+                )
+            poison_detail = _http_bridge_anchor_poison_detail(failure_detail)
+            if (
+                poison_detail is not None
+                and consecutive_failures is not None
+                and consecutive_failures
+                >= _service_get_settings().http_responses_session_bridge_anchor_poison_failure_threshold
+            ):
+                durable_cleared = await _abandon_durable_http_bridge_continuity(
+                    self,
+                    session,
+                    detail=poison_detail,
+                )
+                if not durable_cleared and session.durable_session_id is not None:
+                    _log_http_bridge_event(
+                        "durable_anchor_poison_clear_failed",
+                        session.key,
+                        account_id=session.account.id,
+                        model=session.request_model,
+                        pending_count=len(retired_request_states),
+                        detail=poison_detail,
+                        cache_key_family=session.key.affinity_kind,
+                        model_class=(_extract_model_class(session.request_model) if session.request_model else None),
+                    )
         session.closed = True
         async with self._http_bridge_lock:
             if self._http_bridge_sessions.get(session.key) is session:
