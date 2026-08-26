@@ -7578,11 +7578,12 @@ def _logged_error_json_response(
         message,
         category="proxy_error_response",
     )
-    # lgtm [py/stack-trace-exposure] This is an OpenAI-compatible proxy boundary:
-    # upstream/provider error envelopes intentionally preserve diagnostics for
-    # clients, while internal exception handlers construct generic error
+    # Upstream/provider error envelopes intentionally preserve the public
+    # compatibility contract; internal exception handlers build generic
     # envelopes before reaching this response helper.
-    return JSONResponse(status_code=status_code, content=public_content, headers=effective_headers or None)
+    return JSONResponse(  # lgtm [py/stack-trace-exposure]
+        status_code=status_code, content=public_content, headers=effective_headers or None
+    )
 
 
 def _error_details_from_content(

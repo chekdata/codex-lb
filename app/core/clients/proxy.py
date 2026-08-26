@@ -1010,18 +1010,16 @@ def _maybe_log_upstream_request_start(
 
     if privacy_policy.redacts_sensitive_details:
         account_id = "<redacted>"
-        payload_summary = "sensitive private payload redacted"
         payload_json = None
     if "upstream_summary" in trace_channels:
         logger.info(
-            "upstream_request_start request_id=%s kind=%s method=%s target=%s account_id=%s headers=%s payload=%s",
+            "upstream_request_start request_id=%s kind=%s method=%s target=%s account_id=%s headers=%s payload=omitted",
             safe_log_field(request_id),
             safe_log_field(kind),
             safe_log_field(method),
             safe_log_field(target),
             safe_log_field(account_id),
             safe_log_field(",".join(header_keys)),
-            safe_log_field(payload_summary),
         )
     if "upstream_payload" in trace_channels and payload_json is not None:
         logger.info(

@@ -206,14 +206,15 @@ def log_error_response(
     level = logging.ERROR if status_code >= 500 else logging.WARNING
     logger.log(
         level,
-        "%s request_id=%s method=%s path=%s status=%s code=%s message=%s",
+        "%s request_id=%s method=%s path=%s status=%s code=%s message_present=%s message_length=%s",
         safe_log_field(category),
         safe_log_field(get_request_id()),
         safe_log_field(request.method),
         safe_log_field(request.url.path),
         status_code,
         _error_log_field(code),
-        _error_log_field(message),
+        bool(message),
+        len(message) if message else 0,
         exc_info=exc_info,
     )
 
