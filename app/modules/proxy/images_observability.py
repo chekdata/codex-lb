@@ -55,7 +55,8 @@ def record_images_route_observability(
         logging.INFO if status < 400 else logging.WARNING,
         "images_route_complete route=%s model=%s stream=%s status=%s outcome=%s duration_ms=%.2f",
         route,
-        safe_log_field(model_label),  # lgtm [py/clear-text-logging-sensitive-data]
+        # lgtm [py/clear-text-logging-sensitive-data]
+        safe_log_field(model_label),
         stream_label,
         status,
         safe_log_field(outcome),

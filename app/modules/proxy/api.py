@@ -7581,9 +7581,8 @@ def _logged_error_json_response(
     # Upstream/provider error envelopes intentionally preserve the public
     # compatibility contract; internal exception handlers build generic
     # envelopes before reaching this response helper.
-    return JSONResponse(  # lgtm [py/stack-trace-exposure]
-        status_code=status_code, content=public_content, headers=effective_headers or None
-    )
+    # lgtm [py/stack-trace-exposure]
+    return JSONResponse(status_code=status_code, content=public_content, headers=effective_headers or None)
 
 
 def _error_details_from_content(
