@@ -67,10 +67,7 @@ from app.modules.proxy.load_balancer import (
     AccountSelection,
     CatalogOmissionQuotaAdmission,
 )
-from app.modules.proxy.rowless_recovery import (
-    ROWLESS_AUTHORIZATION_MODE_AUTOMATIC,
-    build_rowless_recovery_capture_facts,
-)
+from app.modules.proxy.rowless_recovery import ROWLESS_AUTHORIZATION_MODE_AUTOMATIC
 from app.modules.proxy.rowless_recovery_api import require_authenticated_rebase_admin
 from app.modules.proxy.rowless_recovery_repository import (
     RowlessCheckpointReceipt,
@@ -1929,11 +1926,6 @@ async def test_rowless_child_thread_sharing_root_bridge_identity_fails_closed_wi
         "administrator_responses_lite_0149",
         "administrator_child_client_request_id",
         "automatic",
-        "automatic_root_retry_chain",
-        "automatic_root_retry_chain_operator_approved",
-        "automatic_root_retry_chain_operator_approved_anchorless",
-        "automatic_settled_tool_retry_chain_operator_approved_anchorless",
-        "automatic_staged_settled_tool_retry_chain_operator_approved_anchorless",
         "automatic_legacy_unknown",
         "automatic_legacy_consumed",
         "automatic_legacy_unknown_missing_thread",
@@ -2021,23 +2013,7 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
         "thread-id": task_id,
         "x-client-request-id": task_id,
     }
-    staged_lite_bundle: dict[str, object] = {
-        "type": "additional_tools",
-        "role": "developer",
-        "tools": [
-            {
-                "type": "custom",
-                "name": "shell",
-                "description": "Run a bounded shell command.",
-                "format": {"type": "text"},
-            }
-        ],
-    }
-    stored_input = (
-        [copy.deepcopy(staged_lite_bundle)]
-        if resolution_mode == "automatic_staged_settled_tool_retry_chain_operator_approved_anchorless"
-        else []
-    ) + [
+    stored_input = [
         {
             "type": "message",
             "role": "user",
@@ -2323,51 +2299,6 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
         assert authority.origin_marker_session_id == marker_id
         assert authority.request_account_neutral
 
-    if resolution_mode in {
-        "automatic_root_retry_chain_operator_approved",
-        "automatic_root_retry_chain_operator_approved_anchorless",
-        "automatic_settled_tool_retry_chain_operator_approved_anchorless",
-        "automatic_staged_settled_tool_retry_chain_operator_approved_anchorless",
-    }:
-        async with SessionLocal() as db_session:
-            repository = RowlessRecoveryRepository(db_session)
-            authority = await db_session.get(HttpBridgeRowlessRecoveryAuthority, authority.id)
-            assert authority is not None
-            challenge = await repository.issue_challenge(
-                authority_id=authority.id,
-                generation=authority.generation,
-            )
-            receipt = RowlessCheckpointReceipt(
-                schema="qk_http_bridge_rowless_checkpoint_receipt_v1",
-                remote_session_jsonl_sha256="a" * 64,
-                remote_session_jsonl_size_bytes=2048,
-                remote_session_jsonl_last_offset=2048,
-                full_checkpoint_tool_ledger_digest="b" * 64,
-                unresolved_count=0,
-                task_identity=task_id,
-                session_identity=task_id,
-                strong_session_hash=authority.strong_session_hash,
-                task_authority_digest=authority.captured_task_authority_digest,
-                captured_input_item_count=authority.captured_input_item_count,
-                captured_input_fingerprint=authority.captured_input_fingerprint,
-                non_input_contract_fingerprint=authority.non_input_contract_fingerprint,
-                retained_request_direct_call_ledger_digest=authority.settled_direct_call_ledger_digest,
-                captured_projected_payload_fingerprint=authority.projected_payload_fingerprint,
-                captured_actual_wire_fingerprint=authority.actual_wire_fingerprint,
-                captured_request_binding_provenance="server_challenge",
-            )
-            approved = await repository.approve(
-                authority_id=authority.id,
-                generation=authority.generation,
-                challenge=challenge.challenge,
-                declared_receipt_sha256=receipt.sha256(),
-                receipt=receipt,
-                acknowledgement="operator_acknowledged_semantic_rebase",
-                approved_actor="trusted-dashboard-operator",
-                request_id="marker-rowless-automatic-supersession-approval",
-            )
-            assert approved.state == HttpBridgeRowlessRecoveryState.APPROVED
-
     if resolution_mode.startswith("automatic"):
         if resolution_mode.startswith("automatic_legacy_"):
             async with SessionLocal() as db_session:
@@ -2460,169 +2391,6 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
             },
             {"role": "user", "content": "continue the original task"},
         ]
-        if resolution_mode in {
-            "automatic_root_retry_chain",
-            "automatic_root_retry_chain_operator_approved",
-            "automatic_root_retry_chain_operator_approved_anchorless",
-            "automatic_settled_tool_retry_chain_operator_approved_anchorless",
-            "automatic_staged_settled_tool_retry_chain_operator_approved_anchorless",
-        }:
-            automatic_full_resend = [
-                *automatic_full_resend[:-1],
-                {
-                    "type": "message",
-                    "id": "msg_00000000-0000-4000-8000-000000000031",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "first failed retry"}],
-                },
-                {
-                    "type": "message",
-                    "id": "msg_00000000-0000-4000-8000-000000000032",
-                    "role": "developer",
-                    "content": [{"type": "input_text", "text": "bounded retry context"}],
-                },
-                {
-                    "type": "message",
-                    "id": "msg_00000000-0000-4000-8000-000000000033",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "live retry"}],
-                },
-            ]
-        if resolution_mode == "automatic_settled_tool_retry_chain_operator_approved_anchorless":
-            automatic_full_resend = [
-                *automatic_full_resend[:-3],
-                {
-                    "type": "reasoning",
-                    "id": "rs_00000000-0000-4000-8000-000000000041",
-                    "content": None,
-                    "encrypted_content": "opaque",
-                    "summary": [],
-                    "status": "completed",
-                },
-                {
-                    "type": "custom_tool_call",
-                    "id": "ctc_00000000-0000-4000-8000-000000000041",
-                    "call_id": "call_settled_after_answer",
-                    "name": "shell",
-                    "input": "pwd",
-                    "status": "completed",
-                },
-                {
-                    "type": "custom_tool_call_output",
-                    "call_id": "call_settled_after_answer",
-                    "output": "verified",
-                    "status": "completed",
-                },
-                {
-                    "type": "message",
-                    "id": "msg_00000000-0000-4000-8000-000000000042",
-                    "role": "developer",
-                    "content": [{"type": "input_text", "text": "bounded retry context"}],
-                },
-                {
-                    "type": "message",
-                    "id": "msg_00000000-0000-4000-8000-000000000043",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "first failed retry"}],
-                },
-                {
-                    "type": "message",
-                    "id": "msg_00000000-0000-4000-8000-000000000044",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "live retry"}],
-                },
-            ]
-        if resolution_mode == "automatic_staged_settled_tool_retry_chain_operator_approved_anchorless":
-            automatic_full_resend = [
-                *automatic_full_resend[:-3],
-                {
-                    "type": "message",
-                    "id": "msg_00000000-0000-4000-8000-000000000051",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "first historical retry"}],
-                },
-                {
-                    "type": "message",
-                    "id": "msg_00000000-0000-4000-8000-000000000052",
-                    "role": "developer",
-                    "content": [{"type": "input_text", "text": "bounded historical context"}],
-                },
-                {
-                    "type": "message",
-                    "id": "msg_00000000-0000-4000-8000-000000000053",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "second historical retry"}],
-                },
-                {
-                    "type": "reasoning",
-                    "id": "rs_00000000-0000-4000-8000-000000000054",
-                    "content": None,
-                    "encrypted_content": "opaque",
-                    "summary": [],
-                    "status": "completed",
-                },
-                {
-                    "type": "message",
-                    "id": "msg_00000000-0000-4000-8000-000000000055",
-                    "role": "assistant",
-                    "phase": "commentary",
-                    "content": [{"type": "output_text", "text": "working on the retained task"}],
-                },
-                {
-                    "type": "custom_tool_call",
-                    "id": "ctc_00000000-0000-4000-8000-000000000056",
-                    "call_id": "call_staged_after_answer_1",
-                    "name": "shell",
-                    "input": "pwd",
-                    "status": "completed",
-                },
-                {
-                    "type": "custom_tool_call_output",
-                    "id": "ctco_00000000-0000-4000-8000-000000000057",
-                    "call_id": "call_staged_after_answer_1",
-                    "output": "verified",
-                },
-                {
-                    "type": "reasoning",
-                    "id": "rs_00000000-0000-4000-8000-000000000058",
-                    "content": None,
-                    "encrypted_content": "opaque",
-                    "summary": [],
-                    "status": "completed",
-                },
-                {
-                    "type": "custom_tool_call",
-                    "id": "ctc_00000000-0000-4000-8000-000000000059",
-                    "call_id": "call_staged_after_answer_2",
-                    "name": "shell",
-                    "input": "git status --short",
-                    "status": "completed",
-                },
-                {
-                    "type": "custom_tool_call_output",
-                    "id": "ctco_00000000-0000-4000-8000-000000000060",
-                    "call_id": "call_staged_after_answer_2",
-                    "output": "clean",
-                },
-                {
-                    "type": "message",
-                    "id": "msg_00000000-0000-4000-8000-000000000061",
-                    "role": "developer",
-                    "content": [{"type": "input_text", "text": "bounded retry context"}],
-                },
-                {
-                    "type": "message",
-                    "id": "msg_00000000-0000-4000-8000-000000000062",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "first current retry"}],
-                },
-                {
-                    "type": "message",
-                    "id": "msg_00000000-0000-4000-8000-000000000063",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "live retry"}],
-                },
-            ]
         if resolution_mode == "automatic_incremental":
             automatic_full_resend = [{"role": "user", "content": "continue the original task"}]
         automatic_headers = dict(headers)
@@ -2676,23 +2444,6 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
         }
         if automatic_client_metadata is not None:
             automatic_request["client_metadata"] = automatic_client_metadata
-        if resolution_mode in {
-            "automatic_root_retry_chain_operator_approved_anchorless",
-            "automatic_settled_tool_retry_chain_operator_approved_anchorless",
-            "automatic_staged_settled_tool_retry_chain_operator_approved_anchorless",
-        }:
-            automatic_request.pop("previous_response_id")
-        if resolution_mode == "automatic_staged_settled_tool_retry_chain_operator_approved_anchorless":
-            automatic_facts = build_rowless_recovery_capture_facts(
-                proxy_module.ResponsesRequest.model_validate(automatic_request),
-                expected_session_identity=task_id,
-                expected_task_identity=task_id,
-            )
-            assert automatic_facts is not None
-            assert automatic_facts.self_contained
-            assert automatic_facts.account_neutral
-            assert automatic_facts.unresolved_count == 0
-            assert automatic_facts.retains_prior_output
         automatic_request_task = asyncio.create_task(
             async_client.post(
                 "/v1/responses",
@@ -2827,39 +2578,6 @@ async def test_marker_backed_rowless_rebase_recovers_mismatched_pending_call_wit
             )
             assert attempt is not None
             assert attempt.state == HttpBridgeRecoveryAttemptState.REPLAYED
-        if resolution_mode == "automatic_staged_settled_tool_retry_chain_operator_approved_anchorless":
-            repeated_old_turn = await async_client.post(
-                "/v1/responses",
-                headers=automatic_headers,
-                json=automatic_request,
-            )
-            assert repeated_old_turn.status_code == 400, repeated_old_turn.text
-            assert repeated_old_turn.json()["error"]["code"] == "rowless_recovery_already_consumed"
-            assert connect_count == 3
-            assert len(recovered_upstream.sent_text) == 1
-
-            follow_up_headers, follow_up_client_metadata = _official_codex_turn_carriers(
-                task_id,
-                "turn-marker-rowless-staged-follow-up",
-            )
-            follow_up = await async_client.post(
-                "/v1/responses",
-                headers={**headers, **follow_up_headers},
-                json={
-                    "model": "gpt-5.1",
-                    "instructions": "Return exactly OK.",
-                    "previous_response_id": automatic_recovery.json()["id"],
-                    "prompt_cache_key": task_id,
-                    "client_metadata": follow_up_client_metadata,
-                    "input": [{"role": "user", "content": "ordinary follow-up"}],
-                },
-            )
-            assert follow_up.status_code == 200, follow_up.text
-            assert follow_up.json()["id"] == "resp_marker_rowless_recovered_2"
-            assert connect_count == 3
-            assert len(recovered_upstream.sent_text) == 2
-            follow_up_wire = json.loads(recovered_upstream.sent_text[1])
-            assert follow_up_wire["previous_response_id"] == automatic_recovery.json()["id"]
         return
 
     async with SessionLocal() as db_session:

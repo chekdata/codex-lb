@@ -8,15 +8,6 @@
 - [x] Add unit, integration, concurrency, cancellation, ambiguous-send, and migration tests.
 - [x] Require retained completed output before a fresh user follow-up and keep
   incremental-only requests on the operator path.
-- [x] Admit only canonical response-owned failed root-turn retry chains while
-  rejecting assistant output, tool activity, unknown items, and malformed
-  user/developer ordering in the retry tail.
-- [x] Admit the exact response-owned reasoning plus fully settled custom-tool
-  tail observed after a recovered follow-up, while rejecting every incomplete
-  or reordered variant.
-- [x] Admit the exact staged failed-retry, assistant-commentary, settled-tool,
-  and final-retry shape observed on the original production task while
-  rejecting malformed phases, identifiers, ordering, and settlement.
 - [x] Carry a verified marker-injected stale anchor through anchorless
   automatic preflight without trimming or rebuilding the claimed wire.
 - [x] Expose the automatic-authority rollback floor and map all uniqueness

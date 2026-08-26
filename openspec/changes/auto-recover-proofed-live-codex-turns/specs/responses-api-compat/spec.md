@@ -50,60 +50,6 @@ employee MUST NOT need to visit the dashboard or retry the turn.
 - **THEN** the service MUST NOT automatically claim or replay the request
 - **AND** MUST preserve the operator-authorized semantic-rebase flow.
 
-#### Scenario: Canonical failed root-turn retries remain recoverable
-
-- **GIVEN** an official root turn retains a completed assistant final answer
-- **AND** subsequent failed retries contain only response-owned user and
-  developer messages with unique valid message identifiers
-- **AND** the retry chain contains at least two user messages, starts and ends
-  with user input, and has no consecutive developer messages
-- **WHEN** the next live retry independently satisfies every automatic
-  recovery identity, settlement, account-neutrality, and at-most-once gate
-- **THEN** the service MAY supersede a physically unsent CAPTURED or APPROVED
-  generation and claim the exact new request automatically
-- **BUT** any assistant output, tool activity, unknown item, duplicate message
-  identifier, leading developer message, or trailing developer message in the
-  retry tail MUST keep the request fail closed.
-
-#### Scenario: Settled post-answer tool history does not strand a failed follow-up retry
-
-- **GIVEN** an official root turn retains a completed assistant final answer
-- **AND** its trailing history contains canonical response-owned reasoning and
-  one or more adjacent self-contained `custom_tool_call` and matching output
-  pairs with unique call IDs and no unresolved call
-- **AND** at most one bounded account-neutral developer refresh precedes at
-  least two response-owned user retry messages
-- **WHEN** the live retry independently satisfies every automatic recovery
-  identity, settlement, account-neutrality, and at-most-once gate
-- **THEN** the service MAY supersede a physically unsent CAPTURED or APPROVED
-  generation and claim the exact anchor-free request once
-- **BUT** a missing or reordered output, mismatched or duplicate call ID,
-  unknown tool type, malformed reasoning, second developer message, or fewer
-  than two retry messages MUST keep the request fail closed.
-
-#### Scenario: Settled Responses Lite progress between failed retry chains remains recoverable
-
-- **GIVEN** an official root turn retains a canonical Responses Lite tool
-  bundle and a completed assistant final answer
-- **AND** a canonical response-owned retry chain with at least two user
-  messages precedes a partial response
-- **AND** the partial response contains canonical reasoning, a response-owned
-  assistant commentary message, and one or more adjacent completed
-  `custom_tool_call` and matching completed output pairs
-- **AND** an optional single response-owned developer refresh precedes at
-  least two response-owned user messages in the final retry chain
-- **WHEN** the live retry independently satisfies every automatic recovery
-  identity, settlement, account-neutrality, and at-most-once gate
-- **THEN** the service MAY supersede a physically unsent CAPTURED or APPROVED
-  generation and claim the exact anchor-free request once
-- **BUT** duplicate message, call, or output IDs; arbitrary assistant phases;
-  malformed developer ordering; unresolved or unknown calls; missing or
-  mismatched outputs; or fewer than two users in either retry chain MUST keep
-  the request fail closed.
-- **AND** a request without the canonical Lite bundle MUST remain ineligible
-  for this staged proof because developer ordering cannot be reconstructed
-  after instruction normalization.
-
 #### Scenario: Marker-backed anchorless retry uses the verified stale anchor
 
 - **GIVEN** an eligible official root turn omits `previous_response_id`
@@ -115,7 +61,6 @@ employee MUST NOT need to visit the dashboard or retry the turn.
 - **AND** the exact claimed anchor-free projection MUST reach upstream once
 - **AND** later store-context processing MUST NOT trim or rebuild that wire
 - **AND** `response.completed` MUST consume the authority and clear the marker.
-
 #### Scenario: Active automatic authority raises the rollback floor
 
 - **GIVEN** at least one automatically authorized APPROVED or UNKNOWN authority
