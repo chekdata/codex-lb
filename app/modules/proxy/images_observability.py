@@ -10,6 +10,7 @@ from app.core.metrics.prometheus import (
     image_requests_total,
 )
 from app.core.openai.images import is_supported_image_model
+from app.core.runtime_logging import safe_log_field
 
 logger = logging.getLogger("app.modules.proxy.api")
 
@@ -54,9 +55,9 @@ def record_images_route_observability(
         logging.INFO if status < 400 else logging.WARNING,
         "images_route_complete route=%s model=%s stream=%s status=%s outcome=%s duration_ms=%.2f",
         route,
-        model_label,
+        safe_log_field(model_label),
         stream_label,
         status,
-        outcome,
+        safe_log_field(outcome),
         duration_seconds * 1000.0,
     )

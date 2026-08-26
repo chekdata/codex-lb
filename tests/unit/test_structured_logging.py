@@ -11,6 +11,7 @@ from app.core.runtime_logging import (
     _error_log_field,
     _redact_log_value,
     build_log_config,
+    safe_log_field,
 )
 
 pytestmark = pytest.mark.unit
@@ -38,6 +39,10 @@ def test_error_log_field_quotes_redacted_field_values():
     field = _error_log_field(value)
 
     assert field == '"temporary failure status=200 request_id=req-1 api_key=[REDACTED]"'
+
+
+def test_safe_log_field_is_single_line_and_redacts_secrets():
+    assert safe_log_field("user\r\npassword=secret-token") == "user password=[REDACTED]"
 
 
 @pytest.mark.parametrize(

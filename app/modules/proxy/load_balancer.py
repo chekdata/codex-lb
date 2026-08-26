@@ -456,7 +456,7 @@ class LoadBalancer:
         logger.warning(
             "API key stream fair share denial api_key_id=%s key_inflight=%s fair_share=%s "
             "pool_inflight=%s pool_capacity=%s active_keys=%s",
-            "<redacted>" if redact_sensitive_details else api_key_id,
+            "<redacted>",
             decision.requester_inflight,
             decision.fair_share,
             decision.pool_inflight,

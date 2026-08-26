@@ -207,10 +207,10 @@ def log_error_response(
     logger.log(
         level,
         "%s request_id=%s method=%s path=%s status=%s code=%s message=%s",
-        category,
-        get_request_id(),
-        request.method,
-        request.url.path,
+        safe_log_field(category),
+        safe_log_field(get_request_id()),
+        safe_log_field(request.method),
+        safe_log_field(request.url.path),
         status_code,
         _error_log_field(code),
         _error_log_field(message),
@@ -223,6 +223,15 @@ def _error_log_field(value: str | None) -> str:
     if redacted is None:
         return "-"
     return json.dumps(redacted)
+
+
+def safe_log_field(value: object | None) -> str:
+    """Return a redacted, single-line representation for a log field."""
+    if value is None:
+        return "-"
+    single_line = str(value).replace("\r", " ").replace("\n", " ")
+    redacted = _redact_log_value(single_line)
+    return redacted or "-"
 
 
 def _collapse_log_value(value: str | None) -> str | None:

@@ -1681,7 +1681,7 @@ def _record_http_bridge_handoff_compatibility_rejection(
         _hash_identifier_or_none(preferred_account_id),
         require_preferred_account,
         service_tier,
-        api_key_scope,
+        "<redacted>",
         session.closed,
         getattr(session, "admission_waiter_count", 0),
         len(session.pending_requests),

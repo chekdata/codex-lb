@@ -109,7 +109,7 @@ class _ApiKeyUsageMixin:
                 service = _service_api_keys_service()(repos.api_keys)
                 try:
                     return await service.enforce_limits_for_request(
-                        api_key.id,
+                        "<redacted>",
                         request_model=request_model,
                         request_service_tier=request_service_tier,
                         request_usage_budget=request_usage_budget,
@@ -327,7 +327,7 @@ class _ApiKeyUsageMixin:
             except Exception as exc:
                 logger.warning(
                     "Failed to settle compact API key reservation key_id=%s request_id=%s",
-                    api_key.id,
+                    "<redacted>",
                     get_request_id(),
                     exc_info=True,
                 )

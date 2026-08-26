@@ -124,10 +124,5 @@ async def responses_model_is_source_owned(
             is not None
         )
     except Exception:
-        logger.warning(
-            "model_source_resolution_failed_open model=%s raw_model=%s",
-            model,
-            raw,
-            exc_info=True,
-        )
+        logger.warning("model_source_resolution_failed_open", exc_info=True)
         return False

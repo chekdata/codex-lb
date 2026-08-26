@@ -145,7 +145,7 @@ from app.core.request_locality import (
     resolve_request_client_host,
 )
 from app.core.resilience.overload import is_local_overload_error_code, merge_retry_after_headers
-from app.core.runtime_logging import log_error_response
+from app.core.runtime_logging import log_error_response, safe_log_field
 from app.core.types import JsonValue
 from app.core.upstream_proxy import ResolvedUpstreamRoute, UpstreamProxyRouteError, resolve_upstream_route
 from app.core.utils.json_guards import is_json_list, is_json_mapping
@@ -7067,7 +7067,7 @@ async def _stream_with_cursor_usage_fallback(
             }
             logger.info(
                 "cursor_usage_fallback source=stream model=%s prompt_tokens=%s completion_tokens=%s",
-                payload.model,
+                safe_log_field(payload.model),
                 prompt_tokens,
                 completion_tokens,
             )
@@ -7122,8 +7122,8 @@ def _apply_cursor_usage_fallback(
     )
     logger.info(
         "cursor_usage_fallback source=%s model=%s prompt_tokens=%s completion_tokens=%s",
-        source,
-        payload.model,
+        safe_log_field(source),
+        safe_log_field(payload.model),
         prompt_tokens,
         completion_tokens,
     )
@@ -7578,7 +7578,7 @@ def _logged_error_json_response(
         message,
         category="proxy_error_response",
     )
-    # codeql[py/stack-trace-exposure] This is an OpenAI-compatible proxy boundary:
+    # lgtm [py/stack-trace-exposure] This is an OpenAI-compatible proxy boundary:
     # upstream/provider error envelopes intentionally preserve diagnostics for
     # clients, while internal exception handlers construct generic error
     # envelopes before reaching this response helper.
@@ -7884,8 +7884,8 @@ async def _settle_source_reservation(
     except Exception:
         logger.warning(
             "failed to settle source reservation reservation_id=%s model=%s",
-            reservation.reservation_id,
-            model,
+            safe_log_field(reservation.reservation_id),
+            safe_log_field(model),
             exc_info=True,
         )
         try:
@@ -7958,8 +7958,8 @@ async def _log_source_chat_completion(
     except Exception:
         logger.warning(
             "failed to write source request log source_id=%s model=%s status=%s",
-            source.id,
-            model,
+            safe_log_field(source.id),
+            safe_log_field(model),
             status,
             exc_info=True,
         )

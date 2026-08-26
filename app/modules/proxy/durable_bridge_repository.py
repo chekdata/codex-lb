@@ -83,7 +83,9 @@ def durable_bridge_api_key_scope(api_key_id: str | None) -> str:
 
 
 def durable_bridge_hash(value: str) -> str:
-    return sha256(value.encode("utf-8")).hexdigest()
+    # These digests are deterministic storage/fingerprint keys, not password
+    # verifiers. Preserve the historical digest for database compatibility.
+    return sha256(value.encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
 def durable_bridge_operation_fingerprint(*, api_key_scope: str, request_text: str) -> str:
