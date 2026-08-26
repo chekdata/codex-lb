@@ -48,6 +48,7 @@ from app.modules.proxy.durable_bridge_repository import (
     DurableBridgeAliasRegistrationReceipt,
 )
 from app.modules.proxy.durable_bridge_runtime import http_bridge_owner_process_epoch
+from app.modules.proxy.response_transition_manifest import ResponseTransitionManifest
 
 logger = logging.getLogger("app.modules.proxy.service")
 
@@ -215,6 +216,7 @@ class _HTTPBridgeSessionRegistryMixin:
         input_item_count: int | None = None,
         input_full_fingerprint: str | None = None,
         pending_tool_calls: Mapping[str, str] | None = None,
+        response_transition_manifest: ResponseTransitionManifest | None = None,
     ) -> bool:
         if _requires_durable_recovery_alias_serialization(session):
             async with session.recovery_alias_lock:
@@ -224,6 +226,7 @@ class _HTTPBridgeSessionRegistryMixin:
                     input_item_count=input_item_count,
                     input_full_fingerprint=input_full_fingerprint,
                     pending_tool_calls=pending_tool_calls,
+                    response_transition_manifest=response_transition_manifest,
                 )
         return await self._register_http_bridge_previous_response_id_impl(
             session,
@@ -231,6 +234,7 @@ class _HTTPBridgeSessionRegistryMixin:
             input_item_count=input_item_count,
             input_full_fingerprint=input_full_fingerprint,
             pending_tool_calls=pending_tool_calls,
+            response_transition_manifest=response_transition_manifest,
         )
 
     async def _register_http_bridge_previous_response_id_impl(
@@ -241,6 +245,7 @@ class _HTTPBridgeSessionRegistryMixin:
         input_item_count: int | None = None,
         input_full_fingerprint: str | None = None,
         pending_tool_calls: Mapping[str, str] | None = None,
+        response_transition_manifest: ResponseTransitionManifest | None = None,
     ) -> bool:
         stripped_response_id = response_id.strip()
         if not stripped_response_id:
@@ -297,6 +302,7 @@ class _HTTPBridgeSessionRegistryMixin:
             input_item_count=input_item_count,
             input_full_fingerprint=input_full_fingerprint,
             pending_tool_calls=pending_tool_calls,
+            response_transition_manifest=response_transition_manifest,
             instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
             lease_ttl_seconds=_http_bridge_durable_lease_ttl_seconds(),
             local_alias_was_published=not defer_durable_publication,

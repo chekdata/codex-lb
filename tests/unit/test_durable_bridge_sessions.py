@@ -38,6 +38,7 @@ from app.modules.proxy.durable_bridge_repository import (
     durable_bridge_api_key_scope,
     missing_durable_bridge_tables,
 )
+from app.modules.proxy.response_transition_manifest import build_response_transition_manifest
 
 pytestmark = pytest.mark.unit
 
@@ -436,6 +437,7 @@ async def test_marker_terminal_alias_conflict_rolls_back_checkpoint_and_journal(
             input_item_count=5,
             input_full_fingerprint="c" * 64,
             pending_tool_calls={},
+            response_transition_manifest=None,
             lease_ttl_seconds=120.0,
         )
     assert settled is False
@@ -647,6 +649,7 @@ async def test_missing_durable_bridge_tables_reports_required_rowless_columns(
         "http_bridge_rowless_recovery_authorities.authorization_mode",
         "http_bridge_rowless_recovery_authorities.authorization_proof_sha256",
         "http_bridge_rowless_recovery_authorities.origin_marker_session_id",
+        "http_bridge_sessions.latest_response_transition_manifest_json",
         "http_bridge_sessions.recovery_required_attempt_request_id",
     )
     assert len(captured_sql) == 3
@@ -2608,6 +2611,80 @@ async def test_durable_bridge_pending_tool_calls_are_bound_to_response_id(
     assert lookup is not None
     assert lookup.latest_response_id == "resp_manifest_new"
     assert lookup.latest_pending_tool_calls is None
+
+
+@pytest.mark.asyncio
+async def test_durable_bridge_response_transition_manifest_survives_lookup_and_clears_with_anchor(
+    coordinator: DurableBridgeSessionCoordinator,
+) -> None:
+    claimed = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-transition-manifest",
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_process_epoch="test-process",
+        lease_ttl_seconds=60.0,
+        account_id="acc-1",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+    pending = {"call_transition": "custom_tool_call"}
+    manifest = build_response_transition_manifest(
+        {
+            "response": {
+                "id": "resp_transition",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "custom_tool_call",
+                        "id": "ctc_transition",
+                        "call_id": "call_transition",
+                        "name": "shell",
+                        "input": "pwd",
+                        "status": "completed",
+                    }
+                ],
+            }
+        },
+        pending_tool_calls=pending,
+    )
+    assert manifest is not None
+
+    await coordinator.register_previous_response_id(
+        session_id=claimed.session_id,
+        api_key_id=None,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        response_id="resp_transition",
+        lease_ttl_seconds=60.0,
+        input_item_count=1,
+        input_full_fingerprint="c" * 64,
+        pending_tool_calls=pending,
+        response_transition_manifest=manifest,
+    )
+
+    lookup = await coordinator.lookup_request_targets(
+        session_key_kind="session_header",
+        session_key_value="sid-transition-manifest",
+        api_key_id=None,
+        turn_state=None,
+        session_header="sid-transition-manifest",
+        previous_response_id=None,
+    )
+    assert lookup is not None
+    assert lookup.latest_response_transition_manifest == manifest
+
+    cleared = await coordinator.clear_live_session_response_anchor(
+        session_id=claimed.session_id,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+    )
+    assert cleared is not None
+    assert cleared.latest_response_id is None
+    assert cleared.latest_response_transition_manifest is None
 
 
 @pytest.mark.asyncio

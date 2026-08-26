@@ -1844,6 +1844,7 @@ class HttpBridgeSessionRecord(Base):
     latest_input_item_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     latest_input_full_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     latest_pending_tool_calls_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    latest_response_transition_manifest_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     recovery_required_anchor_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     recovery_required_account_id: Mapped[str | None] = mapped_column(String, nullable=True)
     recovery_required_attempt_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)

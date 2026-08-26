@@ -127,6 +127,18 @@ from app.core.openai.models import (
     OpenAIErrorEnvelope as OpenAIErrorEnvelopeModel,
 )
 from app.core.openai.parsing import parse_response_payload
+from app.core.openai.public_output import (
+    PUBLIC_RESPONSE_TEXT_PART_TYPES as _PUBLIC_RESPONSE_TEXT_PART_TYPES,
+)
+from app.core.openai.public_output import (
+    extract_public_output_item_text as _extract_public_output_item_text,
+)
+from app.core.openai.public_output import (
+    is_public_passthrough_output_item_type as _is_public_passthrough_output_item_type,
+)
+from app.core.openai.public_output import (
+    normalize_public_output_item as _normalize_public_output_item,
+)
 from app.core.openai.requests import (
     ResponsesCompactRequest,
     ResponsesRequest,
@@ -289,23 +301,6 @@ _REASONING_SUMMARY_DONE_TYPES = frozenset(
     }
 )
 
-_PUBLIC_RESPONSE_OUTPUT_ITEM_TYPES = frozenset(
-    {
-        "message",
-        "compaction",
-        "function_call",
-        "function_call_output",
-        "reasoning",
-        "web_search_call",
-        "file_search_call",
-        "computer_call",
-        "code_interpreter_call",
-        "mcp_approval_request",
-        "mcp_list_tools",
-        "output_image",
-    }
-)
-_PUBLIC_RESPONSE_TEXT_PART_TYPES = frozenset({"output_text", "input_text", "text", "refusal"})
 _PUBLIC_RESPONSE_STREAM_TERMINAL_TYPES = frozenset(
     {"response.completed", "response.incomplete", "response.failed", "error"}
 )
@@ -7615,63 +7610,6 @@ def _normalize_public_response_mapping(
     return normalized, None
 
 
-def _normalize_public_output_item(item: Mapping[str, JsonValue]) -> dict[str, JsonValue] | None:
-    item_type = item.get("type")
-    if item_type == "reasoning":
-        return _normalize_reasoning_output_item(item)
-    if isinstance(item_type, str) and _is_public_passthrough_output_item_type(item_type):
-        return dict(item)
-    text_value = _extract_public_output_item_text(item)
-    if text_value is None:
-        return None
-    normalized: dict[str, JsonValue] = {
-        "type": "message",
-        "role": "assistant",
-        "status": item.get("status") if isinstance(item.get("status"), str) else "completed",
-        "content": [{"type": "output_text", "text": text_value}],
-    }
-    item_id = item.get("id")
-    if isinstance(item_id, str) and item_id:
-        normalized["id"] = item_id
-    return normalized
-
-
-def _normalize_reasoning_output_item(item: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
-    """Remove renderer-only blank HTML comments from reasoning summaries.
-
-    Recent Codex reasoning summaries can include a standalone ``<!-- -->``
-    markdown placeholder after the visible summary heading. The Codex TUI renders
-    reasoning summary text directly, so proxying that inert marker verbatim makes
-    it visible between tool calls. Limit the cleanup to reasoning summary text so
-    assistant/user-visible content and non-empty HTML comments remain untouched.
-    """
-
-    normalized = dict(item)
-    summary = item.get("summary")
-    if not isinstance(summary, list):
-        return normalized
-
-    normalized_summary: list[JsonValue] = []
-    changed = False
-    for part in summary:
-        if not is_json_mapping(part):
-            normalized_summary.append(part)
-            continue
-        text = part.get("text")
-        if part.get("type") != "summary_text" or not isinstance(text, str):
-            normalized_summary.append(dict(part))
-            continue
-        cleaned = _strip_blank_html_comment_lines(text)
-        normalized_part = dict(part)
-        normalized_part["text"] = cleaned
-        normalized_summary.append(normalized_part)
-        changed = changed or cleaned != text
-
-    if changed:
-        normalized["summary"] = normalized_summary
-    return normalized
-
-
 async def _normalize_reasoning_summary_stream(stream: AsyncIterator[str]) -> AsyncIterator[str]:
     pending: dict[tuple[str | None, int | None, int | None], list[tuple[dict[str, JsonValue], str]]] = {}
 
@@ -7748,42 +7686,6 @@ async def _normalize_reasoning_summary_stream(stream: AsyncIterator[str]) -> Asy
     for key in tuple(pending):
         for buffered in flush(key):
             yield buffered
-
-
-def _is_public_passthrough_output_item_type(item_type: str) -> bool:
-    if item_type in _PUBLIC_RESPONSE_OUTPUT_ITEM_TYPES:
-        return True
-    return item_type.endswith("_call") or item_type.endswith("_call_output")
-
-
-def _extract_public_output_item_text(item: Mapping[str, JsonValue]) -> str | None:
-    direct_text = item.get("text")
-    if isinstance(direct_text, str) and direct_text:
-        return direct_text
-    content = item.get("content")
-    if is_json_mapping(content):
-        content_parts: list[Mapping[str, JsonValue]] = [content]
-    elif isinstance(content, list):
-        content_parts = [part for part in content if is_json_mapping(part)]
-    else:
-        content_parts = []
-    parts: list[str] = []
-    for part in content_parts:
-        part_type = part.get("type")
-        if isinstance(part_type, str) and part_type in _PUBLIC_RESPONSE_TEXT_PART_TYPES:
-            text = part.get("text")
-            if isinstance(text, str) and text:
-                parts.append(text)
-                continue
-        text = part.get("text")
-        if isinstance(text, str) and text:
-            parts.append(text)
-    if parts:
-        return "".join(parts)
-    summary = item.get("summary")
-    if isinstance(summary, str) and summary:
-        return summary
-    return None
 
 
 def _looks_like_sse_data_block(event_block: str) -> bool:

@@ -15,6 +15,11 @@ from uuid import UUID
 
 from app.core.openai.requests import extract_input_file_ids
 from app.core.types import JsonValue
+from app.modules.proxy.response_transition_manifest import (
+    ResponseTransitionManifest,
+    match_response_transition_manifest_prefix,
+    response_transition_manifest_matches_context,
+)
 
 _TOOL_CALL_TYPE_BY_OUTPUT_TYPE = {
     "function_call_output": "function_call",
@@ -1221,6 +1226,109 @@ def responses_input_suffix_matches_pending_tool_calls(
         followups,
         allow_response_owned_messages=False,
     )
+
+
+def responses_input_suffix_matches_transition_manifest(
+    input_items: list[JsonValue],
+    *,
+    stored_count: int,
+    response_id: str,
+    pending_tool_calls: Mapping[str, str],
+    transition_manifest: ResponseTransitionManifest,
+) -> bool:
+    """Prove one gateway-recorded output transition and its fresh retry turns."""
+
+    if not response_transition_manifest_matches_context(
+        transition_manifest,
+        response_id=response_id,
+        pending_tool_calls=pending_tool_calls,
+    ):
+        return False
+    manifest_end = match_response_transition_manifest_prefix(
+        input_items,
+        stored_count=stored_count,
+        manifest=transition_manifest,
+    )
+    if manifest_end is None:
+        return False
+
+    unsettled_calls = dict(pending_tool_calls)
+    seen_item_ids: set[str] = set()
+    for item in input_items[stored_count:manifest_end]:
+        if not isinstance(item, dict):
+            return False
+        item_id = item.get("id")
+        if item_id is None:
+            continue
+        if not isinstance(item_id, str) or not item_id or item_id in seen_item_ids:
+            return False
+        seen_item_ids.add(item_id)
+    index = manifest_end
+    while index < len(input_items):
+        item = input_items[index]
+        if not isinstance(item, dict):
+            return False
+        item_type_value = item.get("type")
+        item_type = item_type_value if isinstance(item_type_value, str) else ""
+        call_type = _TOOL_CALL_TYPE_BY_OUTPUT_TYPE.get(item_type)
+        if call_type is None:
+            break
+        call_id = item.get("call_id")
+        if (
+            not isinstance(call_id, str)
+            or unsettled_calls.get(call_id) != call_type
+            or not _input_item_has_only_known_fields(item, item_type)
+            or not _caller_is_self_contained(item)
+            or not _response_owned_tool_metadata_is_account_neutral(item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD))
+            or not _tool_output_is_self_contained(item_type, item)
+        ):
+            return False
+        item_id = item.get("id")
+        if item_id is not None:
+            if not isinstance(item_id, str) or not item_id or item_id in seen_item_ids:
+                return False
+            seen_item_ids.add(item_id)
+        del unsettled_calls[call_id]
+        index += 1
+    if unsettled_calls:
+        return False
+
+    retry_items = input_items[index:]
+    if (
+        len(retry_items) == 1
+        and isinstance(retry_items[0], dict)
+        and retry_items[0].get("role") == "user"
+        and retry_items[0].get("id") in (None, "")
+        and responses_input_items_are_self_contained_fresh_replay(retry_items)
+    ):
+        # Non-Codex Responses clients do not carry turn metadata. Admit only
+        # one self-contained user follow-up; multi-item retries require the
+        # response-owned turn identities validated below.
+        return True
+
+    retry_turn_roles: dict[str, set[str]] = {}
+    user_count = 0
+    for item in retry_items:
+        if not isinstance(item, dict):
+            return False
+        if _is_response_owned_user_message(item):
+            role = "user"
+            user_count += 1
+        elif _is_response_owned_developer_message(item):
+            role = "developer"
+        else:
+            return False
+        message_id = item.get("id")
+        metadata = item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
+        turn_id = metadata.get("turn_id") if isinstance(metadata, dict) else None
+        if not isinstance(message_id, str) or message_id in seen_item_ids or not _is_uuid(turn_id):
+            return False
+        seen_item_ids.add(message_id)
+        roles = retry_turn_roles.setdefault(cast(str, turn_id), set())
+        if role in roles:
+            return False
+        roles.add(role)
+    return user_count > 0 and all("user" in roles for roles in retry_turn_roles.values())
 
 
 def _exact_pending_tool_call_settlement_prefix_length(

@@ -9,6 +9,7 @@ from app.db.models import Account
 from app.modules.proxy._service.support import _HTTPBridgeSession, _HTTPBridgeSessionKey
 from app.modules.proxy.durable_bridge_repository import DurableBridgeAliasRegistrationReceipt
 from app.modules.proxy.load_balancer import AccountSelection
+from app.modules.proxy.response_transition_manifest import ResponseTransitionManifest
 
 
 class _HTTPBridgeServiceProtocol(Protocol):
@@ -78,6 +79,7 @@ class _HTTPBridgeServiceProtocol(Protocol):
         input_item_count: int | None = None,
         input_full_fingerprint: str | None = None,
         pending_tool_calls: Mapping[str, str] | None = None,
+        response_transition_manifest: ResponseTransitionManifest | None = None,
     ) -> bool: ...
     def _schedule_http_bridge_session_closes(
         self,

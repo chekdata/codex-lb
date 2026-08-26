@@ -23,6 +23,7 @@ from app.modules.proxy.durable_bridge_repository import (
     durable_bridge_api_key_scope,
     durable_bridge_hash,
 )
+from app.modules.proxy.response_transition_manifest import ResponseTransitionManifest
 
 _DURABLE_TURN_STATE_ALIAS = "turn_state"
 _DURABLE_PREVIOUS_RESPONSE_ALIAS = "previous_response_id"
@@ -46,6 +47,7 @@ class DurableBridgeLookup:
     latest_input_full_fingerprint: str | None = None
     model: str | None = None
     latest_pending_tool_calls: dict[str, str] | None = None
+    latest_response_transition_manifest: ResponseTransitionManifest | None = None
     owner_process_epoch: str | None = None
     recovery_required_anchor_hash: str | None = None
     recovery_required_account_id: str | None = None
@@ -355,6 +357,7 @@ class DurableBridgeSessionCoordinator:
         latest_input_item_count: int | None = None,
         latest_input_full_fingerprint: str | None = None,
         latest_pending_tool_calls: Mapping[str, str] | None = None,
+        latest_response_transition_manifest: ResponseTransitionManifest | None = None,
         state: HttpBridgeSessionState | None = None,
     ) -> DurableBridgeLookup | None:
         del api_key_id
@@ -369,6 +372,7 @@ class DurableBridgeSessionCoordinator:
                 latest_input_item_count=latest_input_item_count,
                 latest_input_full_fingerprint=latest_input_full_fingerprint,
                 latest_pending_tool_calls=latest_pending_tool_calls,
+                latest_response_transition_manifest=latest_response_transition_manifest,
                 state=state,
             )
         if snapshot is None:
@@ -594,6 +598,7 @@ class DurableBridgeSessionCoordinator:
         input_item_count: int,
         input_full_fingerprint: str,
         pending_tool_calls: Mapping[str, str],
+        response_transition_manifest: ResponseTransitionManifest | None,
         lease_ttl_seconds: float,
     ) -> bool:
         async with self._session() as session:
@@ -610,6 +615,7 @@ class DurableBridgeSessionCoordinator:
                 input_item_count=input_item_count,
                 input_full_fingerprint=input_full_fingerprint,
                 pending_tool_calls=pending_tool_calls,
+                response_transition_manifest=response_transition_manifest,
                 lease_ttl_seconds=lease_ttl_seconds,
             )
 
@@ -715,6 +721,7 @@ class DurableBridgeSessionCoordinator:
         input_item_count: int | None = None,
         input_full_fingerprint: str | None = None,
         pending_tool_calls: Mapping[str, str] | None = None,
+        response_transition_manifest: ResponseTransitionManifest | None = None,
     ) -> DurableBridgeAliasRegistration:
         api_key_scope = durable_bridge_api_key_scope(api_key_id)
         async with self._session() as session:
@@ -730,6 +737,7 @@ class DurableBridgeSessionCoordinator:
                 latest_input_item_count=input_item_count,
                 latest_input_full_fingerprint=input_full_fingerprint,
                 latest_pending_tool_calls=pending_tool_calls,
+                latest_response_transition_manifest=response_transition_manifest,
             )
 
     async def register_session_header(
@@ -775,6 +783,7 @@ def _to_lookup(snapshot: DurableBridgeSessionSnapshot) -> DurableBridgeLookup:
         latest_input_full_fingerprint=snapshot.latest_input_full_fingerprint,
         model=snapshot.model,
         latest_pending_tool_calls=snapshot.latest_pending_tool_calls,
+        latest_response_transition_manifest=snapshot.latest_response_transition_manifest,
         recovery_required_anchor_hash=snapshot.recovery_required_anchor_hash,
         recovery_required_account_id=snapshot.recovery_required_account_id,
         recovery_required_attempt_fingerprint=snapshot.recovery_required_attempt_fingerprint,

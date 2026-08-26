@@ -240,6 +240,7 @@ from app.modules.proxy.replay_safety import (
     project_responses_input_for_abandoned_pending_fresh_replay,
     project_responses_input_for_account_neutral_fresh_replay,
     responses_input_suffix_matches_pending_tool_calls,
+    responses_input_suffix_matches_transition_manifest,
     responses_input_suffix_retains_prior_output,
     responses_payload_is_account_neutral_fresh_replay,
 )
@@ -370,6 +371,7 @@ class _VerifiedDurableFullResend:
     _pending_tool_calls: tuple[tuple[str, str], ...] | None
     _stored_input_fingerprint: str
     _stored_input_item_count: int
+    _transition_manifest_digest: str | None
     __slots__ = (
         "_durable_session_id",
         "_full_input_fingerprint",
@@ -378,6 +380,7 @@ class _VerifiedDurableFullResend:
         "_pending_tool_calls",
         "_stored_input_fingerprint",
         "_stored_input_item_count",
+        "_transition_manifest_digest",
     )
     __construction_token = object()
 
@@ -392,6 +395,7 @@ class _VerifiedDurableFullResend:
         stored_input_fingerprint: str,
         full_input_fingerprint: str,
         pending_tool_calls: tuple[tuple[str, str], ...] | None,
+        transition_manifest_digest: str | None = None,
     ) -> None:
         if _token is not self.__construction_token:
             raise TypeError("verified durable full resend proofs are created only by the verifier")
@@ -402,6 +406,7 @@ class _VerifiedDurableFullResend:
         object.__setattr__(self, "_stored_input_fingerprint", stored_input_fingerprint)
         object.__setattr__(self, "_full_input_fingerprint", full_input_fingerprint)
         object.__setattr__(self, "_pending_tool_calls", pending_tool_calls)
+        object.__setattr__(self, "_transition_manifest_digest", transition_manifest_digest)
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("verified durable full resend proofs are immutable")
@@ -434,6 +439,12 @@ class _VerifiedDurableFullResend:
             and durable_lookup.latest_input_item_count == self._stored_input_item_count
             and durable_lookup.latest_input_full_fingerprint == self._stored_input_fingerprint
             and _pending_tool_calls_identity(durable_lookup.latest_pending_tool_calls) == self._pending_tool_calls
+            and (
+                durable_lookup.latest_response_transition_manifest.digest
+                if durable_lookup.latest_response_transition_manifest is not None
+                else None
+            )
+            == self._transition_manifest_digest
             and _fingerprint_input_items(cast(list[JsonValue], input_items)) == self._full_input_fingerprint
         )
 
@@ -474,28 +485,38 @@ class _VerifiedDurableFullResend:
         pending_tool_calls = durable_lookup.latest_pending_tool_calls
         if replay_projection is None:
             return None
-        safe_fresh_context = (
-            False
-            if pending_tool_calls is None
-            else responses_input_suffix_matches_pending_tool_calls(
-                replay_projection.input_items,
-                stored_count=replay_projection.stored_prefix_count,
+        transition_manifest = durable_lookup.latest_response_transition_manifest
+        if transition_manifest is not None:
+            safe_fresh_context = pending_tool_calls is not None and responses_input_suffix_matches_transition_manifest(
+                input_items,
+                stored_count=stored_count,
+                response_id=latest_response_id,
                 pending_tool_calls=pending_tool_calls,
-                canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+                transition_manifest=transition_manifest,
             )
-            if pending_tool_calls
-            else responses_input_suffix_retains_prior_output(
-                replay_projection.input_items,
-                stored_count=replay_projection.stored_prefix_count,
-                canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
-                # The prefix fingerprint matched the exact context previously
-                # completed by this same-account session. Only the new
-                # inter-agent boundary additionally requires an explicitly
-                # empty manifest.
-                exact_stored_prefix_without_pending_manifest=True,
-                allow_response_owned_agent_message=pending_tool_calls == {},
+        else:
+            safe_fresh_context = (
+                False
+                if pending_tool_calls is None
+                else responses_input_suffix_matches_pending_tool_calls(
+                    replay_projection.input_items,
+                    stored_count=replay_projection.stored_prefix_count,
+                    pending_tool_calls=pending_tool_calls,
+                    canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+                )
+                if pending_tool_calls
+                else responses_input_suffix_retains_prior_output(
+                    replay_projection.input_items,
+                    stored_count=replay_projection.stored_prefix_count,
+                    canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+                    # The prefix fingerprint matched the exact context previously
+                    # completed by this same-account session. Only the new
+                    # inter-agent boundary additionally requires an explicitly
+                    # empty manifest.
+                    exact_stored_prefix_without_pending_manifest=True,
+                    allow_response_owned_agent_message=pending_tool_calls == {},
+                )
             )
-        )
         if not safe_fresh_context:
             return None
         return cls._seal(
@@ -506,6 +527,7 @@ class _VerifiedDurableFullResend:
             stored_input_fingerprint=stored_fingerprint,
             full_input_fingerprint=_fingerprint_input_items(input_items),
             pending_tool_calls=_pending_tool_calls_identity(pending_tool_calls),
+            transition_manifest_digest=(transition_manifest.digest if transition_manifest is not None else None),
         )
 
     @classmethod
@@ -519,6 +541,7 @@ class _VerifiedDurableFullResend:
         stored_input_fingerprint: str,
         full_input_fingerprint: str,
         pending_tool_calls: tuple[tuple[str, str], ...] | None,
+        transition_manifest_digest: str | None = None,
     ) -> "_VerifiedDurableFullResend":
         return cls(
             _token=cls.__construction_token,
@@ -529,6 +552,7 @@ class _VerifiedDurableFullResend:
             stored_input_fingerprint=stored_input_fingerprint,
             full_input_fingerprint=full_input_fingerprint,
             pending_tool_calls=pending_tool_calls,
+            transition_manifest_digest=transition_manifest_digest,
         )
 
 
@@ -616,6 +640,11 @@ def _verify_durable_abandoned_pending_full_resend_with_reason(
             stored_input_fingerprint=stored_fingerprint,
             full_input_fingerprint=_fingerprint_input_items(input_items),
             pending_tool_calls=_pending_tool_calls_identity(pending_tool_calls),
+            transition_manifest_digest=(
+                durable_lookup.latest_response_transition_manifest.digest
+                if durable_lookup.latest_response_transition_manifest is not None
+                else None
+            ),
         ),
         None,
     )
@@ -641,6 +670,7 @@ class _VerifiedStoreContextFullResend:
     _pending_tool_calls: tuple[tuple[str, str], ...] | None
     _stored_input_fingerprint: str
     _stored_input_item_count: int
+    _transition_manifest_digest: str | None
     __slots__ = (
         "_affinity_key",
         "_affinity_kind",
@@ -651,6 +681,7 @@ class _VerifiedStoreContextFullResend:
         "_pending_tool_calls",
         "_stored_input_fingerprint",
         "_stored_input_item_count",
+        "_transition_manifest_digest",
     )
     __construction_token = object()
 
@@ -667,6 +698,7 @@ class _VerifiedStoreContextFullResend:
         stored_input_fingerprint: str,
         full_input_fingerprint: str,
         pending_tool_calls: tuple[tuple[str, str], ...] | None,
+        transition_manifest_digest: str | None = None,
     ) -> None:
         if _token is not self.__construction_token:
             raise TypeError("verified store-context full resend proofs are created only by the verifier")
@@ -679,6 +711,7 @@ class _VerifiedStoreContextFullResend:
         object.__setattr__(self, "_stored_input_fingerprint", stored_input_fingerprint)
         object.__setattr__(self, "_full_input_fingerprint", full_input_fingerprint)
         object.__setattr__(self, "_pending_tool_calls", pending_tool_calls)
+        object.__setattr__(self, "_transition_manifest_digest", transition_manifest_digest)
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("verified store-context full resend proofs are immutable")
@@ -707,6 +740,12 @@ class _VerifiedStoreContextFullResend:
             and session.last_completed_input_prefix_fingerprint == self._stored_input_fingerprint
             and not session.last_pending_tool_call_manifest_invalid
             and _pending_tool_calls_identity(session.last_pending_tool_calls) == self._pending_tool_calls
+            and (
+                session.last_response_transition_manifest.digest
+                if session.last_response_transition_manifest is not None
+                else None
+            )
+            == self._transition_manifest_digest
             and _fingerprint_input_items(cast(list[JsonValue], input_items)) == self._full_input_fingerprint
         )
 
@@ -747,24 +786,32 @@ class _VerifiedStoreContextFullResend:
         pending_tool_calls = session.last_pending_tool_calls
         if replay_projection is None:
             return None
-        safe_fresh_context = (
-            False
-            if pending_tool_calls is None
-            else responses_input_suffix_matches_pending_tool_calls(
-                replay_projection.input_items,
-                stored_count=replay_projection.stored_prefix_count,
+        transition_manifest = session.last_response_transition_manifest
+        if transition_manifest is not None:
+            safe_fresh_context = responses_input_suffix_matches_transition_manifest(
+                input_items,
+                stored_count=stored_count,
+                response_id=latest_response_id,
                 pending_tool_calls=pending_tool_calls,
-                canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+                transition_manifest=transition_manifest,
             )
-            if pending_tool_calls
-            else responses_input_suffix_retains_prior_output(
-                replay_projection.input_items,
-                stored_count=replay_projection.stored_prefix_count,
-                canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
-                exact_stored_prefix_without_pending_manifest=True,
-                allow_response_owned_agent_message=pending_tool_calls == {},
+        else:
+            safe_fresh_context = (
+                responses_input_suffix_matches_pending_tool_calls(
+                    replay_projection.input_items,
+                    stored_count=replay_projection.stored_prefix_count,
+                    pending_tool_calls=pending_tool_calls,
+                    canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+                )
+                if pending_tool_calls
+                else responses_input_suffix_retains_prior_output(
+                    replay_projection.input_items,
+                    stored_count=replay_projection.stored_prefix_count,
+                    canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+                    exact_stored_prefix_without_pending_manifest=True,
+                    allow_response_owned_agent_message=pending_tool_calls == {},
+                )
             )
-        )
         if not safe_fresh_context:
             return None
         return cls(
@@ -778,6 +825,7 @@ class _VerifiedStoreContextFullResend:
             stored_input_fingerprint=stored_fingerprint,
             full_input_fingerprint=_fingerprint_input_items(input_items),
             pending_tool_calls=_pending_tool_calls_identity(pending_tool_calls),
+            transition_manifest_digest=(transition_manifest.digest if transition_manifest is not None else None),
         )
 
 
@@ -1947,24 +1995,38 @@ class _HTTPBridgeStreamingMixin:
             safe_fresh_context = False
             if replay_projection is not None:
                 pending_tool_calls = lookup.latest_pending_tool_calls
-                safe_fresh_context = (
-                    False
-                    if pending_tool_calls is None
-                    else responses_input_suffix_matches_pending_tool_calls(
-                        replay_projection.input_items,
-                        stored_count=replay_projection.stored_prefix_count,
+                transition_manifest = lookup.latest_response_transition_manifest
+                if (
+                    transition_manifest is not None
+                    and pending_tool_calls is not None
+                    and lookup.latest_response_id is not None
+                ):
+                    safe_fresh_context = responses_input_suffix_matches_transition_manifest(
+                        cast(list[JsonValue], payload.input),
+                        stored_count=stored_count,
+                        response_id=lookup.latest_response_id,
                         pending_tool_calls=pending_tool_calls,
-                        canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+                        transition_manifest=transition_manifest,
                     )
-                    if pending_tool_calls
-                    else responses_input_suffix_retains_prior_output(
-                        replay_projection.input_items,
-                        stored_count=replay_projection.stored_prefix_count,
-                        canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
-                        exact_stored_prefix_without_pending_manifest=True,
-                        allow_response_owned_agent_message=pending_tool_calls == {},
+                else:
+                    safe_fresh_context = (
+                        False
+                        if pending_tool_calls is None
+                        else responses_input_suffix_matches_pending_tool_calls(
+                            replay_projection.input_items,
+                            stored_count=replay_projection.stored_prefix_count,
+                            pending_tool_calls=pending_tool_calls,
+                            canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+                        )
+                        if pending_tool_calls
+                        else responses_input_suffix_retains_prior_output(
+                            replay_projection.input_items,
+                            stored_count=replay_projection.stored_prefix_count,
+                            canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+                            exact_stored_prefix_without_pending_manifest=True,
+                            allow_response_owned_agent_message=pending_tool_calls == {},
+                        )
                     )
-                )
             if not safe_fresh_context:
                 _log_http_bridge_event(
                     "full_resend_proof_rejected",
@@ -3958,6 +4020,9 @@ class _HTTPBridgeStreamingMixin:
                                 durable_lookup.latest_pending_tool_calls is None
                             )
                             session.last_pending_tool_calls = dict(durable_lookup.latest_pending_tool_calls or {})
+                            session.last_response_transition_manifest = (
+                                durable_lookup.latest_response_transition_manifest
+                            )
                         session.last_completed_response_id = durable_lookup.latest_response_id
                         session.last_completed_response_account_id = durable_lookup.account_id
                         session.last_completed_input_count = durable_full_resend_anchor_count
@@ -4089,6 +4154,7 @@ class _HTTPBridgeStreamingMixin:
                 # silently treating it as a verified empty manifest.
                 session.last_pending_tool_call_manifest_invalid = durable_lookup.latest_pending_tool_calls is None
                 session.last_pending_tool_calls = dict(durable_lookup.latest_pending_tool_calls or {})
+                session.last_response_transition_manifest = durable_lookup.latest_response_transition_manifest
             session.last_completed_response_id = durable_lookup.latest_response_id
             # The durable anchor is owned by the durable session's account, which
             # may differ from this session's account after a failover. Record the

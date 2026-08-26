@@ -190,6 +190,10 @@ from app.modules.proxy.helpers import (
     _normalize_error_code,
     is_upstream_model_capacity_error,
 )
+from app.modules.proxy.response_transition_manifest import (
+    ResponseTransitionManifest,
+    build_response_transition_manifest,
+)
 from app.modules.proxy.rowless_recovery import (
     rowless_actual_wire_fingerprint,
     rowless_projected_actual_wire_text,
@@ -2373,6 +2377,7 @@ class _HTTPBridgeUpstreamEventsMixin:
         )
 
         completed_pending_tool_call_manifest: dict[str, str] | None = None
+        completed_response_transition_manifest: ResponseTransitionManifest | None = None
         if (
             response_id is not None
             and matched_request_state is not None
@@ -2383,6 +2388,12 @@ class _HTTPBridgeUpstreamEventsMixin:
                 matched_request_state,
                 payload,
             )
+            if completed_pending_tool_call_manifest is not None:
+                completed_response_transition_manifest = build_response_transition_manifest(
+                    payload,
+                    pending_tool_calls=completed_pending_tool_call_manifest,
+                    normalize_for_public_contract=matched_request_state.enforce_openai_sdk_contract,
+                )
             if matched_request_state.rowless_recovery_authority_id is not None:
                 rowless_settled = False
                 if (
@@ -2406,6 +2417,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                                 input_item_count=matched_request_state.input_item_count,
                                 input_full_fingerprint=matched_request_state.input_full_fingerprint,
                                 pending_tool_calls=completed_pending_tool_call_manifest,
+                                response_transition_manifest=completed_response_transition_manifest,
                             )
                     except Exception:
                         logger.warning(
@@ -2426,6 +2438,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                         input_item_count=matched_request_state.input_item_count,
                         input_full_fingerprint=matched_request_state.input_full_fingerprint,
                         pending_tool_calls=completed_pending_tool_call_manifest,
+                        response_transition_manifest=completed_response_transition_manifest,
                     )
                     if not live_alias_registered:
                         # Durable continuity is already atomically published.
@@ -2466,6 +2479,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                             input_item_count=matched_request_state.input_item_count,
                             input_full_fingerprint=matched_request_state.input_full_fingerprint,
                             pending_tool_calls=completed_pending_tool_call_manifest,
+                            response_transition_manifest=completed_response_transition_manifest,
                             lease_ttl_seconds=_http_bridge_durable_lease_ttl_seconds(),
                         )
                     except Exception:
@@ -2481,6 +2495,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                         input_item_count=matched_request_state.input_item_count,
                         input_full_fingerprint=matched_request_state.input_full_fingerprint,
                         pending_tool_calls=completed_pending_tool_call_manifest,
+                        response_transition_manifest=completed_response_transition_manifest,
                     )
                     if not live_alias_registered:
                         # The durable transaction is authoritative. Retire a
@@ -2506,6 +2521,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                         else None
                     ),
                     pending_tool_calls=completed_pending_tool_call_manifest,
+                    response_transition_manifest=completed_response_transition_manifest,
                 )
             if not alias_registered and (
                 matched_request_state.rowless_recovery_authority_id is not None
@@ -2640,6 +2656,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                     payload,
                 )
                 session.last_pending_tool_calls = dict(terminal_request_state.pending_tool_call_types)
+                session.last_response_transition_manifest = completed_response_transition_manifest
             # Prefix trimming is only meaningful for list-shaped inputs, so
             # keep the input-count / fingerprint update scoped to that path.
             if terminal_request_state.input_item_count > 0:

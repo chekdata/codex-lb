@@ -31,6 +31,10 @@ from app.modules.proxy.durable_bridge_repository import (
     _encode_pending_tool_calls,
     durable_bridge_hash,
 )
+from app.modules.proxy.response_transition_manifest import (
+    ResponseTransitionManifest,
+    encode_response_transition_manifest,
+)
 from app.modules.proxy.rowless_recovery import (
     ROWLESS_AUTHORIZATION_MODE_AUTOMATIC,
     ROWLESS_AUTHORIZATION_MODE_OPERATOR,
@@ -1317,6 +1321,7 @@ class RowlessRecoveryRepository:
         input_item_count: int,
         input_full_fingerprint: str,
         pending_tool_calls: dict[str, str],
+        response_transition_manifest: ResponseTransitionManifest | None,
     ) -> bool:
         """Atomically publish the new checkpoint and consume one authority."""
 
@@ -1377,6 +1382,9 @@ class RowlessRecoveryRepository:
             replacement.latest_pending_tool_calls_json = _encode_pending_tool_calls(
                 response_id,
                 pending_tool_calls,
+            )
+            replacement.latest_response_transition_manifest_json = encode_response_transition_manifest(
+                response_transition_manifest
             )
             replacement.recovery_required_anchor_hash = None
             replacement.recovery_required_account_id = None

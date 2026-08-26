@@ -885,6 +885,39 @@ def test_rowless_marker_origin_migration_renders_postgres_upgrade_and_downgrade(
     ]
 
 
+def test_response_transition_manifest_migration_renders_postgres_upgrade_and_empty_downgrade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = importlib.import_module("app.db.alembic.versions.20260826_000000_add_response_transition_manifest")
+
+    upgrade_sql = StringIO()
+    upgrade_context = MigrationContext.configure(
+        dialect_name="postgresql",
+        opts={"as_sql": True, "output_buffer": upgrade_sql},
+    )
+    monkeypatch.setattr(migration, "op", Operations(upgrade_context))
+    monkeypatch.setattr(migration, "_columns", lambda _bind: set())
+    migration.upgrade()
+    assert upgrade_sql.getvalue().splitlines() == [
+        "ALTER TABLE http_bridge_sessions ADD COLUMN latest_response_transition_manifest_json TEXT;",
+        "",
+    ]
+
+    downgrade_sql = StringIO()
+    downgrade_context = MigrationContext.configure(
+        dialect_name="postgresql",
+        opts={"as_sql": True, "output_buffer": downgrade_sql},
+    )
+    monkeypatch.setattr(migration, "op", Operations(downgrade_context))
+    monkeypatch.setattr(migration, "_columns", lambda _bind: {migration._COLUMN})
+    monkeypatch.setattr(migration, "_active_manifest_exists", lambda _bind: False)
+    migration.downgrade()
+    assert downgrade_sql.getvalue().splitlines() == [
+        "ALTER TABLE http_bridge_sessions DROP COLUMN latest_response_transition_manifest_json;",
+        "",
+    ]
+
+
 def test_request_log_useragent_family_migration_backfills_only_slash_values(tmp_path: Path) -> None:
     db_path = tmp_path / "request-log-useragent-families.db"
     url = _db_url(db_path)

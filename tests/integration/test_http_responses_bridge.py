@@ -3351,10 +3351,12 @@ class _InterruptedCustomToolUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
         *,
         emit_added: bool = False,
         tool_call_type: str = "custom_tool_call",
+        include_full_transition_output: bool = False,
     ) -> None:
         super().__init__(response_id_prefix)
         self._emit_added = emit_added
         self._tool_call_type = tool_call_type
+        self._include_full_transition_output = include_full_transition_output
 
     def _pending_call_item(self, *, status: str) -> dict[str, Any]:
         item: dict[str, Any] = {
@@ -3427,13 +3429,33 @@ class _InterruptedCustomToolUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
                             "id": response_id,
                             "object": "response",
                             "status": "completed",
-                            "output": [
-                                {
-                                    "type": "message",
-                                    "role": "assistant",
-                                    "content": [{"type": "output_text", "text": "OK"}],
-                                }
-                            ],
+                            "output": (
+                                [
+                                    {
+                                        "type": "reasoning",
+                                        "id": "rs_transition",
+                                        "encrypted_content": "opaque",
+                                        "summary": [],
+                                        "status": "completed",
+                                    },
+                                    {
+                                        "type": "message",
+                                        "id": "msg_transition",
+                                        "role": "assistant",
+                                        "phase": "commentary",
+                                        "content": [{"type": "output_text", "text": "Checking the task."}],
+                                    },
+                                    self._pending_call_item(status="completed"),
+                                ]
+                                if self._include_full_transition_output and len(self.sent_text) == 1
+                                else [
+                                    {
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [{"type": "output_text", "text": "OK"}],
+                                    }
+                                ]
+                            ),
                             "usage": {
                                 "input_tokens": 24,
                                 "output_tokens": 2,
@@ -3450,8 +3472,19 @@ class _InterruptedCustomToolUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
 
 
 class _ClosingInterruptedCustomToolUpstreamWebSocket(_InterruptedCustomToolUpstreamWebSocket):
-    def __init__(self, response_id_prefix: str = "resp_bridge", *, tool_call_type: str = "custom_tool_call") -> None:
-        super().__init__(response_id_prefix, emit_added=True, tool_call_type=tool_call_type)
+    def __init__(
+        self,
+        response_id_prefix: str = "resp_bridge",
+        *,
+        tool_call_type: str = "custom_tool_call",
+        include_full_transition_output: bool = False,
+    ) -> None:
+        super().__init__(
+            response_id_prefix,
+            emit_added=True,
+            tool_call_type=tool_call_type,
+            include_full_transition_output=include_full_transition_output,
+        )
 
     async def send_text(self, text: str) -> None:
         await super().send_text(text)
@@ -11064,6 +11097,7 @@ async def test_v1_responses_http_bridge_replays_full_resend_once_then_stays_on_n
     assert durable_lookup is not None
     assert durable_lookup.latest_input_item_count == len(historical_input)
     assert durable_lookup.latest_input_full_fingerprint is not None
+    assert durable_lookup.latest_response_transition_manifest is not None
 
     if fresh_developer_followup:
         retained_prior_output = {
@@ -16686,7 +16720,29 @@ async def test_v1_responses_http_bridge_recovers_store_context_trim_after_proxy_
         "http-bridge-store-context-recovery@example.com",
     )
     account = await _get_account(account_id)
-    stale_upstream = _CompleteThenRejectStalePreviousResponseUpstreamWebSocket("resp_store_context")
+    agent_retained_output = [
+        {
+            "type": "reasoning",
+            "id": "rs_previous",
+            "encrypted_content": "opaque",
+            "summary": [],
+        },
+        {
+            "type": "agent_message",
+            "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea0",
+            "author": "/root/episode_identity_final_audit",
+            "recipient": "/root",
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
+                "create_time": 1787431172.912141,
+            },
+            "content": [{"type": "input_text", "text": "verified inter-agent result"}],
+        },
+    ]
+    stale_upstream = _CompleteThenRejectStalePreviousResponseUpstreamWebSocket(
+        "resp_store_context",
+        completed_output=agent_retained_output if retained_output_shape == "agent_message" else None,
+    )
     recovered_upstream = _FakeBridgeUpstreamWebSocket("resp_store_context_recovered")
     upstreams = [stale_upstream, recovered_upstream]
     connect_count = 0
@@ -16760,30 +16816,46 @@ async def test_v1_responses_http_bridge_recovers_store_context_trim_after_proxy_
         # Exact production shape from the stranded long-running Codex task:
         # response-owned reasoning, one completed inter-agent delivery, and
         # two later user retries after the stale anchor had already failed.
-        retained_output = [
-            {
-                "type": "reasoning",
-                "id": "reasoning_previous",
-                "encrypted_content": "opaque",
-                "summary": [],
-            },
-            {
-                "type": "agent_message",
-                "id": "amsg_01a02b33-3b30-7742-bdb3-091f07cf2ea0",
-                "author": "/root/episode_identity_final_audit",
-                "recipient": "/root",
-                "internal_chat_message_metadata_passthrough": {
-                    "turn_id": "01a02b31-bc02-70b0-a09e-0dedbc2e2da9",
-                    "create_time": 1787431172.912141,
-                },
-                "content": [{"type": "input_text", "text": "verified inter-agent result"}],
-            },
-        ]
+        retained_output = first_body["output"]
         follow_up_messages = [
-            {"role": "user", "content": "first retry after the completed inter-agent result"},
-            {"role": "user", "content": "second retry after the stale anchor error"},
+            {
+                "type": "message",
+                "id": "msg_01a02c31-2f60-7dd2-9f22-d7ef316596b1",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "first retry after the completed inter-agent result"}],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "01a02c31-2f60-7dd2-9f22-d7ef316596b1",
+                    "create_time": 1787433300.0,
+                },
+            },
+            {
+                "type": "message",
+                "id": "msg_01a02c43-4980-7afb-97f5-2e2d30aa73de",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "second retry after the stale anchor error"}],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "01a02c43-4980-7afb-97f5-2e2d30aa73de",
+                    "create_time": 1787433402.605,
+                },
+            },
         ]
     complete_follow_up = [*historical_input, *retained_output, *follow_up_messages]
+    assert live_session.last_response_transition_manifest is not None
+    proof_payload = proxy_module.ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": complete_follow_up,
+            "prompt_cache_key": session_id,
+        }
+    )
+    assert (
+        http_bridge_streaming_module._verify_store_context_full_resend(
+            proof_payload,
+            live_session,
+        )
+        is not None
+    )
     second = await async_client.post(
         "/v1/responses",
         headers=session_headers,
@@ -16812,7 +16884,11 @@ async def test_v1_responses_http_bridge_recovers_store_context_trim_after_proxy_
             complete_follow_up[-1],
         ]
     else:
-        recovered_agent_messages = [item for item in recovered_payload["input"] if item.get("type") == "agent_message"]
+        recovered_agent_messages = [
+            item
+            for item in recovered_payload["input"]
+            if item.get("type") == "message" and item.get("id", "").startswith("amsg_")
+        ]
         assert recovered_agent_messages == [retained_output[-1]]
         assert [item.get("content") for item in recovered_payload["input"] if item.get("role") == "user"] == [
             historical_input[0]["content"],
@@ -17262,6 +17338,157 @@ async def test_v1_responses_http_bridge_recovers_verified_full_resend_with_expli
     recovered_payload = json.loads(recovered_upstream.sent_text[0])
     assert "previous_response_id" not in recovered_payload
     assert recovered_payload["input"] == complete_resend
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_recovers_manifest_bound_codex_retry_once(
+    async_client,
+    app_instance,
+    monkeypatch,
+) -> None:
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_manifest_recovery",
+        "http-bridge-manifest-recovery@example.com",
+    )
+    account = await _get_account(account_id)
+    first_upstream = _InterruptedCustomToolUpstreamWebSocket(
+        "resp_manifest_recovery",
+        emit_added=True,
+        include_full_transition_output=True,
+    )
+    stale_upstream: _RejectStalePreviousResponseUpstreamWebSocket | None = None
+    recovered_upstream: _RejectStalePreviousResponseUpstreamWebSocket | None = None
+    connect_count = 0
+
+    async def fake_select_account_with_budget(self, deadline, **kwargs):
+        del self, deadline, kwargs
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        nonlocal connect_count
+        del headers, access_token, account_id_header, base_url, session
+        connect_count += 1
+        if connect_count == 1:
+            return first_upstream
+        if connect_count == 2:
+            assert stale_upstream is not None
+            return stale_upstream
+        assert recovered_upstream is not None
+        return recovered_upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    session_id = "manifest-bound-codex-retry"
+    session_headers = {"x-codex-session-id": session_id}
+    historical_input = [{"role": "user", "content": "run the checks"}]
+    first = await async_client.post(
+        "/v1/responses",
+        headers=session_headers,
+        json={
+            "model": "gpt-5.6-sol",
+            "instructions": "Continue the task.",
+            "input": historical_input,
+            "prompt_cache_key": session_id,
+        },
+    )
+    assert first.status_code == 200, first.text
+    first_body = first.json()
+
+    service = get_proxy_service_for_app(app_instance)
+    durable_lookup = await service._durable_bridge.lookup_request_targets(
+        session_key_kind="session_header",
+        session_key_value=session_id,
+        api_key_id=None,
+        turn_state=None,
+        session_header=session_id,
+        previous_response_id=first_body["id"],
+    )
+    assert durable_lookup is not None
+    assert durable_lookup.latest_pending_tool_calls == {"call_custom_shell": "custom_tool_call"}
+    assert durable_lookup.latest_response_transition_manifest is not None
+
+    stale_upstream = _RejectStalePreviousResponseUpstreamWebSocket(first_body["id"])
+    recovered_upstream = _RejectStalePreviousResponseUpstreamWebSocket(first_body["id"])
+    async with service._http_bridge_lock:
+        session = next(iter(service._http_bridge_sessions.values()))
+    await service._reset_http_bridge_session_after_local_terminal_error(
+        session,
+        error_code="test_transport_replaced",
+        error_message="Force a fresh socket while preserving the manifest checkpoint",
+        preserve_durable_lease=True,
+    )
+
+    full_resend = [
+        *historical_input,
+        *first_body["output"],
+        {
+            "type": "custom_tool_call_output",
+            "id": "ctco_manifest_recovery",
+            "call_id": "call_custom_shell",
+            "output": "verified",
+            "status": "completed",
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "00000000-0000-4000-8000-000000000501",
+                "create_time": 1.0,
+            },
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000502",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "current app context"}],
+            "internal_chat_message_metadata_passthrough": {"turn_id": "00000000-0000-4000-8000-000000000503"},
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000504",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "continue"}],
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "00000000-0000-4000-8000-000000000503",
+                "create_time": 2.0,
+            },
+        },
+    ]
+    recovered = await async_client.post(
+        "/v1/responses",
+        headers=session_headers,
+        json={
+            "model": "gpt-5.6-sol",
+            "instructions": "Continue the task.",
+            "input": full_resend,
+            "prompt_cache_key": session_id,
+            "previous_response_id": first_body["id"],
+        },
+    )
+
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["id"] == "resp_recovered_1"
+    assert connect_count == 3
+    assert stale_upstream is not None
+    assert len(stale_upstream.sent_text) == 1
+    stale_payload = json.loads(stale_upstream.sent_text[0])
+    assert stale_payload.pop("previous_response_id") == first_body["id"]
+    assert recovered_upstream is not None
+    assert len(recovered_upstream.sent_text) == 1
+    recovered_payload = json.loads(recovered_upstream.sent_text[0])
+    assert "previous_response_id" not in recovered_payload
+    assert recovered_payload == stale_payload
 
 
 @pytest.mark.asyncio

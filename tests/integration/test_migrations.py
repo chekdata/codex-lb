@@ -304,6 +304,68 @@ async def test_rowless_recovery_authority_migration_round_trip(tmp_path):
         await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_response_transition_manifest_migration_round_trip(tmp_path) -> None:
+    from alembic import command
+    from sqlalchemy import inspect as sa_inspect
+
+    from app.db.migrate import _build_alembic_config
+
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'response-transition-manifest.sqlite'}"
+    parent_revision = "20260825_000000_add_rowless_authorization_provenance"
+    revision = "20260826_000000_add_response_transition_manifest"
+    column = "latest_response_transition_manifest_json"
+
+    await to_thread.run_sync(lambda: run_upgrade(db_url, parent_revision, bootstrap_legacy=False))
+    engine = create_async_engine(db_url, future=True)
+    try:
+        async with engine.connect() as conn:
+            parent_columns = await conn.run_sync(
+                lambda sync_conn: {item["name"] for item in sa_inspect(sync_conn).get_columns("http_bridge_sessions")}
+            )
+        assert column not in parent_columns
+
+        await to_thread.run_sync(lambda: run_upgrade(db_url, revision, bootstrap_legacy=False))
+        async with engine.connect() as conn:
+            upgraded_columns = await conn.run_sync(
+                lambda sync_conn: {item["name"] for item in sa_inspect(sync_conn).get_columns("http_bridge_sessions")}
+            )
+        assert column in upgraded_columns
+
+        session_id = str(uuid4())
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO http_bridge_sessions ("
+                    "id,session_key_kind,session_key_value,session_key_hash,api_key_scope,"
+                    "owner_epoch,state,latest_response_transition_manifest_json) VALUES ("
+                    ":id,'session_header','session-manifest',:hash,'scope',1,'active',:manifest)"
+                ),
+                {
+                    "id": session_id,
+                    "hash": "a" * 64,
+                    "manifest": '{"schema":"qk_http_bridge_response_transition_manifest_v1"}',
+                },
+            )
+
+        with pytest.raises(RuntimeError, match="durable response transition manifests exist"):
+            await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), parent_revision))
+
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE http_bridge_sessions SET latest_response_transition_manifest_json = NULL WHERE id = :id"),
+                {"id": session_id},
+            )
+        await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), parent_revision))
+        async with engine.connect() as conn:
+            downgraded_columns = await conn.run_sync(
+                lambda sync_conn: {item["name"] for item in sa_inspect(sync_conn).get_columns("http_bridge_sessions")}
+            )
+        assert column not in downgraded_columns
+    finally:
+        await engine.dispose()
+
+
 def _is_postgresql_database_url(url: str) -> bool:
     return url.startswith("postgresql+")
 
