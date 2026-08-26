@@ -31,6 +31,11 @@ from app.modules.proxy.continuity import (
     HTTP_BRIDGE_ACCOUNT_NEUTRAL_REPLAY_REBINDABLE_KINDS,
     is_http_bridge_account_neutral_replay,
 )
+from app.modules.proxy.response_transition_manifest import (
+    ResponseTransitionManifest,
+    decode_response_transition_manifest,
+    encode_response_transition_manifest,
+)
 
 _ANONYMOUS_API_KEY_SCOPE = "__anonymous__"
 REQUIRED_DURABLE_BRIDGE_TABLES = (
@@ -41,7 +46,10 @@ REQUIRED_DURABLE_BRIDGE_TABLES = (
     "http_bridge_rowless_recovery_authorities",
 )
 REQUIRED_DURABLE_BRIDGE_COLUMNS = {
-    "http_bridge_sessions": ("recovery_required_attempt_request_id",),
+    "http_bridge_sessions": (
+        "latest_response_transition_manifest_json",
+        "recovery_required_attempt_request_id",
+    ),
     "http_bridge_rowless_recovery_authorities": (
         "origin_marker_session_id",
         "authorization_mode",
@@ -139,6 +147,7 @@ class DurableBridgeSessionSnapshot:
     last_seen_at: datetime
     closed_at: datetime | None
     latest_pending_tool_calls: dict[str, str] | None = None
+    latest_response_transition_manifest: ResponseTransitionManifest | None = None
     owner_process_epoch: str | None = None
     recovery_required_anchor_hash: str | None = None
     recovery_required_account_id: str | None = None
@@ -664,6 +673,7 @@ class DurableBridgeRepository:
                     existing.latest_input_item_count = None
                     existing.latest_input_full_fingerprint = None
                     existing.latest_pending_tool_calls_json = None
+                    existing.latest_response_transition_manifest_json = None
                 elif owner_changed:
                     if latest_turn_state is not None:
                         existing.latest_turn_state = latest_turn_state
@@ -672,6 +682,7 @@ class DurableBridgeRepository:
                         existing.latest_input_item_count = None
                         existing.latest_input_full_fingerprint = None
                         existing.latest_pending_tool_calls_json = None
+                        existing.latest_response_transition_manifest_json = None
                 else:
                     if latest_turn_state is not None:
                         existing.latest_turn_state = latest_turn_state
@@ -680,6 +691,7 @@ class DurableBridgeRepository:
                         existing.latest_input_item_count = None
                         existing.latest_input_full_fingerprint = None
                         existing.latest_pending_tool_calls_json = None
+                        existing.latest_response_transition_manifest_json = None
                 existing.last_seen_at = now
                 existing.closed_at = None
                 await self._session.commit()
@@ -699,6 +711,7 @@ class DurableBridgeRepository:
         latest_input_item_count: int | None = None,
         latest_input_full_fingerprint: str | None = None,
         latest_pending_tool_calls: Mapping[str, str] | None = None,
+        latest_response_transition_manifest: ResponseTransitionManifest | None = None,
         state: HttpBridgeSessionState | None = None,
     ) -> DurableBridgeSessionSnapshot | None:
         """Renew the lease with a single fenced UPDATE.
@@ -718,6 +731,9 @@ class DurableBridgeRepository:
             values["latest_pending_tool_calls_json"] = _encode_pending_tool_calls(
                 latest_response_id,
                 latest_pending_tool_calls,
+            )
+            values["latest_response_transition_manifest_json"] = encode_response_transition_manifest(
+                latest_response_transition_manifest
             )
             if latest_input_item_count is None or latest_input_full_fingerprint is None:
                 values["latest_input_item_count"] = None
@@ -759,6 +775,7 @@ class DurableBridgeRepository:
                     latest_input_item_count=None,
                     latest_input_full_fingerprint=None,
                     latest_pending_tool_calls_json=None,
+                    latest_response_transition_manifest_json=None,
                 )
             result = await self._session.execute(
                 update(HttpBridgeSessionRecord)
@@ -823,6 +840,7 @@ class DurableBridgeRepository:
             "latest_input_item_count": None,
             "latest_input_full_fingerprint": None,
             "latest_pending_tool_calls_json": None,
+            "latest_response_transition_manifest_json": None,
             "recovery_required_anchor_hash": None,
             "recovery_required_account_id": None,
             "recovery_required_attempt_fingerprint": None,
@@ -1435,6 +1453,7 @@ class DurableBridgeRepository:
                                     latest_input_item_count=None,
                                     latest_input_full_fingerprint=None,
                                     latest_pending_tool_calls_json=None,
+                                    latest_response_transition_manifest_json=None,
                                 )
                                 .returning(HttpBridgeSessionRecord.id)
                             )
@@ -1623,6 +1642,7 @@ class DurableBridgeRepository:
         latest_input_item_count: int | None = None,
         latest_input_full_fingerprint: str | None = None,
         latest_pending_tool_calls: Mapping[str, str] | None = None,
+        latest_response_transition_manifest: ResponseTransitionManifest | None = None,
     ) -> DurableBridgeAliasRegistration:
         """Register continuity only while the caller still owns the durable row."""
 
@@ -1641,6 +1661,9 @@ class DurableBridgeRepository:
                 session_values["latest_pending_tool_calls_json"] = _encode_pending_tool_calls(
                     latest_response_id,
                     latest_pending_tool_calls,
+                )
+                session_values["latest_response_transition_manifest_json"] = encode_response_transition_manifest(
+                    latest_response_transition_manifest
                 )
                 session_values["recovery_required_anchor_hash"] = None
                 session_values["recovery_required_account_id"] = None
@@ -1701,6 +1724,7 @@ class DurableBridgeRepository:
         input_item_count: int,
         input_full_fingerprint: str,
         pending_tool_calls: Mapping[str, str],
+        response_transition_manifest: ResponseTransitionManifest | None,
         lease_ttl_seconds: float,
     ) -> bool:
         """Atomically publish a proof-gated durable-marker recovery checkpoint."""
@@ -1747,6 +1771,9 @@ class DurableBridgeRepository:
             marker.latest_pending_tool_calls_json = _encode_pending_tool_calls(
                 response_id,
                 pending_tool_calls,
+            )
+            marker.latest_response_transition_manifest_json = encode_response_transition_manifest(
+                response_transition_manifest
             )
             marker.recovery_required_anchor_hash = None
             marker.recovery_required_account_id = None
@@ -2176,6 +2203,7 @@ _SNAPSHOT_COLUMNS = (
     HttpBridgeSessionRecord.latest_input_item_count,
     HttpBridgeSessionRecord.latest_input_full_fingerprint,
     HttpBridgeSessionRecord.latest_pending_tool_calls_json,
+    HttpBridgeSessionRecord.latest_response_transition_manifest_json,
     HttpBridgeSessionRecord.recovery_required_anchor_hash,
     HttpBridgeSessionRecord.recovery_required_account_id,
     HttpBridgeSessionRecord.recovery_required_attempt_fingerprint,
@@ -2209,6 +2237,9 @@ def _returned_row_to_snapshot(row: Row[tuple[object, ...]]) -> DurableBridgeSess
         latest_pending_tool_calls=_decode_pending_tool_calls(
             mapping[HttpBridgeSessionRecord.latest_response_id],
             mapping[HttpBridgeSessionRecord.latest_pending_tool_calls_json],
+        ),
+        latest_response_transition_manifest=decode_response_transition_manifest(
+            mapping[HttpBridgeSessionRecord.latest_response_transition_manifest_json]
         ),
         recovery_required_anchor_hash=mapping[HttpBridgeSessionRecord.recovery_required_anchor_hash],
         recovery_required_account_id=mapping[HttpBridgeSessionRecord.recovery_required_account_id],
@@ -2244,6 +2275,9 @@ def _to_snapshot(row: HttpBridgeSessionRecord | None) -> DurableBridgeSessionSna
         latest_pending_tool_calls=_decode_pending_tool_calls(
             row.latest_response_id,
             row.latest_pending_tool_calls_json,
+        ),
+        latest_response_transition_manifest=decode_response_transition_manifest(
+            row.latest_response_transition_manifest_json
         ),
         recovery_required_anchor_hash=row.recovery_required_anchor_hash,
         recovery_required_account_id=row.recovery_required_account_id,

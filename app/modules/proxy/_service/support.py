@@ -22,6 +22,7 @@ from app.core.config.settings import get_settings
 from app.core.errors import OpenAIErrorEnvelope, openai_error
 from app.core.openai.model_registry import get_model_registry
 from app.core.openai.models import OpenAIEvent
+from app.core.openai.public_output import strip_blank_html_comment_lines as _strip_blank_html_comment_lines
 from app.core.plan_types import account_plan_matches_allowed
 from app.core.resilience.network_recovery import PROCESS_NETWORK_UNAVAILABLE_CODE
 from app.core.resilience.overload import is_local_overload_error_code
@@ -39,6 +40,7 @@ from app.modules.proxy.load_balancer import (
     AccountSelection,
     CatalogOmissionQuotaAdmission,
 )
+from app.modules.proxy.response_transition_manifest import ResponseTransitionManifest
 from app.modules.proxy.rowless_recovery import RowlessRecoveryCaptureIntent
 from app.modules.proxy.tool_call_dedupe import ToolCallDedupeKey
 from app.modules.proxy.work_admission import AdmissionLease
@@ -47,7 +49,6 @@ logger = logging.getLogger(__name__)
 
 _REQUEST_TRANSPORT_HTTP = "http"
 _REQUEST_TRANSPORT_WEBSOCKET = "websocket"
-_REASONING_SUMMARY_BLANK_HTML_COMMENT_RE = re.compile(r"(?m)^[ \t]*<!--\s*-->[ \t]*(?:\r?\n|\Z)")
 _TTFT_EVENT_TYPES = frozenset(
     {
         "response.output_text.delta",
@@ -96,19 +97,6 @@ _PROPAGATED_CAPACITY_STARTUP_READY: ContextVar[asyncio.Event | None] = ContextVa
     "propagated_capacity_startup_ready",
     default=None,
 )
-
-
-def _strip_blank_html_comment_lines(text: str) -> str:
-    terminal_match = None
-    for match in _REASONING_SUMMARY_BLANK_HTML_COMMENT_RE.finditer(text):
-        if match.end() == len(text):
-            terminal_match = match
-    cleaned, count = _REASONING_SUMMARY_BLANK_HTML_COMMENT_RE.subn("", text)
-    if count == 0:
-        return text
-    if terminal_match is not None:
-        return cleaned.rstrip("\r\n")
-    return cleaned
 
 
 def _reasoning_summary_delta_key(payload: Mapping[str, JsonValue]) -> tuple[str | None, int | None, int | None]:
@@ -1073,6 +1061,7 @@ class _HTTPBridgeSession:
     last_completed_response_account_id: str | None = None
     last_completed_input_prefix_fingerprint: str | None = None
     last_pending_tool_calls: dict[str, str] = field(default_factory=dict)
+    last_response_transition_manifest: ResponseTransitionManifest | None = None
     # A false value means the completed response's pending-tool manifest was
     # physically verified (including the valid empty-manifest case).  Keep an
     # invalid/unrepresentable live manifest distinct from an empty one so a
@@ -1120,6 +1109,16 @@ class _HTTPBridgeSession:
         if self.liveness_settlement_owner is None:
             self.liveness_settlement_owner = "send"
         return self.liveness_settlement_owner == "send"
+
+
+def _clear_http_bridge_session_response_checkpoint(session: _HTTPBridgeSession) -> None:
+    session.last_completed_response_id = None
+    session.last_completed_response_account_id = None
+    session.last_completed_input_count = 0
+    session.last_completed_input_prefix_fingerprint = None
+    session.last_pending_tool_call_manifest_invalid = False
+    session.last_pending_tool_calls.clear()
+    session.last_response_transition_manifest = None
 
 
 def _complete_http_bridge_handoff(

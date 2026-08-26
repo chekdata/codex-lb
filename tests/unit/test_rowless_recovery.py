@@ -2196,6 +2196,7 @@ async def test_rowless_terminal_persistence_failure_rolls_back_anchor_and_consum
                 input_item_count=captured.captured_input_item_count,
                 input_full_fingerprint=captured.captured_input_fingerprint,
                 pending_tool_calls={},
+                response_transition_manifest=None,
             )
         await session.rollback()
         stored = await repository.get(captured.id)

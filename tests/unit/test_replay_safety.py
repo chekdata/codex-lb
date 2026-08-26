@@ -22,10 +22,12 @@ from app.modules.proxy.replay_safety import (
     project_responses_input_for_account_neutral_fresh_replay,
     responses_input_retains_prior_output_and_root_retry_chain,
     responses_input_suffix_matches_pending_tool_calls,
+    responses_input_suffix_matches_transition_manifest,
     responses_input_suffix_proves_abandoned_pending_agent_boundary,
     responses_input_suffix_retains_prior_output,
     responses_payload_is_account_neutral_fresh_replay,
 )
+from app.modules.proxy.response_transition_manifest import build_response_transition_manifest
 
 
 @pytest.mark.parametrize(
@@ -3085,7 +3087,7 @@ def test_abandoned_pending_boundary_accepts_exact_http_transport_normalized_book
         text="second retry",
     )
     second_user.pop("internal_chat_message_metadata_passthrough")
-    input_items = [
+    input_items: list[JsonValue] = [
         *stored_input,
         reasoning,
         agent_message,
@@ -4934,3 +4936,174 @@ def test_rowless_root_retry_chain_rejects_unproven_tail(invalid_followup: JsonVa
     ]
 
     assert not responses_input_retains_prior_output_and_root_retry_chain(input_items)
+
+
+def _manifest_bound_fourcam_retry() -> tuple[
+    list[JsonValue],
+    int,
+    dict[str, str],
+    Any,
+]:
+    stored_input: list[JsonValue] = [
+        {"type": "message", "role": "user", "content": "sealed stored input"},
+    ]
+    response_output: list[JsonValue] = [
+        {
+            "type": "reasoning",
+            "id": "rs_manifest_fourcam",
+            "encrypted_content": "opaque",
+            "summary": [],
+            "status": "completed",
+        },
+        {
+            "type": "message",
+            "id": "msg_manifest_fourcam",
+            "role": "assistant",
+            "phase": "commentary",
+            "content": [{"type": "output_text", "text": "running checks"}],
+        },
+        {
+            "type": "custom_tool_call",
+            "id": "ctc_manifest_fourcam",
+            "call_id": "call_manifest_fourcam",
+            "name": "shell",
+            "input": "rustfmt --check",
+            "status": "completed",
+        },
+    ]
+    pending = {"call_manifest_fourcam": "custom_tool_call"}
+    manifest = build_response_transition_manifest(
+        {
+            "response": {
+                "id": "resp_manifest_fourcam",
+                "status": "completed",
+                "output": response_output,
+            }
+        },
+        pending_tool_calls=pending,
+    )
+    assert manifest is not None
+    input_items: list[JsonValue] = [
+        *stored_input,
+        *response_output,
+        {
+            "type": "custom_tool_call_output",
+            "id": "ctco_manifest_fourcam",
+            "call_id": "call_manifest_fourcam",
+            "output": "verified",
+            "status": "completed",
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "00000000-0000-4000-8000-000000000301",
+                "create_time": 1.0,
+            },
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000302",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "first retry context"}],
+            "internal_chat_message_metadata_passthrough": {"turn_id": "00000000-0000-4000-8000-000000000303"},
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000304",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "first retry"}],
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "00000000-0000-4000-8000-000000000303",
+                "create_time": 2.0,
+            },
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000305",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "second retry context"}],
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "00000000-0000-4000-8000-000000000306",
+                "create_time": 3.0,
+            },
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000307",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "second retry"}],
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "00000000-0000-4000-8000-000000000306",
+                "create_time": 4.0,
+            },
+        },
+    ]
+    return input_items, len(stored_input), pending, manifest
+
+
+def test_transition_manifest_accepts_completed_output_settlement_and_grouped_retries() -> None:
+    input_items, stored_count, pending, manifest = _manifest_bound_fourcam_retry()
+
+    assert responses_input_suffix_matches_transition_manifest(
+        input_items,
+        stored_count=stored_count,
+        response_id="resp_manifest_fourcam",
+        pending_tool_calls=pending,
+        transition_manifest=manifest,
+    )
+
+
+def test_transition_manifest_accepts_one_plain_responses_user_followup() -> None:
+    input_items, stored_count, pending, manifest = _manifest_bound_fourcam_retry()
+    plain_followup = [*input_items[:5], {"role": "user", "content": "retry"}]
+
+    assert responses_input_suffix_matches_transition_manifest(
+        plain_followup,
+        stored_count=stored_count,
+        response_id="resp_manifest_fourcam",
+        pending_tool_calls=pending,
+        transition_manifest=manifest,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "changed-manifest-item",
+        "reordered-manifest-items",
+        "missing-output",
+        "wrong-output-call",
+        "duplicate-item-id",
+        "orphan-developer-turn",
+        "duplicate-user-in-turn",
+        "unknown-suffix-item",
+    ],
+)
+def test_transition_manifest_rejects_unproven_or_ambiguous_retry(mutation: str) -> None:
+    input_items, stored_count, pending, manifest = _manifest_bound_fourcam_retry()
+    if mutation == "changed-manifest-item":
+        cast(dict[str, JsonValue], input_items[2])["content"] = [{"type": "output_text", "text": "changed"}]
+    elif mutation == "reordered-manifest-items":
+        input_items[1], input_items[2] = input_items[2], input_items[1]
+    elif mutation == "missing-output":
+        input_items.pop(4)
+    elif mutation == "wrong-output-call":
+        cast(dict[str, JsonValue], input_items[4])["call_id"] = "call_other"
+    elif mutation == "duplicate-item-id":
+        cast(dict[str, JsonValue], input_items[4])["id"] = "ctc_manifest_fourcam"
+    elif mutation == "orphan-developer-turn":
+        cast(dict[str, JsonValue], input_items[6])["internal_chat_message_metadata_passthrough"] = {
+            "turn_id": "00000000-0000-4000-8000-000000000399",
+            "create_time": 2.0,
+        }
+    elif mutation == "duplicate-user-in-turn":
+        duplicate = copy.deepcopy(input_items[8])
+        cast(dict[str, JsonValue], duplicate)["id"] = "msg_00000000-0000-4000-8000-000000000308"
+        input_items.append(duplicate)
+    elif mutation == "unknown-suffix-item":
+        input_items.append({"type": "computer_call", "id": "computer_unknown"})
+
+    assert not responses_input_suffix_matches_transition_manifest(
+        input_items,
+        stored_count=stored_count,
+        response_id="resp_manifest_fourcam",
+        pending_tool_calls=pending,
+        transition_manifest=manifest,
+    )

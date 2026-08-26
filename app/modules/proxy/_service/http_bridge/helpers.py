@@ -185,6 +185,7 @@ from app.modules.proxy.helpers import (
     _normalize_error_code,
     _parse_openai_error,
 )
+from app.modules.proxy.response_transition_manifest import ResponseTransitionManifest
 from app.modules.proxy.ring_membership import (
     RING_STALE_THRESHOLD_SECONDS,
     RingMembershipService,
@@ -1926,6 +1927,7 @@ async def _persist_http_bridge_previous_response_alias(
     input_item_count: int | None,
     input_full_fingerprint: str | None,
     pending_tool_calls: Mapping[str, str] | None,
+    response_transition_manifest: ResponseTransitionManifest | None,
     instance_id: str,
     lease_ttl_seconds: float,
     local_alias_was_published: bool = True,
@@ -1942,6 +1944,7 @@ async def _persist_http_bridge_previous_response_alias(
             input_item_count=input_item_count,
             input_full_fingerprint=input_full_fingerprint,
             pending_tool_calls=pending_tool_calls,
+            response_transition_manifest=response_transition_manifest,
         )
     except Exception:
         logger.warning("Failed to persist durable HTTP bridge previous_response_id alias", exc_info=True)

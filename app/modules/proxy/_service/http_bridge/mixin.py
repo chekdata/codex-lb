@@ -155,6 +155,7 @@ from app.modules.proxy._service.support import (
     _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE,
     _HARD_HTTP_BRIDGE_AFFINITY_KINDS,  # noqa: F401
     _WEBSOCKET_FULL_REPLAY_WAIT_POLL_SECONDS,  # noqa: F401
+    _clear_http_bridge_session_response_checkpoint,
     _clear_websocket_precreated_replay_fallback,
     _complete_http_bridge_handoff,
     _copy_websocket_route_metadata_to_session,
@@ -2389,11 +2390,7 @@ class _HTTPBridgeMixin(
             if owner_rebind_affinity is not None or account.id != session.account.id:
                 await self._unregister_http_bridge_turn_states(session)
                 await self._unregister_http_bridge_previous_response_ids(session)
-                session.last_completed_response_id = None
-                session.last_completed_response_account_id = None
-                session.last_completed_input_count = 0
-                session.last_completed_input_prefix_fingerprint = None
-                session.last_pending_tool_calls.clear()
+                _clear_http_bridge_session_response_checkpoint(session)
                 session.affinity = selection_affinity or session.affinity
                 session.codex_session = False
                 session.upstream_turn_state = None

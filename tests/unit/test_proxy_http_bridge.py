@@ -61,6 +61,7 @@ from app.modules.proxy.durable_bridge_repository import (
 )
 from app.modules.proxy.http_bridge_forwarding import OwnerForwardRelayFailure
 from app.modules.proxy.load_balancer import CONTINUITY_OWNER_UNAVAILABLE, CatalogOmissionQuotaAdmission
+from app.modules.proxy.response_transition_manifest import build_response_transition_manifest
 
 pytestmark = pytest.mark.unit
 
@@ -9764,6 +9765,117 @@ def test_verified_durable_full_resend_proof_is_sealed_immutable_and_request_boun
         update={"input": [*stored_input_items, {"role": "user", "content": "follow up"}]}
     )
     assert http_bridge_streaming_module._verify_durable_full_resend(incomplete_payload, durable_lookup) is None
+
+
+def test_verified_durable_full_resend_accepts_manifest_bound_fourcam_shape() -> None:
+    stored_input: list[JsonValue] = [{"type": "message", "role": "user", "content": "stored"}]
+    response_output: list[JsonValue] = [
+        {
+            "type": "reasoning",
+            "id": "rs_manifest_full_resend",
+            "encrypted_content": "opaque",
+            "summary": [],
+            "status": "completed",
+        },
+        {
+            "type": "message",
+            "id": "msg_manifest_full_resend",
+            "role": "assistant",
+            "phase": "commentary",
+            "content": [{"type": "output_text", "text": "checking"}],
+        },
+        {
+            "type": "custom_tool_call",
+            "id": "ctc_manifest_full_resend",
+            "call_id": "call_manifest_full_resend",
+            "name": "shell",
+            "input": "rustfmt --check",
+            "status": "completed",
+        },
+    ]
+    pending = {"call_manifest_full_resend": "custom_tool_call"}
+    manifest = build_response_transition_manifest(
+        {
+            "response": {
+                "id": "resp_manifest_full_resend",
+                "status": "completed",
+                "output": response_output,
+            }
+        },
+        pending_tool_calls=pending,
+    )
+    assert manifest is not None
+    full_input: list[JsonValue] = [
+        *stored_input,
+        *response_output,
+        {
+            "type": "custom_tool_call_output",
+            "id": "ctco_manifest_full_resend",
+            "call_id": "call_manifest_full_resend",
+            "output": "verified",
+            "status": "completed",
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000401",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "retry context"}],
+            "internal_chat_message_metadata_passthrough": {"turn_id": "00000000-0000-4000-8000-000000000402"},
+        },
+        {
+            "type": "message",
+            "id": "msg_00000000-0000-4000-8000-000000000403",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "retry"}],
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "00000000-0000-4000-8000-000000000402",
+                "create_time": 1.0,
+            },
+        },
+    ]
+    payload = proxy_service.ResponsesRequest.model_validate(
+        {"model": "gpt-5.6-sol", "instructions": "continue", "input": full_input}
+    )
+    lookup = proxy_service.DurableBridgeLookup(
+        session_id="sess-manifest-full-resend",
+        canonical_kind="session_header",
+        canonical_key="sid-manifest-full-resend",
+        api_key_scope="__anonymous__",
+        account_id="acc-manifest-full-resend",
+        owner_instance_id=None,
+        owner_epoch=1,
+        lease_expires_at=None,
+        state=HttpBridgeSessionState.CLOSED,
+        latest_turn_state="http_turn_manifest_full_resend",
+        latest_response_id="resp_manifest_full_resend",
+        latest_input_item_count=len(stored_input),
+        latest_input_full_fingerprint=proxy_service._fingerprint_input_items(stored_input),
+        latest_pending_tool_calls=pending,
+        latest_response_transition_manifest=manifest,
+        model="gpt-5.6-sol",
+    )
+
+    proof = http_bridge_streaming_module._verify_durable_full_resend(payload, lookup)
+
+    assert proof is not None
+    assert proof.matches(payload, lookup)
+    changed_output = copy.deepcopy(response_output)
+    cast(dict[str, JsonValue], changed_output[1])["content"] = [{"type": "output_text", "text": "different"}]
+    changed_manifest = build_response_transition_manifest(
+        {
+            "response": {
+                "id": "resp_manifest_full_resend",
+                "status": "completed",
+                "output": changed_output,
+            }
+        },
+        pending_tool_calls=pending,
+    )
+    assert changed_manifest is not None
+    assert not proof.matches(
+        payload,
+        replace(lookup, latest_response_transition_manifest=changed_manifest),
+    )
 
 
 def test_verified_durable_full_resend_accepts_response_bound_pending_tool_calls() -> None:
