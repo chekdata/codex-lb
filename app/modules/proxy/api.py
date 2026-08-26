@@ -6346,6 +6346,9 @@ def _normalize_codex_remote_compaction_v2_result(
             normalized["id"] = payload.id
         if payload.status is not None:
             normalized["status"] = payload.status
+        model = (payload.model_extra or {}).get("model")
+        if isinstance(model, str) and model:
+            normalized["model"] = model
         if payload.usage is not None:
             normalized["usage"] = cast(JsonValue, payload.usage.model_dump(mode="json", exclude_none=True))
         if payload.error is not None:
@@ -6362,6 +6365,9 @@ def _normalize_codex_remote_compaction_v2_result(
         normalized["id"] = payload.id
     if payload.status is not None:
         normalized["status"] = payload.status
+    model = (payload.model_extra or {}).get("model")
+    if isinstance(model, str) and model:
+        normalized["model"] = model
     if payload.usage is not None:
         normalized["usage"] = cast(JsonValue, payload.usage.model_dump(mode="json", exclude_none=True))
     if payload.error is not None:
