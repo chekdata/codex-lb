@@ -1,9 +1,0 @@
-{"type":"session_meta","payload":{"id":"01a00000-0000-7000-8000-000000000001","source":"appServer","session_id":"01a00000-0000-7000-8000-000000000001"}}
-{"type":"turn_context","payload":{"type":"turn_context","thread_id":"01a00000-0000-7000-8000-000000000001"}}
-{"type":"event_msg","payload":{"type":"task_started"}}
-{"type":"response_item","payload":{"type":"message","role":"user","content":"SANITIZED_USER_TEXT"}}
-{"type":"response_item","payload":{"type":"message","role":"assistant","content":"SANITIZED_ASSISTANT_TEXT"}}
-{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"RAW_CALL_ID_MUST_NOT_ESCAPE","name":"sanitized_tool","input":"RAW_ARGUMENT_MUST_NOT_ESCAPE"}}
-{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"RAW_CALL_ID_MUST_NOT_ESCAPE","output":"RAW_OUTPUT_MUST_NOT_ESCAPE"}}
-{"type":"event_msg","payload":{"type":"task_complete","error":null}}
-{"type":"event_msg","payload":{"type":"item_completed"}}

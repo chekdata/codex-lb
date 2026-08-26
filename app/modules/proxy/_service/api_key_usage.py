@@ -26,6 +26,7 @@ from app.modules.api_keys.service import (
 from app.modules.proxy._service.support import (
     _ApiKeyReservationTouchState,
     _consume_api_key_reservation_heartbeat_result,
+    _signal_propagated_responses_service_cleanup_ready,
     _StreamSettlement,
     _WebSocketRequestState,
 )
@@ -306,6 +307,7 @@ class _ApiKeyUsageMixin:
         )
 
         proxy = cast(_ApiKeyUsageServiceProtocol, self)
+        reservation_released = False
         with anyio.CancelScope(shield=True):
             try:
                 async with proxy._repo_factory() as repos:
@@ -321,6 +323,7 @@ class _ApiKeyUsageMixin:
                         )
                     else:
                         await api_keys_service.release_usage_reservation(reservation_id)
+                reservation_released = True
             except Exception as exc:
                 logger.warning(
                     "Failed to settle compact API key reservation key_id=%s request_id=%s",
@@ -332,6 +335,7 @@ class _ApiKeyUsageMixin:
                     async with proxy._repo_factory() as repos:
                         api_keys_service = _service_api_keys_service()(repos.api_keys)
                         await api_keys_service.release_usage_reservation(reservation_id)
+                    reservation_released = True
                 except Exception:
                     logger.warning(
                         "Failed to release compact API key reservation after settlement failure "
@@ -350,7 +354,38 @@ class _ApiKeyUsageMixin:
                     failure_phase="usage_settlement",
                     failure_detail="compact_api_key_usage_persistence_failed",
                     failure_exception_type=type(exc).__name__,
+                    reservation_released=reservation_released,
                 ) from exc
+            finally:
+                _signal_propagated_responses_service_cleanup_ready()
+
+    async def settle_image_api_key_usage(
+        self,
+        api_key: ApiKeyData | None,
+        reservation: ApiKeyUsageReservationData | None,
+        *,
+        model: str,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        cached_input_tokens: int | None,
+        request_id: str,
+    ) -> bool:
+        """Transfer captured image usage to tracked reservation settlement."""
+        has_usage = input_tokens is not None or output_tokens is not None
+        settlement = _StreamSettlement(
+            status="success" if has_usage else "failed",
+            model=model,
+            input_tokens=int(input_tokens or 0) if has_usage else None,
+            output_tokens=int(output_tokens or 0) if has_usage else None,
+            cached_input_tokens=int(cached_input_tokens or 0) if has_usage else None,
+            service_tier=None,
+        )
+        return await self._settle_stream_api_key_usage(
+            api_key,
+            reservation,
+            settlement,
+            request_id=request_id,
+        )
 
     async def _settle_stream_api_key_usage(
         self,

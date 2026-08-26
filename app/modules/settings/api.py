@@ -20,6 +20,7 @@ from app.core.auth.dependencies import (
     validate_dashboard_session,
 )
 from app.core.clients.http import _build_ssl_context
+from app.core.config.settings import get_settings as get_app_settings
 from app.core.config.settings_cache import get_settings_cache
 from app.core.crypto import TokenEncryptor
 from app.core.exceptions import DashboardBadRequestError, DashboardSettingsConflictError
@@ -412,7 +413,10 @@ async def _validate_proxy_pool_id(context: SettingsContext, pool_id: str | None)
 
 async def _get_account_or_error(context: SettingsContext, account_id: str) -> Account:
     account = await context.session.get(Account, account_id)
-    if account is None:
+    # An account marked for background deletion is already deleted from the
+    # operator's point of view: binding mutations must report not-found, as
+    # the synchronous delete did once the row was removed.
+    if account is None or account.delete_requested_at is not None:
         raise DashboardBadRequestError("Account not found", code="account_not_found")
     return account
 
@@ -562,6 +566,19 @@ async def update_settings(
         and payload.upstream_proxy_default_pool_id is not None
     ):
         await _validate_proxy_pool_id(context, payload.upstream_proxy_default_pool_id)
+    if (
+        payload.auto_redeem_reset_credits_before_expiry
+        and not current.auto_redeem_reset_credits_before_expiry
+        and not get_app_settings().rate_limit_reset_credits_refresh_enabled
+    ):
+        # The reset-credit refresh loop is the sole driver of automatic
+        # redemption; accepting the opt-in while polling is disabled would
+        # persist a setting that can never run.
+        raise DashboardBadRequestError(
+            "autoRedeemResetCreditsBeforeExpiry requires reset-credit polling; "
+            "set CODEX_LB_RATE_LIMIT_RESET_CREDITS_REFRESH_ENABLED=true first",
+            code="reset_credit_polling_disabled",
+        )
     try:
         legacy_threshold_provided = payload.sticky_reallocation_budget_threshold_pct is not None
         primary_threshold_provided = payload.sticky_reallocation_primary_budget_threshold_pct is not None

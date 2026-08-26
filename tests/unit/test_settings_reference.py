@@ -51,14 +51,25 @@ ENV_EXAMPLE_PATH = REPO_ROOT / ".env.example"
 # gate, issue #1535). Not a hardcoded default because the right congestion
 # threshold depends on pool size and workload mix, and 0-means-off is the P1
 # default-off switch; the companion min-guarantee constant stayed hardcoded.
-# 117 -> 118: http_responses_session_bridge_anchor_poison_failure_threshold
-# (bridge restart anchor poisoning). Not hardcoded because operators need a
-# bounded deployment-specific poison threshold while recovery telemetry matures.
-# 118 -> 119: database_postgres_schema. Shared-database deployments need one
-# explicit schema knob so runtime engines, migration jobs, and schema gates use
-# the same non-public search_path; there is no safe fixed default when a single
-# PostgreSQL database is reused by multiple applications.
-MAX_SETTINGS_FIELDS = 119
+# 117 -> 126: durable HTTP bridge continuity controls (operation ledger,
+# ambiguous-continuation recovery, and best-effort transcript spool, #1657).
+# These remain operator-selectable because deployments differ in recovery
+# safety policy and available persistence/latency budgets; their conservative
+# defaults preserve fail-closed behavior and bound background write work.
+# 126 -> 127: rate_limit_reset_credits_refresh_enabled (reset-credit polling
+# toggle, #1701). Not a hardcoded default because "off" is a deployment
+# decision — operators who don't use the reset-credit surface shed the
+# per-replica authenticated upstream polling; default true keeps current
+# zero-config behavior and the interval setting alone cannot express "off".
+# 127 -> 129: telemetry_enabled + telemetry_endpoint (anonymous telemetry,
+# #1618). telemetry_enabled has no hardcoded default because tri-state None
+# drives the informed-consent dialog; the endpoint stays settable so
+# self-hosters can point at their own collector or air-gap it.
+# 129 -> 130: timeout_invariant_validation_strict (#1622). This stays
+# operator-selectable because startup invariant failures need two supported
+# modes: report-only by default for mixed/self-hosted environments, and
+# fail-fast when CI or strict operators want config drift to abort startup.
+MAX_SETTINGS_FIELDS = 132
 
 
 def test_generated_settings_reference_matches_code() -> None:
@@ -72,6 +83,7 @@ def test_generated_settings_reference_matches_code() -> None:
 def test_settings_reference_page_is_checked_in_under_docs() -> None:
     assert OUTPUT_PATH == REPO_ROOT / "docs" / "reference" / "settings.md"
     assert OUTPUT_PATH.is_file()
+    assert "openspec/specs/responses-api-compat" in render_settings_reference()
 
 
 def test_settings_surface_ratchet() -> None:

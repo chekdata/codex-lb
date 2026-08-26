@@ -37,6 +37,8 @@ import {
   createQuotaPlannerSettings,
   createQuotaPlannerWarmupActionResponse,
   createRequestLogFilterOptions,
+  createTelemetryConsent,
+  createTelemetrySnapshotEnvelope,
   createUpstreamProxyAdmin,
   createRequestLogsResponse,
   type DashboardAuthSession,
@@ -46,11 +48,12 @@ import {
   type QuotaPlannerForecast,
   type QuotaPlannerSettings,
   type RequestLogEntry,
+  type TelemetryConsent,
   type UpstreamProxyAdmin,
 } from "@/test/mocks/factories";
 
 const MODEL_OPTION_DELIMITER = ":::";
-const STATUS_ORDER = ["ok", "rate_limit", "quota", "error"] as const;
+const STATUS_ORDER = ["ok", "cancelled", "rate_limit", "quota", "error"] as const;
 
 // ── Zod schemas for mock request bodies ──
 
@@ -93,6 +96,10 @@ const ApiKeyUpdatePayloadSchema = z.looseObject({
 
 const AccountAliasPayloadSchema = z.object({
   alias: z.string().max(255).nullable(),
+});
+
+const TelemetryConsentPayloadSchema = z.object({
+  enabled: z.boolean(),
 });
 
 const AccountRoutingPolicyPayloadSchema = z.object({
@@ -155,6 +162,7 @@ const ModelSourceCreatePayloadSchema = z.looseObject({
   supportsChatCompletions: z.boolean().optional(),
   supportsResponses: z.boolean().optional(),
   supportsAudioTranscriptions: z.boolean().optional(),
+  supportsEmbeddings: z.boolean().optional(),
   models: z
     .array(
       z.looseObject({
@@ -172,6 +180,7 @@ const ModelSourceCreatePayloadSchema = z.looseObject({
 
 const ModelSourceUpdatePayloadSchema = z.looseObject({
   isEnabled: z.boolean().optional(),
+  supportsEmbeddings: z.boolean().optional(),
 });
 
 const QuotaPlannerSettingsPayloadSchema = z.looseObject({
@@ -248,6 +257,7 @@ type MockState = {
   conversationDetails: ConversationDetails[];
   authSession: DashboardAuthSession;
   settings: DashboardSettings;
+  telemetryConsent: TelemetryConsent;
   quotaPlannerSettings: QuotaPlannerSettings;
   quotaPlannerDecisions: QuotaPlannerDecision[];
   upstreamProxyAdmin: UpstreamProxyAdmin;
@@ -340,6 +350,7 @@ function createInitialState(): MockState {
     ],
     authSession: createDashboardAuthSession(),
     settings: createDashboardSettings(),
+    telemetryConsent: createTelemetryConsent(),
     quotaPlannerSettings: createQuotaPlannerSettings(),
     quotaPlannerDecisions: [createQuotaPlannerDecision()],
     upstreamProxyAdmin: createUpstreamProxyAdmin(),
@@ -1198,7 +1209,31 @@ export const handlers = [
     return HttpResponse.json(state.settings);
   }),
 
+  http.get("/api/settings/telemetry", ({ request }) => {
+    // include_preview=true is the on-demand path: the envelope is attached
+    // regardless of consent state.
+    if (new URL(request.url).searchParams.get("include_preview") === "true") {
+      return HttpResponse.json({
+        ...state.telemetryConsent,
+        preview: createTelemetrySnapshotEnvelope(),
+      });
+    }
+    return HttpResponse.json(state.telemetryConsent);
+  }),
 
+  http.put("/api/settings/telemetry", async ({ request }) => {
+    const payload = await parseJsonBody(request, TelemetryConsentPayloadSchema);
+    if (!payload) {
+      return HttpResponse.json(state.telemetryConsent);
+    }
+    state.telemetryConsent = createTelemetryConsent({
+      state: payload.enabled ? "enabled" : "disabled",
+      source: "persisted",
+      active: payload.enabled,
+      preview: null,
+    });
+    return HttpResponse.json(state.telemetryConsent);
+  }),
 
   http.get("/api/settings/upstream-proxy", () => {
     return HttpResponse.json(state.upstreamProxyAdmin);
@@ -2088,6 +2123,7 @@ export const handlers = [
       supportsChatCompletions: payload?.supportsChatCompletions ?? true,
       supportsResponses: payload?.supportsResponses ?? false,
       supportsAudioTranscriptions: payload?.supportsAudioTranscriptions ?? false,
+      supportsEmbeddings: payload?.supportsEmbeddings ?? false,
       models: (payload?.models ?? [{ model: `model-${sequence}` }]).map(
         (model, index) => ({
           id: index + 1,
@@ -2127,6 +2163,9 @@ export const handlers = [
     const updated = createModelSource({
       ...existing,
       ...(payload?.isEnabled !== undefined ? { isEnabled: payload.isEnabled } : {}),
+      ...(payload?.supportsEmbeddings !== undefined
+        ? { supportsEmbeddings: payload.supportsEmbeddings }
+        : {}),
       updatedAt: new Date().toISOString(),
     });
     state.modelSources = state.modelSources.map((source) =>

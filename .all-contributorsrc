@@ -1224,14 +1224,93 @@
       ]
     },
     {
-      "login": "hongzexin",
-      "name": "Jason HONG",
-      "avatar_url": "https://avatars.githubusercontent.com/u/136784169?v=4",
-      "profile": "https://github.com/hongzexin",
+      "login": "kidclone3",
+      "name": "DuyBui",
+      "avatar_url": "https://avatars.githubusercontent.com/u/54184969?v=4",
+      "profile": "https://github.com/kidclone3",
+      "contributions": [
+        "code",
+        "test"
+      ]
+    },
+    {
+      "login": "kevinsslin",
+      "name": "Kevin Lin",
+      "avatar_url": "https://avatars.githubusercontent.com/u/86810837?v=4",
+      "profile": "https://github.com/kevinsslin",
+      "contributions": [
+        "code",
+        "test"
+      ]
+    },
+    {
+      "login": "Borealin",
+      "name": "Borealin",
+      "avatar_url": "https://avatars.githubusercontent.com/u/41241077?v=4",
+      "profile": "https://github.com/Borealin",
+      "contributions": [
+        "code",
+        "test"
+      ]
+    },
+    {
+      "login": "BrenticusMaximus",
+      "name": "BrenticusMaximus",
+      "avatar_url": "https://avatars.githubusercontent.com/u/32489248?v=4",
+      "profile": "https://github.com/BrenticusMaximus",
+      "contributions": [
+        "code",
+        "test"
+      ]
+    },
+    {
+      "login": "sakthimaran-venom",
+      "name": "Sakthimaran",
+      "avatar_url": "https://avatars.githubusercontent.com/u/233523816?v=4",
+      "profile": "https://github.com/sakthimaran-venom",
+      "contributions": [
+        "code",
+        "test"
+      ]
+    },
+    {
+      "login": "evan-choi",
+      "name": "Evan",
+      "avatar_url": "https://avatars.githubusercontent.com/u/9690415?v=4",
+      "profile": "https://github.com/evan-choi",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "chaoxu",
+      "name": "Chao Xu",
+      "avatar_url": "https://avatars.githubusercontent.com/u/18860?v=4",
+      "profile": "https://chaoxu.prof/",
+      "contributions": [
+        "code",
+        "test"
+      ]
+    },
+    {
+      "login": "zenasharp",
+      "name": "zenasharp",
+      "avatar_url": "https://avatars.githubusercontent.com/u/170236008?v=4",
+      "profile": "https://github.com/zenasharp",
       "contributions": [
         "code",
         "test",
         "doc"
+      ]
+    },
+    {
+      "login": "hanseo0507",
+      "name": "HanSu Lee",
+      "avatar_url": "https://avatars.githubusercontent.com/u/56479293?v=4",
+      "profile": "https://github.com/hanseo0507",
+      "contributions": [
+        "code",
+        "test"
       ]
     }
   ],

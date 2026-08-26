@@ -261,6 +261,18 @@ async def test_v1_models_uses_bootstrap_models_when_registry_not_populated(async
     assert ids == BOOTSTRAP_MODEL_SLUGS
     assert "gpt-5.5-pro" not in ids
 
+    # The raised GPT-5.6 ceiling is a Codex-native field. /v1 input budgets
+    # stay on ``context_window`` so OpenAI-compatible clients keep packing to
+    # the 272k default instead of the 872k ``max_context_window`` ceiling.
+    entries = {item["id"]: item for item in payload["data"]}
+    for slug in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+        entry = entries[slug]
+        assert entry["metadata"]["context_window"] == 272_000
+        assert entry["metadata"]["input_context_window"] == 272_000
+        assert entry["capabilities"]["context_length"] == 272_000
+        assert entry["context_length"] == 272_000
+        assert entry["contextLength"] == 272_000
+
 
 @pytest.mark.asyncio
 async def test_backend_codex_models_uses_bootstrap_upstream_metadata(async_client):
@@ -281,7 +293,7 @@ async def test_backend_codex_models_uses_bootstrap_upstream_metadata(async_clien
 
     sol = entries["gpt-5.6-sol"]
     assert sol["display_name"] == "GPT-5.6-Sol"
-    assert sol["context_window"] == 372_000
+    assert sol["context_window"] == 272_000
     assert sol["default_reasoning_level"] == "low"
     assert {level["effort"] for level in sol["supported_reasoning_levels"]} == {
         "low",
@@ -314,10 +326,14 @@ async def test_backend_codex_models_uses_bootstrap_upstream_metadata(async_clien
         "max",
     }
 
-    # Upstream-exact GPT-5.6 metadata as served on the Codex catalog wire
-    # (codex-rs/models-manager/models.json at rust-v0.144.1).
+    # Reproducible upstream catalog evidence:
+    # codex-rs/models-manager/models.json at rust-v0.145.0, except
+    # ``max_context_window``: raised to 872000 in openai/codex commit
+    # 2eee483e49f88b868f67364134a658b3298e6c14 (openai/codex#39102), which no
+    # rust-v* release tag carries yet.
     for gpt56 in (sol, terra, luna):
         assert gpt56["minimal_client_version"] == "0.144.0"
+        assert gpt56["context_window"] == 272_000
         assert gpt56["tool_mode"] == "code_mode_only"
         assert gpt56["use_responses_lite"] is True
         assert gpt56["apply_patch_tool_type"] == "freeform"
@@ -327,7 +343,8 @@ async def test_backend_codex_models_uses_bootstrap_upstream_metadata(async_clien
         assert gpt56["reasoning_summary_format"] == "experimental"
         assert gpt56["comp_hash"] == "3000"
         assert gpt56["experimental_supported_tools"] == []
-        assert gpt56["max_context_window"] == 372_000
+        assert gpt56["max_context_window"] == 872_000
+        assert gpt56["max_context_window"] > gpt56["context_window"]
         assert gpt56["service_tiers"] == [
             {"id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"}
         ]
@@ -795,6 +812,37 @@ async def test_backend_codex_models_unions_service_tiers_across_accounts(async_c
     tier_slugs = {t.get("slug") for t in (model.get("service_tiers") or [])}
     assert "fast" in tier_slugs
     assert "fast" in (model.get("additional_speed_tiers") or [])
+
+
+@pytest.mark.asyncio
+async def test_backend_codex_models_filters_unknown_reasoning_efforts(async_client):
+    registry = get_model_registry()
+    model = replace(
+        _make_upstream_model(
+            "source-gpt",
+            raw={
+                "shell_type": "shell_command",
+                "visibility": "list",
+            },
+        ),
+        supported_reasoning_levels=tuple(
+            ReasoningLevel(effort=effort, description=effort)
+            for effort in ("none", "high", "provider-specific", "ultra")
+        ),
+        default_reasoning_level="provider-specific",
+    )
+    await registry.update({"plus": [model], "pro": [model]})
+
+    resp = await async_client.get("/backend-api/codex/models")
+
+    assert resp.status_code == 200
+    entry = next(m for m in resp.json()["models"] if m["slug"] == "source-gpt")
+    assert [level["effort"] for level in entry["supported_reasoning_levels"]] == [
+        "none",
+        "high",
+        "ultra",
+    ]
+    assert entry["default_reasoning_level"] is None
 
 
 @pytest.mark.asyncio
@@ -1363,10 +1411,74 @@ async def test_model_context_window_override(async_client, monkeypatch):
     v1_entry = next(m for m in resp_v1.json()["data"] if m["id"] == "gpt-5.4")
     metadata = v1_entry["metadata"]
     assert metadata["context_window"] == 515000
-    assert metadata["input_context_window"] == 272000
-    assert v1_entry["capabilities"]["context_length"] == 272000
-    assert v1_entry["contextLength"] == 272000
-    assert v1_entry["context_length"] == 272000
+    # An explicit operator override is the reported input budget too: generic
+    # OpenAI-compatible clients read `context_length`/`contextLength` and would
+    # otherwise cap themselves at the un-overridden upstream window.
+    assert metadata["input_context_window"] == 515000
+    assert v1_entry["capabilities"]["context_length"] == 515000
+    assert v1_entry["contextLength"] == 515000
+    assert v1_entry["context_length"] == 515000
+
+
+@pytest.mark.asyncio
+async def test_model_context_window_override_clamped_to_max_context_window(async_client, monkeypatch):
+    registry = get_model_registry()
+    models = [_make_upstream_model("gpt-5.4", raw=_raw_with_max_context_window(872_000))]
+    await registry.update({"pro": models})
+
+    from app.core.config.settings import get_settings
+    from app.modules.proxy import api as proxy_api_module
+
+    patched = get_settings().model_copy(update={"model_context_window_overrides": {"gpt-5.4": 1_000_000}})
+    monkeypatch.setattr(proxy_api_module, "get_settings", lambda: patched)
+
+    resp_v1 = await async_client.get("/v1/models")
+    assert resp_v1.status_code == 200
+    v1_entry = next(m for m in resp_v1.json()["data"] if m["id"] == "gpt-5.4")
+
+    # The reported input budget never exceeds the upstream-declared ceiling, and
+    # `metadata.context_window` reports the same clamped value: the override is
+    # resolved once, so the clamp cannot reintroduce a dual-budget split.
+    assert v1_entry["metadata"]["context_window"] == 872_000
+    assert v1_entry["metadata"]["input_context_window"] == 872_000
+    assert v1_entry["capabilities"]["context_length"] == 872_000
+    assert v1_entry["contextLength"] == 872_000
+    assert v1_entry["context_length"] == 872_000
+
+    # The Codex-native catalog shares the same single resolution.
+    resp_codex = await async_client.get("/backend-api/codex/models")
+    assert resp_codex.status_code == 200
+    native_entry = next(m for m in resp_codex.json()["models"] if m["slug"] == "gpt-5.4")
+    assert native_entry["context_window"] == 872_000
+    assert native_entry["max_context_window"] == 872_000
+
+
+@pytest.mark.asyncio
+async def test_model_context_window_override_applies_to_codex_models_data_alias(async_client, monkeypatch):
+    registry = get_model_registry()
+    models = [_make_upstream_model("gpt-5.4")]
+    await registry.update({"pro": models})
+
+    from app.core.config.settings import get_settings
+    from app.modules.proxy import api as proxy_api_module
+
+    patched = get_settings().model_copy(update={"model_context_window_overrides": {"gpt-5.4": 515_000}})
+    monkeypatch.setattr(proxy_api_module, "get_settings", lambda: patched)
+
+    # The OpenAI-compatible `data` alias on /backend-api/codex/models is built
+    # from the same list-item shape as /v1/models, so the override reaches its
+    # context_length-family fields too (pinned: both views advertise one budget).
+    resp = await async_client.get("/backend-api/codex/models")
+    assert resp.status_code == 200
+    payload = resp.json()
+    native_entry = next(m for m in payload["models"] if m["slug"] == "gpt-5.4")
+    assert native_entry["context_window"] == 515_000
+    alias_item = next(m for m in payload["data"] if m["id"] == "gpt-5.4")
+    assert alias_item["metadata"]["context_window"] == 515_000
+    assert alias_item["metadata"]["input_context_window"] == 515_000
+    assert alias_item["capabilities"]["context_length"] == 515_000
+    assert alias_item["contextLength"] == 515_000
+    assert alias_item["context_length"] == 515_000
 
 
 @pytest.mark.asyncio

@@ -16,14 +16,15 @@ from app.modules.proxy.continuity import is_http_bridge_account_neutral_replay
 from app.modules.proxy.durable_bridge_repository import (
     DurableBridgeAliasRegistration,
     DurableBridgeAliasRegistrationReceipt,
+    DurableBridgeOperationEventInput,
+    DurableBridgeOperationSnapshot,
     DurableBridgeRecoveryAttemptSnapshot,
     DurableBridgeRepository,
     DurableBridgeRetryCircuitSnapshot,
     DurableBridgeSessionSnapshot,
+    DurableBridgeTranscriptTurn,
     durable_bridge_api_key_scope,
-    durable_bridge_hash,
 )
-from app.modules.proxy.response_transition_manifest import ResponseTransitionManifest
 
 _DURABLE_TURN_STATE_ALIAS = "turn_state"
 _DURABLE_PREVIOUS_RESPONSE_ALIAS = "previous_response_id"
@@ -47,13 +48,7 @@ class DurableBridgeLookup:
     latest_input_full_fingerprint: str | None = None
     model: str | None = None
     latest_pending_tool_calls: dict[str, str] | None = None
-    latest_response_transition_manifest: ResponseTransitionManifest | None = None
     owner_process_epoch: str | None = None
-    recovery_required_anchor_hash: str | None = None
-    recovery_required_account_id: str | None = None
-    recovery_required_attempt_fingerprint: str | None = None
-    recovery_required_attempt_request_id: str | None = None
-    recovery_required_at: datetime | None = None
 
     def lease_is_active(self, *, now: datetime) -> bool:
         if self.owner_instance_id is None:
@@ -65,14 +60,6 @@ class DurableBridgeLookup:
         # UTC. Normalize both sides — comparing them raw raises TypeError
         # on the anchored-lookup hot path.
         return to_utc_naive(self.lease_expires_at) > to_utc_naive(now)
-
-    def recovery_is_required_for_latest_anchor(self) -> bool:
-        return bool(
-            self.latest_response_id is not None
-            and self.account_id is not None
-            and self.recovery_required_anchor_hash == durable_bridge_hash(self.latest_response_id)
-            and self.recovery_required_account_id == self.account_id
-        )
 
 
 class DurableBridgeSessionCoordinator:
@@ -320,8 +307,6 @@ class DurableBridgeSessionCoordinator:
         allow_takeover: bool,
         owner_process_epoch: str,
         force_owner_epoch_advance: bool = False,
-        expected_takeover_owner_instance_id: str | None = None,
-        expected_takeover_owner_process_epoch: str | None = None,
     ) -> DurableBridgeLookup:
         api_key_scope = durable_bridge_api_key_scope(api_key_id)
         async with self._session() as session:
@@ -339,8 +324,6 @@ class DurableBridgeSessionCoordinator:
                 allow_takeover=allow_takeover,
                 owner_process_epoch=owner_process_epoch,
                 force_owner_epoch_advance=force_owner_epoch_advance,
-                expected_takeover_owner_instance_id=expected_takeover_owner_instance_id,
-                expected_takeover_owner_process_epoch=expected_takeover_owner_process_epoch,
             )
         return _to_lookup(snapshot)
 
@@ -357,7 +340,6 @@ class DurableBridgeSessionCoordinator:
         latest_input_item_count: int | None = None,
         latest_input_full_fingerprint: str | None = None,
         latest_pending_tool_calls: Mapping[str, str] | None = None,
-        latest_response_transition_manifest: ResponseTransitionManifest | None = None,
         state: HttpBridgeSessionState | None = None,
     ) -> DurableBridgeLookup | None:
         del api_key_id
@@ -372,7 +354,6 @@ class DurableBridgeSessionCoordinator:
                 latest_input_item_count=latest_input_item_count,
                 latest_input_full_fingerprint=latest_input_full_fingerprint,
                 latest_pending_tool_calls=latest_pending_tool_calls,
-                latest_response_transition_manifest=latest_response_transition_manifest,
                 state=state,
             )
         if snapshot is None:
@@ -435,96 +416,6 @@ class DurableBridgeSessionCoordinator:
             return None
         return _to_lookup(snapshot)
 
-    async def mark_live_session_recovery_required(
-        self,
-        *,
-        session_id: str,
-        instance_id: str,
-        owner_epoch: int,
-        account_id: str,
-        rejected_response_id: str,
-    ) -> bool:
-        async with self._session() as session:
-            return await DurableBridgeRepository(session).mark_recovery_required(
-                session_id=session_id,
-                instance_id=instance_id,
-                owner_epoch=owner_epoch,
-                account_id=account_id,
-                rejected_response_id=rejected_response_id,
-            )
-
-    async def claim_live_session_recovery_attempt(
-        self,
-        *,
-        session_id: str,
-        instance_id: str,
-        owner_epoch: int,
-        account_id: str,
-        rejected_response_id: str,
-        attempt_fingerprint: str,
-        request_id: str,
-    ) -> bool:
-        async with self._session() as session:
-            return await DurableBridgeRepository(session).claim_recovery_required_attempt(
-                session_id=session_id,
-                instance_id=instance_id,
-                owner_epoch=owner_epoch,
-                account_id=account_id,
-                rejected_response_id=rejected_response_id,
-                attempt_fingerprint=attempt_fingerprint,
-                request_id=request_id,
-            )
-
-    async def rollback_live_session_recovery_attempt_before_dispatch(
-        self,
-        *,
-        session_id: str,
-        api_key_id: str | None,
-        instance_id: str,
-        owner_epoch: int,
-        account_id: str,
-        attempt_fingerprint: str,
-        request_id: str,
-        journal_request_id: str,
-    ) -> bool:
-        async with self._session() as session:
-            return await DurableBridgeRepository(session).rollback_recovery_required_attempt_before_dispatch(
-                session_id=session_id,
-                api_key_scope=durable_bridge_api_key_scope(api_key_id),
-                instance_id=instance_id,
-                owner_epoch=owner_epoch,
-                account_id=account_id,
-                attempt_fingerprint=attempt_fingerprint,
-                request_id=request_id,
-                journal_request_id=journal_request_id,
-            )
-
-    async def claim_and_record_live_session_recovery_attempt(
-        self,
-        *,
-        session_id: str,
-        instance_id: str,
-        owner_epoch: int,
-        account_id: str,
-        rejected_response_id: str,
-        attempt_fingerprint: str,
-        claim_request_id: str,
-        journal_request_id: str,
-        model: str | None,
-    ) -> DurableBridgeRecoveryAttemptSnapshot | None:
-        async with self._session() as session:
-            return await DurableBridgeRepository(session).claim_recovery_required_attempt_with_journal(
-                session_id=session_id,
-                instance_id=instance_id,
-                owner_epoch=owner_epoch,
-                account_id=account_id,
-                rejected_response_id=rejected_response_id,
-                attempt_fingerprint=attempt_fingerprint,
-                claim_request_id=claim_request_id,
-                journal_request_id=journal_request_id,
-                model=model,
-            )
-
     async def record_recovery_attempt(
         self,
         *,
@@ -583,42 +474,6 @@ class DurableBridgeSessionCoordinator:
                 response_id=response_id,
             )
 
-    async def settle_marker_recovery_completed(
-        self,
-        *,
-        session_id: str,
-        api_key_id: str | None,
-        instance_id: str,
-        owner_epoch: int,
-        account_id: str,
-        request_fingerprint: str,
-        claim_request_id: str,
-        request_id: str,
-        response_id: str,
-        input_item_count: int,
-        input_full_fingerprint: str,
-        pending_tool_calls: Mapping[str, str],
-        response_transition_manifest: ResponseTransitionManifest | None,
-        lease_ttl_seconds: float,
-    ) -> bool:
-        async with self._session() as session:
-            return await DurableBridgeRepository(session).settle_marker_recovery_completed(
-                session_id=session_id,
-                api_key_scope=durable_bridge_api_key_scope(api_key_id),
-                instance_id=instance_id,
-                owner_epoch=owner_epoch,
-                account_id=account_id,
-                request_fingerprint=request_fingerprint,
-                claim_request_id=claim_request_id,
-                request_id=request_id,
-                response_id=response_id,
-                input_item_count=input_item_count,
-                input_full_fingerprint=input_full_fingerprint,
-                pending_tool_calls=pending_tool_calls,
-                response_transition_manifest=response_transition_manifest,
-                lease_ttl_seconds=lease_ttl_seconds,
-            )
-
     async def rollback_recovery_attempt_replayed(
         self,
         *,
@@ -634,6 +489,317 @@ class DurableBridgeSessionCoordinator:
                 session_id=session_id,
                 instance_id=instance_id,
                 owner_epoch=owner_epoch,
+                request_fingerprint=request_fingerprint,
+            )
+
+    async def rollback_recovery_attempt_before_dispatch(
+        self,
+        *,
+        session_id: str,
+        api_key_id: str | None,
+        instance_id: str,
+        owner_epoch: int,
+        request_fingerprint: str,
+    ) -> bool:
+        del api_key_id
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).rollback_recovery_attempt_before_dispatch(
+                session_id=session_id,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+                request_fingerprint=request_fingerprint,
+            )
+
+    async def record_operation(
+        self,
+        *,
+        operation_id: str,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        request_fingerprint: str,
+        account_id: str | None,
+        model: str | None,
+        parent_response_id: str | None,
+        api_key_scope: str | None = None,
+        request_text: str | None = None,
+        recovery_attempt_session_id: str | None = None,
+        recovery_attempt_owner_epoch: int | None = None,
+        recovery_attempt_fingerprint: str | None = None,
+        recovery_attempt_consumed: bool = False,
+    ) -> DurableBridgeOperationSnapshot | None:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).record_operation(
+                operation_id=operation_id,
+                session_id=session_id,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+                request_fingerprint=request_fingerprint,
+                api_key_scope=api_key_scope,
+                account_id=account_id,
+                model=model,
+                parent_response_id=parent_response_id,
+                request_text=request_text,
+                recovery_attempt_session_id=recovery_attempt_session_id,
+                recovery_attempt_owner_epoch=recovery_attempt_owner_epoch,
+                recovery_attempt_fingerprint=recovery_attempt_fingerprint,
+                recovery_attempt_consumed=recovery_attempt_consumed,
+            )
+
+    async def get_operation_events(self, *, operation_id: str) -> list[str]:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).get_operation_events(operation_id=operation_id)
+
+    async def get_replayable_transcript(
+        self,
+        *,
+        response_id: str,
+        max_turns: int = 128,
+        max_bytes: int = 8 * 1024 * 1024,
+    ) -> list[DurableBridgeTranscriptTurn] | None:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).get_replayable_transcript(
+                response_id=response_id,
+                max_turns=max_turns,
+                max_bytes=max_bytes,
+            )
+
+    async def purge_operation_spool(self, *, cutoff: datetime, batch_size: int = 500) -> int:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).purge_operation_spool(
+                cutoff=cutoff,
+                batch_size=batch_size,
+            )
+
+    async def append_operation_event(
+        self,
+        *,
+        operation_id: str,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        event_text: str,
+        max_bytes: int,
+    ) -> bool:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).append_operation_event(
+                operation_id=operation_id,
+                session_id=session_id,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+                event_text=event_text,
+                max_bytes=max_bytes,
+            )
+
+    async def append_terminal_operation_event(
+        self,
+        *,
+        operation_id: str,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        event_text: str,
+        max_bytes: int,
+        state: str,
+        expected_recovery_dispatch_count: int = 0,
+        response_id: str | None = None,
+    ) -> bool:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).append_terminal_operation_event(
+                operation_id=operation_id,
+                session_id=session_id,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+                event_text=event_text,
+                max_bytes=max_bytes,
+                state=state,
+                expected_recovery_dispatch_count=expected_recovery_dispatch_count,
+                response_id=response_id,
+            )
+
+    async def append_operation_events(
+        self,
+        *,
+        events: Sequence[DurableBridgeOperationEventInput],
+        max_bytes: int,
+    ) -> bool:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).append_operation_events(
+                events=events,
+                max_bytes=max_bytes,
+            )
+
+    async def finalize_operation_event_spool(
+        self,
+        *,
+        operation_id: str,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+    ) -> bool:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).finalize_operation_event_spool(
+                operation_id=operation_id,
+                session_id=session_id,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+            )
+
+    async def settle_terminal_append_failure(
+        self,
+        *,
+        operation_id: str,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        state: str,
+        expected_response_id: str | None,
+        expected_recovery_dispatch_count: int = 0,
+        alternate_expected_response_id: str | None = None,
+        response_id: str | None = None,
+    ) -> bool:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).settle_terminal_append_failure(
+                operation_id=operation_id,
+                session_id=session_id,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+                state=state,
+                expected_response_id=expected_response_id,
+                expected_recovery_dispatch_count=expected_recovery_dispatch_count,
+                alternate_expected_response_id=alternate_expected_response_id,
+                response_id=response_id,
+            )
+
+    async def update_operation(
+        self,
+        *,
+        operation_id: str,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        state: str,
+        response_id: str | None = None,
+    ) -> bool:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).update_operation(
+                operation_id=operation_id,
+                session_id=session_id,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+                state=state,
+                response_id=response_id,
+            )
+
+    async def get_operation(self, *, operation_id: str) -> DurableBridgeOperationSnapshot | None:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).get_operation(operation_id=operation_id)
+
+    async def reset_operation_event_spool(
+        self,
+        *,
+        operation_id: str,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+    ) -> bool:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).reset_operation_event_spool(
+                operation_id=operation_id,
+                session_id=session_id,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+            )
+
+    async def claim_unknown_operation_for_recovery(
+        self,
+        *,
+        operation_id: str,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        max_recovery_dispatches: int | None = None,
+    ) -> bool:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).claim_unknown_operation_for_recovery(
+                operation_id=operation_id,
+                session_id=session_id,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+                max_recovery_dispatches=max_recovery_dispatches,
+            )
+
+    async def mark_operation_unknown(
+        self,
+        *,
+        operation_id: str,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+        restore_recovery_dispatch_claim: bool = False,
+    ) -> bool:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).mark_operation_unknown(
+                operation_id=operation_id,
+                session_id=session_id,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+                restore_recovery_dispatch_claim=restore_recovery_dispatch_claim,
+            )
+
+    async def rollback_operation_before_dispatch(
+        self,
+        *,
+        operation_id: str,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+    ) -> bool:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).rollback_operation_before_dispatch(
+                operation_id=operation_id,
+                session_id=session_id,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+            )
+
+    async def get_operation_by_fingerprint(
+        self,
+        *,
+        request_fingerprint: str,
+        api_key_scope: str | None = None,
+    ) -> DurableBridgeOperationSnapshot | None:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).get_operation_by_fingerprint(
+                request_fingerprint=request_fingerprint,
+                api_key_scope=api_key_scope,
+            )
+
+    async def get_latest_completed_operation(
+        self,
+        *,
+        session_id: str,
+        parent_response_id: str,
+        request_fingerprint: str | None = None,
+    ) -> DurableBridgeOperationSnapshot | None:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).get_latest_completed_operation(
+                session_id=session_id,
+                parent_response_id=parent_response_id,
+                request_fingerprint=request_fingerprint,
+            )
+
+    async def get_latest_completed_operation_any_session(
+        self,
+        *,
+        parent_response_id: str,
+        api_key_scope: str | None = None,
+        request_fingerprint: str | None = None,
+    ) -> DurableBridgeOperationSnapshot | None:
+        async with self._session() as session:
+            return await DurableBridgeRepository(session).get_latest_completed_operation_any_session(
+                parent_response_id=parent_response_id,
+                api_key_scope=api_key_scope,
                 request_fingerprint=request_fingerprint,
             )
 
@@ -721,7 +887,6 @@ class DurableBridgeSessionCoordinator:
         input_item_count: int | None = None,
         input_full_fingerprint: str | None = None,
         pending_tool_calls: Mapping[str, str] | None = None,
-        response_transition_manifest: ResponseTransitionManifest | None = None,
     ) -> DurableBridgeAliasRegistration:
         api_key_scope = durable_bridge_api_key_scope(api_key_id)
         async with self._session() as session:
@@ -737,7 +902,6 @@ class DurableBridgeSessionCoordinator:
                 latest_input_item_count=input_item_count,
                 latest_input_full_fingerprint=input_full_fingerprint,
                 latest_pending_tool_calls=pending_tool_calls,
-                latest_response_transition_manifest=response_transition_manifest,
             )
 
     async def register_session_header(
@@ -783,10 +947,4 @@ def _to_lookup(snapshot: DurableBridgeSessionSnapshot) -> DurableBridgeLookup:
         latest_input_full_fingerprint=snapshot.latest_input_full_fingerprint,
         model=snapshot.model,
         latest_pending_tool_calls=snapshot.latest_pending_tool_calls,
-        latest_response_transition_manifest=snapshot.latest_response_transition_manifest,
-        recovery_required_anchor_hash=snapshot.recovery_required_anchor_hash,
-        recovery_required_account_id=snapshot.recovery_required_account_id,
-        recovery_required_attempt_fingerprint=snapshot.recovery_required_attempt_fingerprint,
-        recovery_required_attempt_request_id=snapshot.recovery_required_attempt_request_id,
-        recovery_required_at=snapshot.recovery_required_at,
     )

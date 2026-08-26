@@ -53,6 +53,7 @@ async def test_cleanup_once_purges_prompt_cache_only(monkeypatch) -> None:
         lambda: SimpleNamespace(
             http_responses_session_bridge_idle_ttl_seconds=120.0,
             http_responses_session_bridge_codex_idle_ttl_seconds=900.0,
+            http_responses_session_bridge_operation_spool_retention_seconds=604800.0,
         ),
     )
 
@@ -64,8 +65,7 @@ async def test_cleanup_once_purges_prompt_cache_only(monkeypatch) -> None:
     bridge_repo.purge_closed_before = AsyncMock(return_value=2)
     bridge_repo.purge_abandoned_before = AsyncMock(return_value=1)
     bridge_repo.purge_retry_circuits_before = AsyncMock(return_value=3)
-    rowless_repo = AsyncMock()
-    rowless_repo.purge_expired_audit_rows = AsyncMock(return_value={"captured": 0})
+    bridge_repo.purge_operation_spool = AsyncMock(return_value=0)
     ring_service = AsyncMock()
     ring_service.purge_stale_before = AsyncMock(return_value=0)
 
@@ -86,7 +86,6 @@ async def test_cleanup_once_purges_prompt_cache_only(monkeypatch) -> None:
         patch.object(cleanup_scheduler, "SettingsRepository", return_value=settings_repo),
         patch.object(cleanup_scheduler, "StickySessionsRepository", return_value=sticky_repo),
         patch.object(cleanup_scheduler, "DurableBridgeRepository", return_value=bridge_repo),
-        patch.object(cleanup_scheduler, "RowlessRecoveryRepository", return_value=rowless_repo),
         patch.object(cleanup_scheduler, "RingMembershipService", return_value=ring_service),
         patch.object(cleanup_scheduler, "_get_leader_election", lambda: _FakeLeader()),
         patch.object(cleanup_scheduler.startup_module, "_bridge_durable_schema_ready", True),
@@ -98,7 +97,7 @@ async def test_cleanup_once_purges_prompt_cache_only(monkeypatch) -> None:
     bridge_repo.purge_closed_before.assert_called_once()
     bridge_repo.purge_abandoned_before.assert_called_once()
     bridge_repo.purge_retry_circuits_before.assert_called_once()
-    rowless_repo.purge_expired_audit_rows.assert_called_once()
+    bridge_repo.purge_operation_spool.assert_called_once()
     ring_service.purge_stale_before.assert_called_once()
     sticky_repo.purge_stale_hard_codex_session_mappings.assert_called_once()
     passed_cutoff = sticky_repo.purge_stale_hard_codex_session_mappings.call_args.args[0]
@@ -121,6 +120,7 @@ async def test_cleanup_once_skips_bridge_purge_when_schema_is_not_ready(monkeypa
         lambda: SimpleNamespace(
             http_responses_session_bridge_idle_ttl_seconds=120.0,
             http_responses_session_bridge_codex_idle_ttl_seconds=900.0,
+            http_responses_session_bridge_operation_spool_retention_seconds=604800.0,
         ),
     )
 
@@ -131,8 +131,7 @@ async def test_cleanup_once_skips_bridge_purge_when_schema_is_not_ready(monkeypa
     bridge_repo.purge_closed_before = AsyncMock(return_value=0)
     bridge_repo.purge_abandoned_before = AsyncMock(return_value=0)
     bridge_repo.purge_retry_circuits_before = AsyncMock(return_value=0)
-    rowless_repo = AsyncMock()
-    rowless_repo.purge_expired_audit_rows = AsyncMock(return_value={"captured": 0})
+    bridge_repo.purge_operation_spool = AsyncMock(return_value=0)
     ring_service = AsyncMock()
     ring_service.purge_stale_before = AsyncMock(return_value=0)
 
@@ -153,7 +152,6 @@ async def test_cleanup_once_skips_bridge_purge_when_schema_is_not_ready(monkeypa
         patch.object(cleanup_scheduler, "SettingsRepository", return_value=settings_repo),
         patch.object(cleanup_scheduler, "StickySessionsRepository", return_value=sticky_repo),
         patch.object(cleanup_scheduler, "DurableBridgeRepository", return_value=bridge_repo),
-        patch.object(cleanup_scheduler, "RowlessRecoveryRepository", return_value=rowless_repo),
         patch.object(cleanup_scheduler, "RingMembershipService", return_value=ring_service),
         patch.object(cleanup_scheduler, "_get_leader_election", lambda: _FakeLeader()),
         patch.object(cleanup_scheduler.startup_module, "_bridge_durable_schema_ready", False),
@@ -169,7 +167,6 @@ async def test_cleanup_once_skips_bridge_purge_when_schema_is_not_ready(monkeypa
     bridge_repo.purge_closed_before.assert_not_called()
     bridge_repo.purge_abandoned_before.assert_not_called()
     bridge_repo.purge_retry_circuits_before.assert_not_called()
-    rowless_repo.purge_expired_audit_rows.assert_not_called()
     ring_service.purge_stale_before.assert_called_once()
 
 
@@ -188,6 +185,7 @@ async def test_cleanup_once_purges_bridge_when_schema_exists_after_startup_flag_
         lambda: SimpleNamespace(
             http_responses_session_bridge_idle_ttl_seconds=120.0,
             http_responses_session_bridge_codex_idle_ttl_seconds=900.0,
+            http_responses_session_bridge_operation_spool_retention_seconds=604800.0,
         ),
     )
 
@@ -198,8 +196,7 @@ async def test_cleanup_once_purges_bridge_when_schema_exists_after_startup_flag_
     bridge_repo.purge_closed_before = AsyncMock(return_value=1)
     bridge_repo.purge_abandoned_before = AsyncMock(return_value=0)
     bridge_repo.purge_retry_circuits_before = AsyncMock(return_value=0)
-    rowless_repo = AsyncMock()
-    rowless_repo.purge_expired_audit_rows = AsyncMock(return_value={"captured": 0})
+    bridge_repo.purge_operation_spool = AsyncMock(return_value=0)
     ring_service = AsyncMock()
     ring_service.purge_stale_before = AsyncMock(return_value=2)
 
@@ -220,7 +217,6 @@ async def test_cleanup_once_purges_bridge_when_schema_exists_after_startup_flag_
         patch.object(cleanup_scheduler, "SettingsRepository", return_value=settings_repo),
         patch.object(cleanup_scheduler, "StickySessionsRepository", return_value=sticky_repo),
         patch.object(cleanup_scheduler, "DurableBridgeRepository", return_value=bridge_repo),
-        patch.object(cleanup_scheduler, "RowlessRecoveryRepository", return_value=rowless_repo),
         patch.object(cleanup_scheduler, "RingMembershipService", return_value=ring_service),
         patch.object(cleanup_scheduler, "_get_leader_election", lambda: _FakeLeader()),
         patch.object(cleanup_scheduler.startup_module, "_bridge_durable_schema_ready", False),
@@ -232,7 +228,7 @@ async def test_cleanup_once_purges_bridge_when_schema_exists_after_startup_flag_
     bridge_repo.purge_closed_before.assert_called_once()
     bridge_repo.purge_abandoned_before.assert_called_once()
     bridge_repo.purge_retry_circuits_before.assert_called_once()
-    rowless_repo.purge_expired_audit_rows.assert_called_once()
+    bridge_repo.purge_operation_spool.assert_called_once()
     ring_service.purge_stale_before.assert_called_once()
 
 
@@ -280,6 +276,7 @@ async def test_cleanup_once_gates_abandoned_purge_on_prompt_cache_reuse_ttl(monk
         lambda: SimpleNamespace(
             http_responses_session_bridge_idle_ttl_seconds=120.0,
             http_responses_session_bridge_codex_idle_ttl_seconds=900.0,
+            http_responses_session_bridge_operation_spool_retention_seconds=604800.0,
         ),
     )
 
@@ -290,8 +287,7 @@ async def test_cleanup_once_gates_abandoned_purge_on_prompt_cache_reuse_ttl(monk
     bridge_repo.purge_closed_before = AsyncMock(return_value=0)
     bridge_repo.purge_abandoned_before = AsyncMock(return_value=0)
     bridge_repo.purge_retry_circuits_before = AsyncMock(return_value=0)
-    rowless_repo = AsyncMock()
-    rowless_repo.purge_expired_audit_rows = AsyncMock(return_value={"captured": 0})
+    bridge_repo.purge_operation_spool = AsyncMock(return_value=0)
     ring_service = AsyncMock()
     ring_service.purge_stale_before = AsyncMock(return_value=0)
 
@@ -312,7 +308,6 @@ async def test_cleanup_once_gates_abandoned_purge_on_prompt_cache_reuse_ttl(monk
         patch.object(cleanup_scheduler, "SettingsRepository", return_value=settings_repo),
         patch.object(cleanup_scheduler, "StickySessionsRepository", return_value=sticky_repo),
         patch.object(cleanup_scheduler, "DurableBridgeRepository", return_value=bridge_repo),
-        patch.object(cleanup_scheduler, "RowlessRecoveryRepository", return_value=rowless_repo),
         patch.object(cleanup_scheduler, "RingMembershipService", return_value=ring_service),
         patch.object(cleanup_scheduler, "_get_leader_election", lambda: _FakeLeader()),
         patch.object(cleanup_scheduler.startup_module, "_bridge_durable_schema_ready", True),
@@ -325,3 +320,40 @@ async def test_cleanup_once_gates_abandoned_purge_on_prompt_cache_reuse_ttl(monk
     # must be retained for the full 3600s prompt-cache reuse window.
     gap_seconds = (closed_cutoff - abandoned_cutoff).total_seconds()
     assert abs(gap_seconds - 1800.0) < 5.0
+
+
+@pytest.mark.asyncio
+async def test_cleanup_once_retains_operation_purge_when_sticky_cleanup_disabled(monkeypatch) -> None:
+    settings_repo = AsyncMock()
+    sticky_repo = AsyncMock()
+    bridge_repo = AsyncMock()
+    bridge_repo.purge_operation_spool = AsyncMock(return_value=0)
+
+    class FakeSession:
+        async def __aenter__(self):
+            return AsyncMock()
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(
+        cleanup_scheduler,
+        "get_settings",
+        lambda: SimpleNamespace(http_responses_session_bridge_operation_spool_retention_seconds=604800.0),
+    )
+    scheduler = cleanup_scheduler.StickySessionCleanupScheduler(interval_seconds=60, enabled=False)
+
+    with (
+        patch.object(cleanup_scheduler, "get_background_session", FakeSession),
+        patch.object(cleanup_scheduler, "SettingsRepository", return_value=settings_repo),
+        patch.object(cleanup_scheduler, "StickySessionsRepository", return_value=sticky_repo),
+        patch.object(cleanup_scheduler, "DurableBridgeRepository", return_value=bridge_repo),
+        patch.object(cleanup_scheduler, "_get_leader_election", lambda: _FakeLeader()),
+        patch.object(cleanup_scheduler.startup_module, "_bridge_durable_schema_ready", True),
+    ):
+        await scheduler._cleanup_once()
+
+    settings_repo.get_or_create.assert_not_awaited()
+    sticky_repo.purge_prompt_cache_before.assert_not_awaited()
+    bridge_repo.purge_closed_before.assert_not_awaited()
+    bridge_repo.purge_operation_spool.assert_awaited_once()

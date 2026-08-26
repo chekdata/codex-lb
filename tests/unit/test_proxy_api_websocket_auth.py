@@ -15,6 +15,7 @@ from starlette.types import Message, Receive, Scope, Send
 import app.core.auth.dependencies as auth_dependencies
 import app.core.request_locality as request_locality
 import app.modules.proxy.api as proxy_api_module
+import app.modules.proxy.request_policy as proxy_request_policy
 from app.core.clients.proxy import ProxyResponseError
 from app.core.errors import openai_error
 from app.core.exceptions import ProxyAuthError
@@ -393,7 +394,7 @@ async def test_stream_responses_prefers_forwarded_downstream_turn_state(monkeypa
 
     def fake_apply_api_key_enforcement(_payload, _api_key, *, prohibit_fast_mode=False):
         assert prohibit_fast_mode is False
-        return None
+        return proxy_request_policy.ApiKeyEnforcementResult(False, None)
 
     def fake_validate_model_access(_api_key, _model):
         return None
@@ -557,7 +558,7 @@ async def test_stream_responses_does_not_release_forwarded_reservation_on_intern
 
     def fake_apply_api_key_enforcement(_payload, _api_key, *, prohibit_fast_mode=False):
         assert prohibit_fast_mode is False
-        return None
+        return proxy_request_policy.ApiKeyEnforcementResult(False, None)
 
     def fake_validate_model_access(_api_key, _model):
         return None
@@ -628,6 +629,35 @@ def test_public_previous_response_not_found_error_is_masked_to_stream_incomplete
     assert error["type"] == "server_error"
     assert error["message"] == "Upstream websocket closed before response.completed"
     assert "resp_missing" not in masked.model_dump_json()
+
+
+def test_public_previous_response_not_found_can_enable_client_full_history_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    envelope = proxy_api_module.OpenAIErrorEnvelopeModel(
+        error=proxy_api_module.OpenAIError(
+            message="Previous response with id 'resp_missing' not found.",
+            type="invalid_request_error",
+            code="previous_response_not_found",
+            param="previous_response_id",
+        )
+    )
+    monkeypatch.setattr(
+        proxy_api_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            http_responses_session_bridge_ambiguous_continuation_recovery_mode="client_full_history_once"
+        ),
+    )
+
+    status_code, preserved = proxy_api_module._mask_previous_response_not_found_error(
+        envelope,
+        default_status=400,
+        allow_client_full_history_once=True,
+    )
+
+    assert status_code == 400
+    assert preserved == envelope
 
 
 def test_public_previous_response_invalid_request_param_is_masked_to_stream_incomplete():

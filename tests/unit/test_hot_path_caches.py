@@ -11,13 +11,11 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 import app.core.auth.dependencies as auth_dependencies
 import app.core.middleware.api_firewall as api_firewall_module
 from app.core.auth.api_key_cache import get_api_key_cache
 from app.core.crypto import TokenEncryptor
-from app.core.handlers import add_exception_handlers
 from app.core.middleware.api_firewall import add_api_firewall_middleware
 from app.core.middleware.firewall_cache import get_firewall_ip_cache, reset_firewall_ip_cache_for_testing
 from app.db.models import Account, AccountStatus, UsageHistory
@@ -71,7 +69,7 @@ async def test_api_key_validation_uses_cache_for_repeated_key(monkeypatch: pytes
         yield object()
 
     monkeypatch.setattr(auth_dependencies, "get_settings_cache", lambda: _SettingsCache())
-    monkeypatch.setattr(auth_dependencies, "get_request_session", _fake_session)
+    monkeypatch.setattr(auth_dependencies, "get_background_session", _fake_session)
     monkeypatch.setattr(auth_dependencies, "ApiKeysRepository", lambda _session: object())
     monkeypatch.setattr(auth_dependencies, "ApiKeysService", _Service)
 
@@ -110,7 +108,7 @@ async def test_firewall_middleware_uses_cache_for_repeated_ip(monkeypatch: pytes
         "get_settings",
         lambda: SimpleNamespace(firewall_trusted_proxy_cidrs=[], firewall_trust_proxy_headers=False),
     )
-    monkeypatch.setattr(api_firewall_module, "get_request_session", _fake_session)
+    monkeypatch.setattr(api_firewall_module, "get_background_session", _fake_session)
     monkeypatch.setattr(api_firewall_module, "FirewallRepository", lambda _session: object())
     monkeypatch.setattr(api_firewall_module, "FirewallService", _Service)
 
@@ -128,81 +126,6 @@ async def test_firewall_middleware_uses_cache_for_repeated_ip(monkeypatch: pytes
             assert response.status_code == 200
 
     assert calls == 1
-
-
-@pytest.mark.asyncio
-async def test_firewall_pool_timeout_returns_sanitized_retryable_503(monkeypatch: pytest.MonkeyPatch) -> None:
-    @asynccontextmanager
-    async def _timed_out_session() -> AsyncIterator[object]:
-        raise SQLAlchemyTimeoutError("private QueuePool topology")
-        yield object()
-
-    monkeypatch.setattr(
-        api_firewall_module,
-        "get_settings",
-        lambda: SimpleNamespace(firewall_trusted_proxy_cidrs=[], firewall_trust_proxy_headers=False),
-    )
-    monkeypatch.setattr(api_firewall_module, "get_request_session", _timed_out_session)
-
-    app = FastAPI()
-    add_api_firewall_middleware(app)
-
-    @app.get("/v1/test")
-    async def _v1_test() -> dict[str, str]:
-        return {"ok": "true"}
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-        response = await client.get("/v1/test")
-
-    assert response.status_code == 503
-    assert response.headers["Retry-After"] == "1"
-    assert response.json() == {
-        "error": {
-            "code": "database_pool_unavailable",
-            "message": "Database capacity is temporarily unavailable; retry shortly.",
-            "type": "server_error",
-        }
-    }
-    assert "QueuePool" not in response.text
-
-
-@pytest.mark.asyncio
-async def test_api_key_pool_timeout_uses_global_sanitized_retryable_503(monkeypatch: pytest.MonkeyPatch) -> None:
-    class _SettingsCache:
-        async def get(self) -> SimpleNamespace:
-            return SimpleNamespace(api_key_auth_enabled=True)
-
-    @asynccontextmanager
-    async def _timed_out_session() -> AsyncIterator[object]:
-        raise SQLAlchemyTimeoutError("private QueuePool topology")
-        yield object()
-
-    monkeypatch.setattr(auth_dependencies, "get_settings_cache", lambda: _SettingsCache())
-    monkeypatch.setattr(auth_dependencies, "get_request_session", _timed_out_session)
-
-    app = FastAPI()
-    add_exception_handlers(app)
-
-    @app.get("/v1/test")
-    async def _v1_test() -> dict[str, str]:
-        await auth_dependencies.validate_proxy_api_key_authorization("Bearer sk-clb-private")
-        return {"ok": "true"}
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-        response = await client.get("/v1/test")
-
-    assert response.status_code == 503
-    assert response.headers["Retry-After"] == "1"
-    assert response.json() == {
-        "error": {
-            "code": "database_pool_unavailable",
-            "message": "Database capacity is temporarily unavailable; retry shortly.",
-            "type": "server_error",
-        }
-    }
-    assert "QueuePool" not in response.text
 
 
 @pytest.mark.asyncio
