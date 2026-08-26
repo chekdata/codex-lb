@@ -73,6 +73,9 @@ from app.modules.proxy._service.http_bridge.quarantine import (
     _record_http_bridge_quarantine_eventless_timeout,
     _record_http_bridge_quarantine_wedged_pending,
 )
+from app.modules.proxy._service.http_bridge.retry_circuit import (
+    _http_bridge_anchor_poison_detail,
+)
 from app.modules.proxy._service.http_bridge.service_stubs import (
     _assign_websocket_response_id,
     _await_cancelled_task,
@@ -741,6 +744,8 @@ async def _clear_durable_http_bridge_response_anchor(
 async def _abandon_durable_http_bridge_continuity(
     service: Any,
     session: "_HTTPBridgeSession",
+    *,
+    detail: str = "repeated_zero_event_idle_timeout",
 ) -> bool:
     """Clear durable continuity before retiring a repeatedly poisoned bridge.
 
@@ -777,7 +782,7 @@ async def _abandon_durable_http_bridge_continuity(
         session.key,
         account_id=session.account.id,
         model=session.request_model,
-        detail="repeated_zero_event_idle_timeout",
+        detail=detail,
         cache_key_family=session.key.affinity_kind,
         model_class=_extract_model_class(session.request_model) if session.request_model else None,
     )
@@ -940,21 +945,27 @@ class _HTTPBridgeUpstreamEventsMixin:
                         exc_info=True,
                     )
                 retry_circuit_recorded = consecutive_failures is not None
-            poison_after_deferred_failures = False
+            poison_detail: str | None = None
             if session.admission_waiter_count > 0 and not force_retire:
-                poison_after_deferred_failures = bool(
-                    retry_circuit_detail == "stream_idle_timeout"
+                poison_candidate_detail = _http_bridge_anchor_poison_detail(retry_circuit_detail)
+                if (
+                    poison_candidate_detail is not None
                     and observed_response_events == 0
                     and consecutive_failures is not None
                     and consecutive_failures
                     >= _service_get_settings().http_responses_session_bridge_anchor_poison_failure_threshold
-                )
-                if poison_after_deferred_failures:
-                    durable_cleared = await _abandon_durable_http_bridge_continuity(self, session)
+                ):
+                    poison_detail = poison_candidate_detail
+                if poison_detail is not None:
+                    durable_cleared = await _abandon_durable_http_bridge_continuity(
+                        self,
+                        session,
+                        detail=poison_detail,
+                    )
                     if durable_cleared:
                         await self._retire_stale_pending_http_bridge_session(
                             session,
-                            detail="repeated_zero_event_idle_timeout",
+                            detail=poison_detail,
                             response_events_seen=observed_response_events,
                         )
                         force_retire = True
@@ -965,7 +976,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                             account_id=session.account.id,
                             model=session.request_model,
                             pending_count=session.admission_waiter_count,
-                            detail="repeated_zero_event_idle_timeout",
+                            detail=poison_detail,
                             cache_key_family=session.key.affinity_kind,
                             model_class=_extract_model_class(session.request_model) if session.request_model else None,
                         )

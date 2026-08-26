@@ -261,6 +261,10 @@ logger = logging.getLogger("app.modules.proxy.service")
 T = TypeVar("T")
 _REQUEST_TRANSPORT_HTTP = "http"
 _RESPONSE_CREATE_GATE_RETRY_SLEEP_SECONDS = 10.0
+# Keep the old authority/marker schemas readable for rollback safety, but use
+# the upstream durable-owner/full-resend recovery path for all live requests.
+_DURABLE_RECOVERY_MARKER_REQUEST_PATH_ENABLED = False
+_ROWLESS_SEMANTIC_REBASE_REQUEST_PATH_ENABLED = False
 _OBSERVABLE_REPLAY_SUFFIX_ITEM_TYPES = frozenset(
     {
         "agent_message",
@@ -273,6 +277,14 @@ _OBSERVABLE_REPLAY_SUFFIX_ITEM_TYPES = frozenset(
         "reasoning",
     }
 )
+
+
+def _durable_recovery_marker_request_path_active(lookup: DurableBridgeLookup | None) -> bool:
+    return bool(
+        _DURABLE_RECOVERY_MARKER_REQUEST_PATH_ENABLED
+        and lookup is not None
+        and lookup.recovery_is_required_for_latest_anchor()
+    )
 
 
 def _full_resend_suffix_shape_for_observability(
@@ -1794,14 +1806,12 @@ class _HTTPBridgeStreamingMixin:
             durable_lookup,
         )
         durable_marker_abandoned_pending_candidate = bool(
-            durable_lookup is not None
-            and durable_lookup.recovery_is_required_for_latest_anchor()
+            _durable_recovery_marker_request_path_active(durable_lookup)
             and durable_abandoned_pending_full_resend_proof is not None
             and durable_abandoned_pending_full_resend_proof.matches(payload, durable_lookup)
         )
         durable_marker_verified_recovery_candidate = bool(
-            durable_lookup is not None
-            and durable_lookup.recovery_is_required_for_latest_anchor()
+            _durable_recovery_marker_request_path_active(durable_lookup)
             and (
                 (durable_full_resend_proof is not None and durable_full_resend_proof.matches(payload, durable_lookup))
                 or durable_marker_abandoned_pending_candidate
@@ -1879,7 +1889,8 @@ class _HTTPBridgeStreamingMixin:
             and rowless_fallback_metadata_valid
         )
         rowless_lookup_identity_eligible = (
-            rowless_task_identity is not None
+            _ROWLESS_SEMANTIC_REBASE_REQUEST_PATH_ENABLED
+            and rowless_task_identity is not None
             and official_session_id is not None
             and explicit_prompt_cache_key is not None
             and official_session_id == explicit_prompt_cache_key == rowless_task_identity
@@ -1902,7 +1913,8 @@ class _HTTPBridgeStreamingMixin:
                 ),
             )
         marker_rowless_lookup_identity_eligible = (
-            marker_rowless_task_identity is not None
+            _ROWLESS_SEMANTIC_REBASE_REQUEST_PATH_ENABLED
+            and marker_rowless_task_identity is not None
             and rowless_task_identity_sources_consistent
             and not rowless_explicit_child_signal
             and official_session_id is not None
@@ -2244,7 +2256,7 @@ class _HTTPBridgeStreamingMixin:
             verified_quarantine_full_resend = bool(
                 durable_full_resend_proof is not None and durable_full_resend_proof.matches(payload, durable_lookup)
             )
-            durable_recovery_marker_active = durable_lookup.recovery_is_required_for_latest_anchor()
+            durable_recovery_marker_active = _durable_recovery_marker_request_path_active(durable_lookup)
             verified_marker_full_resend = bool(
                 verified_quarantine_full_resend
                 or (
@@ -2543,7 +2555,7 @@ class _HTTPBridgeStreamingMixin:
                         update={"input": abandoned_projection.input_items}
                     )
                     durable_marker_abandoned_pending_replay = True
-                if durable_lookup.latest_response_id is not None:
+                if _ROWLESS_SEMANTIC_REBASE_REQUEST_PATH_ENABLED and durable_lookup.latest_response_id is not None:
                     try:
                         async with SessionLocal() as rowless_session:
                             rowless_repository = RowlessRecoveryRepository(rowless_session)

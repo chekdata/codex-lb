@@ -81,6 +81,22 @@ pytestmark = pytest.mark.integration
 _TEST_SYNC_TIMEOUT_SECONDS = 5.0
 
 
+@pytest.fixture(autouse=True)
+def _enable_legacy_rowless_recovery_contract_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep compatibility coverage while production defaults to the upstream path."""
+
+    monkeypatch.setattr(
+        http_bridge_streaming_module,
+        "_ROWLESS_SEMANTIC_REBASE_REQUEST_PATH_ENABLED",
+        True,
+    )
+    monkeypatch.setattr(
+        http_bridge_streaming_module,
+        "_DURABLE_RECOVERY_MARKER_REQUEST_PATH_ENABLED",
+        True,
+    )
+
+
 def _official_codex_turn_carriers(task_id: str, turn_id: str) -> tuple[dict[str, str], dict[str, str]]:
     turn_metadata = {
         "installation_id": "installation-before-account-selection",

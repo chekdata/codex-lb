@@ -34,6 +34,19 @@ _HTTP_BRIDGE_RETRY_CIRCUIT_DETAIL_ALIASES = {
     "missing_response_created_timeout": "stream_idle_timeout",
     "response_create_gate_timeout_stuck_pending": "stream_idle_timeout",
 }
+_HTTP_BRIDGE_ANCHOR_POISON_DETAILS = {
+    "stream_idle_timeout": "repeated_zero_event_idle_timeout",
+    "stream_incomplete": "repeated_zero_event_stream_incomplete",
+}
+
+
+def _http_bridge_anchor_poison_detail(detail: str | None) -> str | None:
+    """Map an eventless transport failure to the upstream anchor-poison class."""
+
+    if detail is None:
+        return None
+    aliased = _HTTP_BRIDGE_RETRY_CIRCUIT_DETAIL_ALIASES.get(detail, detail)
+    return _HTTP_BRIDGE_ANCHOR_POISON_DETAILS.get(aliased)
 
 
 @dataclass(slots=True)

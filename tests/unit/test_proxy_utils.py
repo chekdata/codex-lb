@@ -32451,6 +32451,31 @@ def test_http_bridge_should_attempt_local_previous_response_recovery_invalid_req
     assert proxy_service._http_bridge_should_attempt_local_previous_response_recovery(non_recoverable_error) is False
 
 
+def test_http_bridge_should_attempt_local_previous_response_recovery_normalizes_upstream_error_frames():
+    terse_parameterless_error = proxy_module.ProxyResponseError(
+        400,
+        {
+            "error": {
+                "type": "invalid_request_error",
+                "message": "Invalid `previous_response_id`.",
+            }
+        },
+    )
+    type_only_not_found_error = proxy_module.ProxyResponseError(
+        404,
+        {
+            "error": {
+                "type": "previous_response_not_found",
+                "code": "   ",
+                "message": "Previous response with id 'resp_prev_anchor' not found.",
+            }
+        },
+    )
+
+    assert proxy_service._http_bridge_should_attempt_local_previous_response_recovery(terse_parameterless_error)
+    assert proxy_service._http_bridge_should_attempt_local_previous_response_recovery(type_only_not_found_error)
+
+
 def test_http_bridge_should_rollover_after_context_overflow():
     context_overflow_error = proxy_module.ProxyResponseError(
         400,

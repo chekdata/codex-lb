@@ -157,6 +157,32 @@ def test_http_bridge_rejected_dead_owner_recovery_code_is_not_emitted_from_app()
     assert result.returncode == 1, result.stdout
 
 
+def test_custom_semantic_rebase_request_paths_are_disabled_by_default() -> None:
+    lookup = Mock()
+
+    assert http_bridge_streaming_module._DURABLE_RECOVERY_MARKER_REQUEST_PATH_ENABLED is False
+    assert http_bridge_streaming_module._ROWLESS_SEMANTIC_REBASE_REQUEST_PATH_ENABLED is False
+    assert http_bridge_streaming_module._durable_recovery_marker_request_path_active(lookup) is False
+    lookup.recovery_is_required_for_latest_anchor.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("detail", "expected"),
+    [
+        ("stream_idle_timeout", "repeated_zero_event_idle_timeout"),
+        ("missing_response_created_timeout", "repeated_zero_event_idle_timeout"),
+        ("stream_incomplete", "repeated_zero_event_stream_incomplete"),
+        ("clean_close", None),
+        (None, None),
+    ],
+)
+def test_http_bridge_anchor_poison_detail_matches_upstream_contract(
+    detail: str | None,
+    expected: str | None,
+) -> None:
+    assert http_bridge_retry_circuit_module._http_bridge_anchor_poison_detail(detail) == expected
+
+
 @pytest.fixture(autouse=True)
 def _share_proxy_dashboard_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     class _SettingsCache:
@@ -16542,6 +16568,7 @@ async def test_get_or_create_http_bridge_session_waiter_propagates_terminal_infl
     service._http_bridge_inflight_sessions[key] = inflight_future
 
     monkeypatch.setattr(service, "_prune_http_bridge_sessions_locked", Mock(return_value=[]))
+    monkeypatch.setattr("app.core.startup._bridge_registration_complete", True)
     monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
     monkeypatch.setattr(proxy_service, "_http_bridge_owner_instance", AsyncMock(return_value="instance-a"))
     monkeypatch.setattr(
@@ -23979,6 +24006,121 @@ async def test_retire_stale_pending_http_bridge_session_unregisters_aliases_and_
 
 
 @pytest.mark.asyncio
+async def test_http_bridge_repeated_zero_event_stream_incompletes_poison_anchor_with_waiter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    session = _make_bridge_session(
+        key_value="bridge-anchor-poison-stream-incomplete",
+        pending_requests=deque([_make_eventless_http_bridge_owner()]),
+        queued_request_count=1,
+    )
+    session.admission_waiter_count = 1
+    session.durable_session_id = "durable-anchor-poison-stream-incomplete"
+    session.durable_owner_epoch = 3
+    durable_bridge = SimpleNamespace(
+        lookup_retry_circuit=AsyncMock(return_value=None),
+        persist_retry_circuit=AsyncMock(),
+        rebind_session_account=AsyncMock(return_value=True),
+    )
+    service._durable_bridge = cast(Any, durable_bridge)
+    monkeypatch.setattr(service, "_fail_pending_websocket_requests", AsyncMock())
+    retire = AsyncMock()
+    monkeypatch.setattr(service, "_retire_stale_pending_http_bridge_session", retire)
+
+    for failure_number in range(1, 8):
+        retired = await service._fail_http_bridge_reader_and_maybe_retire(
+            session,
+            error_code="stream_incomplete",
+            error_message="Upstream websocket closed before response.completed",
+        )
+        assert retired is (failure_number == 7)
+
+    durable_bridge.rebind_session_account.assert_awaited_once_with(
+        session_id="durable-anchor-poison-stream-incomplete",
+        api_key_id=None,
+        instance_id=proxy_service.get_settings().http_responses_session_bridge_instance_id,
+        owner_epoch=3,
+        account_id="acc-bridge",
+        clear_continuity=True,
+    )
+    retire.assert_awaited_once_with(
+        session,
+        detail="repeated_zero_event_stream_incomplete",
+        response_events_seen=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_retire_stale_pending_poisons_already_recorded_eventless_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    durable_bridge = SimpleNamespace(
+        lookup_retry_circuit=AsyncMock(return_value=None),
+        persist_retry_circuit=AsyncMock(),
+        rebind_session_account=AsyncMock(return_value=True),
+    )
+    service._durable_bridge = cast(Any, durable_bridge)
+    monkeypatch.setattr(service, "_close_http_bridge_session_bounded", AsyncMock())
+
+    for _ in range(7):
+        session = _make_bridge_session(
+            key_value="bridge-anchor-poison-retire",
+            pending_requests=deque([_make_eventless_http_bridge_owner()]),
+            queued_request_count=1,
+        )
+        session.durable_session_id = "durable-anchor-poison-retire"
+        session.durable_owner_epoch = 5
+        await service._record_http_bridge_retry_circuit_failure(session, detail="stream_incomplete")
+        await service._retire_stale_pending_http_bridge_session(
+            session,
+            detail="stream_incomplete",
+            retry_circuit_already_recorded=True,
+            response_events_seen=0,
+        )
+
+    durable_bridge.rebind_session_account.assert_awaited_once_with(
+        session_id="durable-anchor-poison-retire",
+        api_key_id=None,
+        instance_id=proxy_service.get_settings().http_responses_session_bridge_instance_id,
+        owner_epoch=5,
+        account_id="acc-bridge",
+        clear_continuity=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_retire_stale_pending_clean_close_never_poisons_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    durable_bridge = SimpleNamespace(
+        lookup_retry_circuit=AsyncMock(return_value=None),
+        persist_retry_circuit=AsyncMock(),
+        rebind_session_account=AsyncMock(return_value=True),
+    )
+    service._durable_bridge = cast(Any, durable_bridge)
+    monkeypatch.setattr(service, "_close_http_bridge_session_bounded", AsyncMock())
+
+    for _ in range(7):
+        session = _make_bridge_session(
+            key_value="bridge-anchor-clean-close",
+            pending_requests=deque([_make_eventless_http_bridge_owner()]),
+            queued_request_count=1,
+        )
+        session.durable_session_id = "durable-anchor-clean-close"
+        session.durable_owner_epoch = 6
+        await service._retire_stale_pending_http_bridge_session(
+            session,
+            detail="stream_incomplete",
+            retry_circuit_detail="clean_close",
+        )
+
+    durable_bridge.rebind_session_account.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_http_bridge_retirement_does_not_record_midstream_retry_circuit_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -24901,7 +25043,7 @@ async def test_http_bridge_reader_failure_keeps_waiter_count_when_draining_reque
     )
     session.admission_waiter_count = 1
     fail_pending = AsyncMock()
-    record_failure = AsyncMock()
+    record_failure = AsyncMock(return_value=None)
     monkeypatch.setattr(service, "_fail_pending_websocket_requests", fail_pending)
     monkeypatch.setattr(service, "_record_http_bridge_retry_circuit_failure", record_failure)
 

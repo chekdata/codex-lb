@@ -2394,7 +2394,11 @@ def _http_bridge_should_attempt_local_previous_response_recovery(exc: ProxyRespo
     error = payload.get("error")
     if not isinstance(error, dict):
         return False
-    code = error.get("code")
+    code_value = error.get("code")
+    raw_code = code_value.strip() if isinstance(code_value, str) and code_value.strip() else None
+    type_value = error.get("type")
+    error_type = type_value.strip() if isinstance(type_value, str) and type_value.strip() else None
+    code = _normalize_error_code(raw_code, error_type)
     if code in {
         "bridge_owner_unreachable",
         "bridge_previous_response_not_found",
