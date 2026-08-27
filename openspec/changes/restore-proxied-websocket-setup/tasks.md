@@ -17,8 +17,7 @@
 ## 3. Verification
 
 - [x] 3.1 Run focused WebSocket unit and HTTP bridge integration tests.
-- [ ] 3.2 Run strict OpenSpec validation (blocked: the `openspec` CLI is not
-  installed in this environment).
+- [x] 3.2 Run strict OpenSpec validation with the compatible
+  `@fission-ai/openspec` CLI (57/57 specs passed).
 - [x] 3.3 Run Ruff, type checks, and inspect the final diff for unrelated
-  changes. The `openspec` CLI is unavailable in this environment, so strict
-  OpenSpec validation remains a release-time gap.
+  changes.
