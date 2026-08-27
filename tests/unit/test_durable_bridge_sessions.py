@@ -59,7 +59,7 @@ async def test_missing_durable_bridge_tables_uses_configured_postgres_schema(mon
         lambda: SimpleNamespace(database_postgres_schema="codex_lb_prod"),
     )
 
-    missing = await missing_durable_bridge_tables(FakeSession())
+    missing = await missing_durable_bridge_tables(cast(AsyncSession, FakeSession()))
 
     assert "http_bridge_sessions" not in missing
     statement, parameters = FakeSession.execute.call_args.args
