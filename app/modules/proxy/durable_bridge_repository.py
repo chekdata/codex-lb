@@ -15,6 +15,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config.settings import get_settings
 from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import (
     HttpBridgeOperationEvent,
@@ -2995,12 +2996,13 @@ async def missing_durable_bridge_tables(session: AsyncSession) -> tuple[str, ...
         result = await session.execute(
             text(
                 "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = 'public' "
+                "WHERE table_schema = :schema "
                 "AND table_name IN ("
                 "'http_bridge_sessions', 'http_bridge_session_aliases', 'http_bridge_retry_circuits', "
                 "'http_bridge_recovery_attempts', 'http_bridge_operations', 'http_bridge_operation_events'"
                 ")"
-            )
+            ),
+            {"schema": get_settings().database_postgres_schema or "public"},
         )
     present = {str(row[0]) for row in result.fetchall()}
     return tuple(sorted(expected - present))
