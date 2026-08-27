@@ -35,9 +35,36 @@ from app.modules.proxy.durable_bridge_repository import (
     DurableBridgeRepository,
     durable_bridge_hash,
     durable_bridge_operation_id,
+    missing_durable_bridge_tables,
 )
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.asyncio
+async def test_missing_durable_bridge_tables_uses_configured_postgres_schema(monkeypatch) -> None:
+    import app.modules.proxy.durable_bridge_repository as repository_module
+
+    result = SimpleNamespace(fetchall=lambda: [("http_bridge_sessions",)])
+
+    class FakeSession:
+        def get_bind(self):
+            return SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+
+        execute = AsyncMock(return_value=result)
+
+    monkeypatch.setattr(
+        repository_module,
+        "get_settings",
+        lambda: SimpleNamespace(database_postgres_schema="codex_lb_prod"),
+    )
+
+    missing = await missing_durable_bridge_tables(FakeSession())
+
+    assert "http_bridge_sessions" not in missing
+    statement, parameters = FakeSession.execute.call_args.args
+    assert "table_schema = :schema" in str(statement)
+    assert parameters == {"schema": "codex_lb_prod"}
 
 
 @pytest.fixture
