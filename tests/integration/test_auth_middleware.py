@@ -20,7 +20,6 @@ from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import ApiKeyCreateData, ApiKeysService
 from app.modules.dashboard_auth.service import DASHBOARD_SESSION_COOKIE, get_dashboard_session_store
-from app.modules.proxy.rowless_recovery_repository import RowlessRecoveryRepository
 
 pytestmark = pytest.mark.integration
 
@@ -970,110 +969,6 @@ async def test_disabled_dashboard_auth_mode_bypasses_guard_and_disables_password
     disable_totp = await async_client.post("/api/dashboard-auth/totp/disable", json={"code": "123456"})
     assert disable_totp.status_code == 400
     assert disable_totp.json()["error"]["code"] == "password_management_disabled"
-
-
-@pytest.mark.asyncio
-async def test_rowless_recovery_admin_surface_requires_trusted_proxy_operator(
-    async_client,
-    app_instance,
-    monkeypatch,
-):
-    _set_dashboard_auth_env(monkeypatch, mode=DashboardAuthMode.DISABLED)
-    disabled = await async_client.get("/api/http-bridge/rowless-recovery")
-    assert disabled.status_code == 403
-
-    _set_dashboard_auth_env(
-        monkeypatch,
-        mode=DashboardAuthMode.TRUSTED_HEADER,
-        trust_proxy_headers=True,
-    )
-    without_actor = await async_client.get("/api/http-bridge/rowless-recovery")
-    assert without_actor.status_code == 401
-
-    bearer_only = await async_client.get(
-        "/api/http-bridge/rowless-recovery",
-        headers={"Authorization": "Bearer ordinary-proxy-key"},
-    )
-    assert bearer_only.status_code == 401
-
-    allowed = await async_client.get(
-        "/api/http-bridge/rowless-recovery",
-        headers={"Remote-User": "operator@example.com"},
-    )
-    assert allowed.status_code == 200
-    assert allowed.json() == []
-    status_response = await async_client.get(
-        "/api/http-bridge/rowless-recovery/status",
-        headers={"Remote-User": "operator@example.com"},
-    )
-    assert status_response.status_code == 200
-    assert status_response.json() == {
-        "stateCounts": {"captured": 0, "approved": 0, "unknown": 0, "consumed": 0},
-        "markerBoundStateCounts": {"captured": 0, "approved": 0, "unknown": 0, "consumed": 0},
-        "replayFenceCount": 0,
-        "markerBoundAuthorityCount": 0,
-        "activeAutomaticAuthorityCount": 0,
-        "preRowlessImageCompatible": True,
-        "preMarkerRecoveryImageCompatible": True,
-        "preAutomaticRecoveryImageCompatible": True,
-        "minimumRollbackCapability": None,
-    }
-
-    async def marker_bound_counts(self, *, marker_bound_only=False):
-        del self, marker_bound_only
-        return {
-            "captured": 1,
-            "approved": 0,
-            "unknown": 0,
-            "consumed": 0,
-        }
-
-    with monkeypatch.context() as status_patch:
-        status_patch.setattr(RowlessRecoveryRepository, "authority_state_counts", marker_bound_counts)
-        marker_status = await async_client.get(
-            "/api/http-bridge/rowless-recovery/status",
-            headers={"Remote-User": "operator@example.com"},
-        )
-    assert marker_status.status_code == 200
-    assert marker_status.json()["markerBoundAuthorityCount"] == 1
-    assert marker_status.json()["preRowlessImageCompatible"] is False
-    assert marker_status.json()["preMarkerRecoveryImageCompatible"] is False
-    assert marker_status.json()["preAutomaticRecoveryImageCompatible"] is True
-    assert marker_status.json()["minimumRollbackCapability"] == "rowless_marker_recovery_v2"
-
-    async def one_active_automatic(self):
-        del self
-        return 1
-
-    with monkeypatch.context() as status_patch:
-        status_patch.setattr(RowlessRecoveryRepository, "active_automatic_authority_count", one_active_automatic)
-        automatic_status = await async_client.get(
-            "/api/http-bridge/rowless-recovery/status",
-            headers={"Remote-User": "operator@example.com"},
-        )
-    assert automatic_status.status_code == 200
-    assert automatic_status.json()["activeAutomaticAuthorityCount"] == 1
-    assert automatic_status.json()["preAutomaticRecoveryImageCompatible"] is False
-    assert automatic_status.json()["minimumRollbackCapability"] == "rowless_automatic_recovery_v3"
-
-    _set_dashboard_auth_env(
-        monkeypatch,
-        mode=DashboardAuthMode.TRUSTED_HEADER,
-        trust_proxy_headers=True,
-        trusted_proxy_cidrs="10.0.0.0/8",
-    )
-    remote_transport = ASGITransport(app=app_instance, client=("203.0.113.24", 50001))
-    async with AsyncClient(transport=remote_transport, base_url="http://lb.example") as remote_client:
-        spoofed = await remote_client.get(
-            "/api/http-bridge/rowless-recovery",
-            headers={"Remote-User": "attacker@example.com"},
-        )
-        spoofed_status = await remote_client.get(
-            "/api/http-bridge/rowless-recovery/status",
-            headers={"Remote-User": "attacker@example.com"},
-        )
-    assert spoofed.status_code == 401
-    assert spoofed_status.status_code == 401
 
 
 @pytest.mark.asyncio

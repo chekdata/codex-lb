@@ -22,12 +22,13 @@ from app.core.config.settings import get_settings
 from app.core.errors import OpenAIErrorEnvelope, openai_error
 from app.core.openai.model_registry import get_model_registry
 from app.core.openai.models import OpenAIEvent
-from app.core.openai.public_output import strip_blank_html_comment_lines as _strip_blank_html_comment_lines
+from app.core.openai.parsing import classify_event_type
 from app.core.plan_types import account_plan_matches_allowed
 from app.core.resilience.network_recovery import PROCESS_NETWORK_UNAVAILABLE_CODE
 from app.core.resilience.overload import is_local_overload_error_code
 from app.core.types import JsonValue
 from app.core.upstream_proxy import ResolvedUpstreamRoute
+from app.core.utils.sse import sse_event_type_from_block
 from app.db.models import Account
 from app.modules.api_keys.service import (
     ApiKeyData,
@@ -40,8 +41,6 @@ from app.modules.proxy.load_balancer import (
     AccountSelection,
     CatalogOmissionQuotaAdmission,
 )
-from app.modules.proxy.response_transition_manifest import ResponseTransitionManifest
-from app.modules.proxy.rowless_recovery import RowlessRecoveryCaptureIntent
 from app.modules.proxy.tool_call_dedupe import ToolCallDedupeKey
 from app.modules.proxy.work_admission import AdmissionLease
 
@@ -49,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 _REQUEST_TRANSPORT_HTTP = "http"
 _REQUEST_TRANSPORT_WEBSOCKET = "websocket"
+_REASONING_SUMMARY_BLANK_HTML_COMMENT_RE = re.compile(r"(?m)^[ \t]*<!--\s*-->[ \t]*(?:\r?\n|\Z)")
 _TTFT_EVENT_TYPES = frozenset(
     {
         "response.output_text.delta",
@@ -74,6 +74,7 @@ _HARD_HTTP_BRIDGE_AFFINITY_KINDS = frozenset(
     {
         "turn_state_header",
         "session_header",
+        "thread_header",
         "internal_unanchored_parallel",
         "internal_model_parallel",
         "internal_request_parallel",
@@ -97,6 +98,31 @@ _PROPAGATED_CAPACITY_STARTUP_READY: ContextVar[asyncio.Event | None] = ContextVa
     "propagated_capacity_startup_ready",
     default=None,
 )
+_PROPAGATED_RESPONSES_SERVICE_CLEANUP_READY: ContextVar[asyncio.Event | None] = ContextVar(
+    "propagated_responses_service_cleanup_ready",
+    default=None,
+)
+_PROPAGATED_RESPONSES_OWNER_FORWARD_DISPATCHED: ContextVar[asyncio.Event | None] = ContextVar(
+    "propagated_responses_owner_forward_dispatched",
+    default=None,
+)
+_PROPAGATED_RESPONSES_OWNER_FORWARD_REJECTED: ContextVar[asyncio.Event | None] = ContextVar(
+    "propagated_responses_owner_forward_rejected",
+    default=None,
+)
+
+
+def _strip_blank_html_comment_lines(text: str) -> str:
+    terminal_match = None
+    for match in _REASONING_SUMMARY_BLANK_HTML_COMMENT_RE.finditer(text):
+        if match.end() == len(text):
+            terminal_match = match
+    cleaned, count = _REASONING_SUMMARY_BLANK_HTML_COMMENT_RE.subn("", text)
+    if count == 0:
+        return text
+    if terminal_match is not None:
+        return cleaned.rstrip("\r\n")
+    return cleaned
 
 
 def _reasoning_summary_delta_key(payload: Mapping[str, JsonValue]) -> tuple[str | None, int | None, int | None]:
@@ -242,6 +268,58 @@ def _finalize_ttft_latency_ms(
     return _ttft_latency_ms_from_visible_at(_finalize_ttft_reasoning_deltas(pending_reasoning_deltas), started_at)
 
 
+# Stream frames whose parsed payload feeds a real per-event consumer:
+# lifecycle/terminal handling and usage settlement (created/in_progress/
+# completed/failed/incomplete/error), parallel tool-call rewrite + duplicate
+# side-effect suppression (response.output_item.*), and text-done suppression
+# (response.output_text.done / response.content_part.done). Canonically framed
+# frames of any other type can relay upstream bytes verbatim once the TTFT
+# window is settled and no service-tier snapshot is present.
+_MUST_PARSE_STREAM_EVENT_TYPES = frozenset(
+    {
+        "response.created",
+        "response.in_progress",
+        "response.completed",
+        "response.failed",
+        "response.incomplete",
+        "error",
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.output_text.done",
+        "response.content_part.done",
+    }
+)
+# Raw-line gate for service-tier attribution: response snapshots carry
+# `"service_tier"` in their JSON, and a false positive (the substring inside
+# delta text) merely takes the full-parse path.
+_SERVICE_TIER_MARKER = '"service_tier"'
+
+
+def _verbatim_relay_event_type(
+    line: str,
+    latency_first_token_ms: int | None,
+    pending_reasoning_deltas: dict[tuple[str | None, int | None, int | None], _TTFTReasoningDeltaState],
+) -> str | None:
+    """Return the cheap event type when a stream frame can relay verbatim.
+
+    Eligible frames are canonically framed (leading ``event: <type>`` line,
+    single JSON-object ``data:`` line — see ``sse_event_type_from_block``),
+    outside the must-parse set, past the TTFT first-token window (including a
+    pending reasoning-delta window), and free of the service-tier marker.
+    Everything else returns ``None`` and takes the full parse +
+    ``format_sse_event`` path, preserving the EventSource framing guarantee
+    for data-only blocks.
+    """
+    if latency_first_token_ms is None or pending_reasoning_deltas:
+        return None
+    if _SERVICE_TIER_MARKER in line:
+        return None
+    event_type = sse_event_type_from_block(line)
+    if event_type is None or event_type in _MUST_PARSE_STREAM_EVENT_TYPES:
+        return None
+    return event_type
+
+
 def _bind_propagated_capacity_startup_wait(event: asyncio.Event) -> Token[asyncio.Event | None]:
     return _PROPAGATED_CAPACITY_STARTUP_WAIT.set(event)
 
@@ -272,6 +350,48 @@ def _signal_propagated_capacity_startup_ready() -> None:
     if wait_event is not None:
         wait_event.clear()
     event = _PROPAGATED_CAPACITY_STARTUP_READY.get()
+    if event is not None:
+        event.set()
+
+
+def _bind_propagated_responses_service_cleanup_ready(event: asyncio.Event) -> Token[asyncio.Event | None]:
+    return _PROPAGATED_RESPONSES_SERVICE_CLEANUP_READY.set(event)
+
+
+def _reset_propagated_responses_service_cleanup_ready(token: Token[asyncio.Event | None]) -> None:
+    _PROPAGATED_RESPONSES_SERVICE_CLEANUP_READY.reset(token)
+
+
+def _signal_propagated_responses_service_cleanup_ready() -> None:
+    event = _PROPAGATED_RESPONSES_SERVICE_CLEANUP_READY.get()
+    if event is not None:
+        event.set()
+
+
+def _bind_propagated_responses_owner_forward_dispatched(event: asyncio.Event) -> Token[asyncio.Event | None]:
+    return _PROPAGATED_RESPONSES_OWNER_FORWARD_DISPATCHED.set(event)
+
+
+def _reset_propagated_responses_owner_forward_dispatched(token: Token[asyncio.Event | None]) -> None:
+    _PROPAGATED_RESPONSES_OWNER_FORWARD_DISPATCHED.reset(token)
+
+
+def _signal_propagated_responses_owner_forward_dispatched() -> None:
+    event = _PROPAGATED_RESPONSES_OWNER_FORWARD_DISPATCHED.get()
+    if event is not None:
+        event.set()
+
+
+def _bind_propagated_responses_owner_forward_rejected(event: asyncio.Event) -> Token[asyncio.Event | None]:
+    return _PROPAGATED_RESPONSES_OWNER_FORWARD_REJECTED.set(event)
+
+
+def _reset_propagated_responses_owner_forward_rejected(token: Token[asyncio.Event | None]) -> None:
+    _PROPAGATED_RESPONSES_OWNER_FORWARD_REJECTED.reset(token)
+
+
+def _signal_propagated_responses_owner_forward_rejected() -> None:
+    event = _PROPAGATED_RESPONSES_OWNER_FORWARD_REJECTED.get()
     if event is not None:
         event.set()
 
@@ -724,12 +844,6 @@ def _consume_api_key_reservation_heartbeat_result(task: asyncio.Task[None]) -> N
 
 
 @dataclass(frozen=True, slots=True)
-class _FilePinEntry:
-    account_id: str
-    expires_at: float
-
-
-@dataclass(frozen=True, slots=True)
 class _RequestLogFailureMetadata:
     failure_phase: str | None = None
     failure_detail: str | None = None
@@ -758,6 +872,34 @@ class _DeferredAccountBackoffTracker:
     current_lifecycle: _DeferredAccountBackoffLifecycle | None = None
 
 
+@dataclass(eq=False, slots=True)
+class _HTTPBridgeResponseCreateAttempt:
+    ordinal: int
+    disarmed: bool = False
+    response_observed: bool = False
+    retry_circuit_failure_recorded: bool = False
+    retry_circuit_failure_settled: anyio.Event | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _HTTPBridgeRetryCircuitAttemptSelection:
+    kind: Literal["absent", "eligible", "recorded", "settled", "ineligible"]
+    attempts: tuple[_HTTPBridgeResponseCreateAttempt, ...] = ()
+
+    def __post_init__(self) -> None:
+        carries_attempts = self.kind in {"eligible", "recorded", "settled"}
+        if carries_attempts != bool(self.attempts):
+            raise ValueError(f"invalid retry-circuit attempt selection: {self.kind}")
+
+    @property
+    def attempt(self) -> _HTTPBridgeResponseCreateAttempt | None:
+        return self.attempts[0] if len(self.attempts) == 1 else None
+
+    @property
+    def ambiguous(self) -> bool:
+        return len(self.attempts) > 1
+
+
 @dataclass
 class _WebSocketRequestState:
     request_id: str
@@ -780,19 +922,8 @@ class _WebSocketRequestState:
     # send. Retries replace this value so admission wait and prior attempts do
     # not age a fresh send into the eventless owner deadline.
     response_create_sent_at: float | None = None
-    # Set immediately before the one-shot replacement path invokes its send
-    # primitive. A cancellation while reconnecting is still proven unsent and
-    # may roll back a reversible recovery alias; cancellation after this point
-    # is ambiguous and must retain the alias/fail closed.
-    fresh_upstream_send_primitive_reached: bool = False
-    # Set immediately before the initial rowless semantic-rebase send helper
-    # is invoked. Cleanup may restore the durable attempt only while this is
-    # false; after the helper is entered, cancellation is ambiguous.
-    rowless_recovery_send_primitive_reached: bool = False
-    # True only after the initial rowless send returned the transport's exact
-    # closed-before-send proof. Generic socket-only reconnects must never set
-    # this bit: replay_count alone is not physical non-delivery evidence.
-    rowless_recovery_first_send_proven_unsent: bool = False
+    response_create_attempt_count: int = 0
+    response_create_attempt: _HTTPBridgeResponseCreateAttempt | None = None
     bridge_queue_wait_started_at: float | None = None
     # Monotonic deadline of the original bridge request budget. Retry and
     # recovery paths re-prepare request states with a fresh started_at, so
@@ -816,6 +947,24 @@ class _WebSocketRequestState:
     connection_request_kind: str | None = None
     generate_false_prewarm: bool = False
     api_key: ApiKeyData | None = None
+    # The client's requested model captured before api-key enforcement
+    # normalized aliases (``gpt-5-high`` -> ``gpt-5``), with the key's
+    # ``enforced_model`` substituted and the fast-mode correction applied,
+    # exactly like the HTTP path's ``raw_source_model``. Consumed only by the
+    # WebSocket source-ownership guards; it must never reach the upstream
+    # wire payload. ``None`` on request states that were not built by
+    # ``_prepare_websocket_response_create_request`` (replays, archives),
+    # which keeps those on the normalized-model check.
+    raw_source_model: str | None = None
+    # True when the HTTP route would exclude this request from model-source
+    # routing (``responses_source_route_excluded``: a terminal compaction
+    # trigger, or ``input_file`` references pinned to the uploading
+    # subscription account). The WebSocket source-ownership guards skip such
+    # requests so the owner-routing logic can dispatch them to a subscription
+    # account, exactly like HTTP. ``False`` on request states that were not
+    # built by ``_prepare_websocket_response_create_request``, which keeps
+    # the guards active for those.
+    source_route_excluded: bool = False
     request_usage_budget: ApiKeyRequestUsageBudget | None = None
     request_text: str | None = None
     replay_count: int = 0
@@ -870,11 +1019,6 @@ class _WebSocketRequestState:
     # on, and dropping the anchor there would silently turn a continuation into
     # a context-free fresh turn.
     fresh_upstream_request_is_retry_safe: bool = False
-    # True only when the retained fresh body is also proven free of
-    # account-scoped identifiers (for example conversation, prompt, hosted
-    # input items, or uploaded files). Replay safety proves context
-    # completeness; it does not by itself authorize changing accounts.
-    fresh_upstream_request_is_account_neutral: bool = False
     # Stable fingerprint used by the durable recovery-attempt journal. It is
     # populated only for a proof-gated fresh replay candidate.
     recovery_attempt_fingerprint: str | None = None
@@ -888,21 +1032,32 @@ class _WebSocketRequestState:
     # claimed recovery journal; an attempted send must remain consumed.
     recovery_attempt_dispatched: bool = False
     recovery_attempt_event_observed: bool = False
-    # True only for the proof-gated automatic recovery of an active durable
-    # rejected-anchor marker. Its response.completed checkpoint must publish
-    # the replacement anchor, alias, marker clear, and recovery journal in one
-    # durable transaction before downstream success is delivered.
-    marker_recovery_terminal_settlement_required: bool = False
-    # True only after this concrete request successfully claimed the active
-    # marker generation. Cleanup must not attempt a rollback before this flips.
-    marker_recovery_claimed: bool = False
-    # The outer HTTP request that owns the durable marker claim. This differs
-    # from request_id, which identifies the concrete upstream dispatch journal.
-    marker_recovery_claim_request_id: str | None = None
-    # Plaintext anchor is kept only in request memory so the delayed marker
-    # claim can revalidate the exact durable generation immediately before the
-    # recovery journal is written.
-    marker_recovery_rejected_response_id: str | None = None
+    # Durable operation identity for a continuity-bound response.create. It is
+    # stable across client reconnects with the same parent response and body.
+    operation_id: str | None = None
+    operation_fingerprint: str | None = None
+    operation_parent_response_id: str | None = None
+    operation_registered: bool = False
+    # Account-neutral durable recovery keeps the original operation identity
+    # while asking request submission to rebind it to the replacement session.
+    operation_rebind_required: bool = False
+    # True after an existing UNKNOWN operation is claimed for this attempt.
+    # If admission fails before send, cleanup must restore UNKNOWN rather than
+    # treating the pre-existing row like a newly-created operation.
+    operation_recovery_claimed: bool = False
+    # True only when this request created the durable operation row. A
+    # pre-dispatch admission failure may remove that row; an existing row
+    # represents an ambiguous upstream attempt and must remain fenced.
+    operation_created: bool = False
+    operation_replay: bool = False
+    operation_dispatched: bool = False
+    # Immutable durable attempt generation. Recovery claims increment the
+    # operation's dispatch count before sending a replacement attempt.
+    operation_attempt_generation: int = 0
+    # Last response identity successfully written to the durable operation.
+    # Retry setup may clear the active response before a replacement is
+    # acknowledged, but fallback settlement must still fence against this ID.
+    operation_persisted_response_id: str | None = None
     # Responses-Lite model advertised by ``fresh_upstream_request_text``. A
     # fresh replay built from a trusted marker-only frame has the reserved
     # marker stripped, so swapping to the fresh body must also swap this onto
@@ -911,6 +1066,9 @@ class _WebSocketRequestState:
     fresh_upstream_request_responses_lite_model: str | None = None
     request_stage: str = "first_turn"
     preferred_account_id: str | None = None
+    # Once an account-bound body has been dispatched, retries remain pinned to
+    # that owner even when stale-anchor recovery removes previous_response_id.
+    replay_required_account_id: str | None = None
     require_security_work_authorized: bool = False
     durable_capability_lineage_required: bool = False
     file_required_preferred_account: bool = False
@@ -927,11 +1085,6 @@ class _WebSocketRequestState:
     last_upstream_activity_at: float | None = None
     upstream_model_output_seen: bool = False
     previous_response_not_found_rewritten: bool = False
-    rowless_recovery_capture_intent: RowlessRecoveryCaptureIntent | None = None
-    rowless_recovery_authority_id: str | None = None
-    rowless_recovery_generation: int | None = None
-    rowless_recovery_task_authority_digest: str | None = None
-    rowless_recovery_wire_fingerprint: str | None = None
     previous_response_owner_lookup_source: str | None = None
     previous_response_owner_lookup_outcome: str | None = None
     previous_response_owner_requested_at: datetime | None = None
@@ -944,14 +1097,13 @@ class _WebSocketRequestState:
     account_response_create_release: Callable[[AccountLease | None], Coroutine[Any, Any, None]] | None = None
     websocket_stream_lease: AccountLease | None = None
     affinity_policy: _AffinityPolicy = field(default_factory=_AffinityPolicy)
+    thread_affinity_last_touch_at: float = field(default_factory=time.monotonic)
     suppressed_downstream_tool_call: bool = False
     suppressed_duplicate_tool_call: bool = False
     pending_function_call_ids: list[str] = field(default_factory=list)
     pending_tool_call_types: dict[str, str] = field(default_factory=dict)
     added_tool_call_types: dict[str, str] = field(default_factory=dict)
     tool_call_manifest_invalid: bool = False
-    response_output_items: dict[int, dict[str, JsonValue]] = field(default_factory=dict)
-    response_output_items_invalid: bool = False
     seen_tool_call_keys: dict[ToolCallDedupeKey, None] = field(default_factory=dict)
     input_item_count: int = 0
     input_full_fingerprint: str | None = None
@@ -1063,18 +1215,16 @@ class _HTTPBridgeSession:
     last_completed_response_account_id: str | None = None
     last_completed_input_prefix_fingerprint: str | None = None
     last_pending_tool_calls: dict[str, str] = field(default_factory=dict)
-    last_response_transition_manifest: ResponseTransitionManifest | None = None
-    # A false value means the completed response's pending-tool manifest was
-    # physically verified (including the valid empty-manifest case).  Keep an
-    # invalid/unrepresentable live manifest distinct from an empty one so a
-    # later full-history resend cannot mint an unanchored replay proof.
-    last_pending_tool_call_manifest_invalid: bool = False
     durable_session_id: str | None = None
     durable_owner_epoch: int | None = None
     upstream_reader: asyncio.Task[None] | None = None
     last_upstream_close_code: int | None = None
     last_upstream_close_generation: int = 0
     closed: bool = False
+    # ``closed`` is only an admission fence. Resource teardown is single-flight
+    # through this task so invalidation and shutdown can distinguish a rejected
+    # session from one whose socket and leases actually have a close owner.
+    resource_close_task: asyncio.Task[None] | None = None
     # ``closed`` rejects new admissions but is written by many unrelated
     # retirement paths; it never proves that a sender owns pending settlement.
     # Only the submitter may claim this, while holding ``lifecycle_lock``, when
@@ -1111,16 +1261,6 @@ class _HTTPBridgeSession:
         if self.liveness_settlement_owner is None:
             self.liveness_settlement_owner = "send"
         return self.liveness_settlement_owner == "send"
-
-
-def _clear_http_bridge_session_response_checkpoint(session: _HTTPBridgeSession) -> None:
-    session.last_completed_response_id = None
-    session.last_completed_response_account_id = None
-    session.last_completed_input_count = 0
-    session.last_completed_input_prefix_fingerprint = None
-    session.last_pending_tool_call_manifest_invalid = False
-    session.last_pending_tool_calls.clear()
-    session.last_response_transition_manifest = None
 
 
 def _complete_http_bridge_handoff(
@@ -1327,9 +1467,21 @@ def _clear_websocket_deferred_reasoning_downstream_texts(request_state: _WebSock
         request_state.deferred_reasoning_downstream_texts = []
 
 
+def _mark_response_create_attempt_observed(
+    request_state: _WebSocketRequestState | None,
+    event_type: str | None,
+) -> None:
+    if request_state is None or event_type is None or not event_type.startswith("response."):
+        return
+    attempt = request_state.response_create_attempt
+    if attempt is not None:
+        attempt.response_observed = True
+
+
 def _record_response_event(request_state: _WebSocketRequestState | None, event_type: str | None) -> None:
     if request_state is None or event_type is None or not event_type.startswith("response."):
         return
+    _mark_response_create_attempt_observed(request_state, event_type)
     request_state.last_upstream_activity_at = time.monotonic()
     if event_type in {"response.failed", "response.incomplete"}:
         return
@@ -1341,19 +1493,6 @@ def _websocket_request_can_replay_before_visible_output(
     *,
     allow_clean_close_retry: bool = False,
 ) -> bool:
-    if request_state.rowless_recovery_authority_id is not None:
-        # Automatic authorization is claimed before its first physical send.
-        # Admit only that retained in-memory projection; once the send marker
-        # is durable, every outcome is ambiguous and remains non-replayable.
-        return bool(
-            not request_state.rowless_recovery_send_primitive_reached
-            and request_state.replay_count == 0
-            and request_state.response_event_count == 0
-            and not request_state.downstream_visible
-            and not request_state.upstream_model_output_seen
-            and request_state.fresh_upstream_request_is_retry_safe
-            and request_state.fresh_upstream_request_text is not None
-        )
     if not request_state.request_text:
         return False
     if request_state.transport == _REQUEST_TRANSPORT_WEBSOCKET and request_state.response_create_sent_at is None:
@@ -1471,14 +1610,7 @@ class _WebSocketReceiveTimeout:
 def _event_type_from_payload(event: OpenAIEvent | None, payload: dict[str, JsonValue] | None) -> str | None:
     if event is not None:
         return event.type
-    if payload is None:
-        return None
-    payload_type = payload.get("type")
-    if isinstance(payload_type, str):
-        return payload_type
-    if isinstance(payload.get("error"), dict):
-        return "error"
-    return None
+    return classify_event_type(payload)
 
 
 async def _wait_for_websocket_continuity_gap(
@@ -1520,6 +1652,7 @@ def _is_account_neutral_error_code(code: str | None) -> bool:
         PROCESS_NETWORK_UNAVAILABLE_CODE,
         "proxy_unavailable",
         "responses_compact_input_too_large",
+        "stream_idle_timeout",
     }
 
 
@@ -1606,7 +1739,4 @@ def _openai_error_envelope_from_response_failed_payload(
     resets_in = error_payload.get("resets_in_seconds")
     if isinstance(resets_in, int | float):
         error_detail["resets_in_seconds"] = resets_in
-    action = error_payload.get("action")
-    if isinstance(action, str) and action.strip():
-        error_detail["action"] = action.strip()
     return envelope

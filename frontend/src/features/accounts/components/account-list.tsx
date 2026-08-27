@@ -156,8 +156,12 @@ export function AccountList({
       >
         {filtered.length === 0 ? (
           <div className="flex flex-col items-center gap-2 rounded-lg border border-dashed p-6 text-center">
-            <p className="text-sm font-medium text-muted-foreground">{t("accounts.list.noMatches")}</p>
-            <p className="text-xs text-muted-foreground/70">{t("accounts.list.adjustFilters")}</p>
+            <p className="text-sm font-medium text-muted-foreground">
+              {accounts.length === 0 ? t("accounts.list.emptyTitle") : t("accounts.list.noMatches")}
+            </p>
+            <p className="text-xs text-muted-foreground/70">
+              {accounts.length === 0 ? t("accounts.list.emptyDescription") : t("accounts.list.adjustFilters")}
+            </p>
           </div>
         ) : (
           filtered.map((account) => (
@@ -172,6 +176,12 @@ export function AccountList({
           ))
         )}
       </div>
+
+      {accounts.length > 0 ? (
+        <p className="px-1 text-[11px] leading-snug text-muted-foreground/80">
+          {t("accounts.list.statusEligibilityNote")}
+        </p>
+      ) : null}
 
       <AddAccountDialog
         open={chooserOpen}

@@ -7,6 +7,7 @@ from enum import Enum
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
@@ -66,6 +67,16 @@ class RequestKind(str, Enum):
     WARMUP = "warmup"
 
 
+class FileAccountPin(Base):
+    __tablename__ = "file_account_pins"
+
+    file_id: Mapped[str] = mapped_column(String, primary_key=True)
+    account_id: Mapped[str] = mapped_column(String, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (Index("ix_file_account_pins_expires_at", "expires_at"),)
+
+
 class Account(Base):
     __tablename__ = "accounts"
 
@@ -122,6 +133,20 @@ class Account(Base):
         nullable=False,
     )
     security_work_authorized: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=false(),
+        nullable=False,
+    )
+    # Pending-deletion marker: set by the fast DELETE path, consumed by the
+    # background deletion worker, cleared only by a credential replacement
+    # (re-import/reauth) that supersedes the deletion. Non-NULL rows are
+    # hidden from account listings and are already unroutable (the fast path
+    # also sets status=DEACTIVATED).
+    delete_requested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Frozen at the first delete request (repeat requests do not escalate):
+    # True selects the history-deleting variant in the background worker.
+    delete_history_requested: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
         server_default=false(),
@@ -777,17 +802,15 @@ class StickySession(Base):
         onupdate=func.now(),
         nullable=False,
     )
-    # Set only by purge_stale_hard_codex_session_mappings's first pass. A hard
-    # codex_session row normally proves ownership for `conversation`-continuity
-    # requests (see affinity.py's require_unambiguous_account), which have no
-    # other owner index. Once the durably-unavailable owner's proof is this
-    # stale, we stop treating the row as a live pin (so a fresh account can be
-    # selected) but keep it around with this marker set instead of deleting it
-    # outright, so selection can tell "this key was deliberately abandoned,
-    # picking a new owner is authorized" apart from "this key was never seen,
-    # ambiguity must fail closed." The row is only ever hard-deleted once it
-    # has sat abandoned past a further grace window with nobody claiming it.
+    # A non-null timestamp with NULL scope is the historical global tombstone.
+    # Source-scoped abandonment instead leaves this timestamp NULL and stores
+    # the typed scope below. That asymmetry is intentional: binaries predating
+    # the scope column see a live hard owner during rollout/rollback, while new
+    # binaries can let a process-session restart ignore the ambiguous raw row
+    # without erasing its explicit-turn-state ownership. Stale-hard cleanup
+    # may later promote the scoped marker to a timestamped global tombstone.
     continuity_abandoned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
+    continuity_abandonment_scope: Mapped[str | None] = mapped_column(String(32), nullable=True, default=None)
 
 
 class CapabilityLineageMarker(Base):
@@ -938,6 +961,14 @@ class DashboardSettings(Base):
     )
     totp_secret_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     totp_last_verified_step: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    telemetry_consent: Mapped[str] = mapped_column(
+        String(16),
+        default="undecided",
+        server_default=text("'undecided'"),
+        nullable=False,
+    )
+    telemetry_instance_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    telemetry_private_key_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     http_responses_session_bridge_prompt_cache_idle_ttl_seconds: Mapped[int] = mapped_column(
         Integer,
         default=3600,
@@ -1115,6 +1146,12 @@ class ApiFirewallAllowlist(Base):
 
 class ApiKey(Base):
     __tablename__ = "api_keys"
+    __table_args__ = (
+        CheckConstraint(
+            "allowed_reasoning_efforts IS NULL OR enforced_reasoning_effort IS NULL",
+            name="ck_api_keys_reasoning_policy_exclusive",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
     name: Mapped[str] = mapped_column(String, nullable=False)
@@ -1129,6 +1166,7 @@ class ApiKey(Base):
     )
     enforced_model: Mapped[str | None] = mapped_column(String, nullable=True)
     enforced_reasoning_effort: Mapped[str | None] = mapped_column(String, nullable=True)
+    allowed_reasoning_efforts: Mapped[str | None] = mapped_column(Text, nullable=True)
     enforced_service_tier: Mapped[str | None] = mapped_column(String, nullable=True)
     traffic_class: Mapped[str] = mapped_column(
         String,
@@ -1232,6 +1270,12 @@ class ModelSource(Base):
         nullable=False,
     )
     supports_audio_transcriptions: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=false(),
+        nullable=False,
+    )
+    supports_embeddings: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
         server_default=false(),
@@ -1805,10 +1849,20 @@ class HttpBridgeRecoveryAttemptState(str, Enum):
 
 
 class HttpBridgeRowlessRecoveryState(str, Enum):
+    """Legacy recovery authority states retained for schema compatibility."""
+
     CAPTURED = "captured"
     APPROVED = "approved"
     UNKNOWN = "unknown"
     CONSUMED = "consumed"
+
+
+class HttpBridgeOperationState(str, Enum):
+    SUBMITTED = "submitted"
+    UNKNOWN = "unknown"
+    ACKNOWLEDGED = "acknowledged"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 
 class HttpBridgeSessionRecord(Base):
@@ -1844,6 +1898,9 @@ class HttpBridgeSessionRecord(Base):
     latest_input_item_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     latest_input_full_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     latest_pending_tool_calls_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Legacy CHEK recovery columns remain mapped so migration drift checks and
+    # rollback-compatible deployments recognize the production schema. The
+    # upstream runtime does not consume these fields.
     latest_response_transition_manifest_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     recovery_required_anchor_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     recovery_required_account_id: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -1931,7 +1988,7 @@ class HttpBridgeRecoveryAttemptRecord(Base):
 
 
 class HttpBridgeRowlessRecoveryAuthority(Base):
-    """Content-free operator authority that outlives bridge-session cleanup."""
+    """Legacy CHEK authority rows retained as an inert schema contract."""
 
     __tablename__ = "http_bridge_rowless_recovery_authorities"
 
@@ -2012,6 +2069,79 @@ class HttpBridgeRowlessRecoveryAuthority(Base):
             name="uq_http_bridge_rowless_recovery_task_contract",
         ),
         Index("idx_http_bridge_rowless_recovery_state", "state", "updated_at"),
+    )
+
+
+class HttpBridgeOperationRecord(Base):
+    """Durable identity and outcome for a continuity-bound response.create."""
+
+    __tablename__ = "http_bridge_operations"
+
+    operation_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    session_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("http_bridge_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    account_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    model: Mapped[str | None] = mapped_column(String, nullable=True)
+    parent_response_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    request_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'submitted'"))
+    response_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    recovery_dispatch_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    event_bytes: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    event_spool_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=func.now(), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=func.now(), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id",
+            "request_fingerprint",
+            name="uq_http_bridge_operations_session_fingerprint",
+        ),
+        Index(
+            "uq_http_bridge_operations_request_fingerprint",
+            "request_fingerprint",
+            unique=True,
+        ),
+        Index("idx_http_bridge_operations_session_parent_state", "session_id", "parent_response_id", "state"),
+        Index("idx_http_bridge_operations_parent_state", "parent_response_id", "state", "updated_at"),
+        Index("idx_http_bridge_operations_state_updated", "state", "updated_at"),
+    )
+
+
+class HttpBridgeOperationEvent(Base):
+    """Replayable upstream SSE blocks for a durable bridge operation."""
+
+    __tablename__ = "http_bridge_operation_events"
+
+    event_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    operation_id: Mapped[str] = mapped_column(
+        String(80),
+        ForeignKey("http_bridge_operations.operation_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sequence_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_text: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=func.now(), server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "operation_id",
+            "event_fingerprint",
+            name="uq_http_bridge_operation_events_operation_fingerprint",
+        ),
+        Index("idx_http_bridge_operation_events_operation_sequence", "operation_id", "sequence_number"),
     )
 
 
@@ -2122,6 +2252,17 @@ Index(
     postgresql_include=["used_percent", "reset_at", "window_minutes", "id"],
 )
 Index("idx_accounts_email", Account.email)
+# Pending-deletion queue: every replica probes ``delete_requested_at IS NOT
+# NULL LIMIT 1`` each worker interval and the leader orders the queue by
+# (delete_requested_at, id); the partial index keeps both reads off the full
+# accounts table and is empty in the steady state (no pending deletions).
+Index(
+    "idx_accounts_delete_requested_at",
+    Account.delete_requested_at,
+    Account.id,
+    postgresql_where=text("delete_requested_at IS NOT NULL"),
+    sqlite_where=text("delete_requested_at IS NOT NULL"),
+)
 Index("idx_api_keys_name", ApiKey.name)
 Index("idx_logs_account_time", RequestLog.account_id, RequestLog.requested_at)
 Index("idx_logs_model_source_time", RequestLog.model_source_id, RequestLog.requested_at)

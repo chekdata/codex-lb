@@ -26,3 +26,43 @@ max_lines = 60
 path = "frontend/src/components/layout/app-header.tsx"
 array = "CORE_NAV_ITEMS"
 max_items = 5
+
+[root_files]
+# Complete allowlist of tracked repository-root entries (files and
+# directories), compared against `git ls-tree --name-only HEAD`. A new root
+# entry is a reviewable one-line diff here; anything not listed fails the
+# check. Keep the list sorted.
+allowed = [
+  ".agents",
+  ".all-contributorsrc",
+  ".claude",
+  ".dockerignore",
+  ".env.example",
+  ".github",
+  ".gitignore",
+  ".pre-commit-config.yaml",
+  "AGENTS.md",
+  "CHANGELOG.md",
+  "CLAUDE.md",
+  "Dockerfile",
+  "Dockerfile.distroless",
+  "LICENSE",
+  "Makefile",
+  "PRINCIPLES.md",
+  "README.md",
+  "README.zh-CN.md",
+  "app",
+  "config",
+  "deploy",
+  "docker-compose.prod.yml",
+  "docker-compose.yml",
+  "docs",
+  "frontend",
+  "mkdocs.yml",
+  "openspec",
+  "pyproject.toml",
+  "renovate.json",
+  "scripts",
+  "tests",
+  "uv.lock",
+]

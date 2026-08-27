@@ -14,6 +14,7 @@ from app.core.clients.proxy import stream_responses
 from app.core.crypto import TokenEncryptor
 from app.core.openai.parsing import parse_sse_event
 from app.core.openai.requests import ResponsesRequest
+from app.core.runtime_logging import safe_log_field
 from app.core.utils.time import naive_utc_to_epoch, utcnow
 from app.db.models import Account, AccountStatus, QuotaPlannerDecision
 from app.modules.accounts.repository import AccountsRepository
@@ -151,7 +152,9 @@ class QuotaWarmupService:
                         output_tokens=WARMUP_DEFAULT_OUTPUT_BUDGET,
                     ),
                 )
-                reservation_id = reservation.reservation_id
+                # ``None`` means no configured limit applies to the warmup
+                # probe; there is nothing to finalize afterwards.
+                reservation_id = reservation.reservation_id if reservation is not None else None
             except ApiKeyNotFoundError:
                 row = await self._planner.update_decision_status(
                     decision.id,
@@ -309,7 +312,11 @@ class QuotaWarmupService:
         try:
             await self._record_warmup_effect(account, model, source=source, confidence=confidence)
         except Exception:
-            logger.exception("Failed to record quota warmup effect", extra={"account_id": account.id, "model": model})
+            logger.exception(
+                "Failed to record quota warmup effect account_id=%s model=%s",
+                safe_log_field(account.id),
+                safe_log_field(model),
+            )
 
     async def _resolve_refused_claim(
         self,

@@ -6,11 +6,10 @@ import json
 import logging
 import math
 from collections.abc import AsyncGenerator, Callable
-from typing import Any, AsyncIterator, Literal, Mapping, TypeVar, cast
+from typing import Any, AsyncIterator, Mapping, TypeVar, cast
 from uuid import uuid4
 
 import anyio
-from sqlalchemy import select
 
 from app.core.clients.files import create_file as core_create_file  # noqa: F401
 from app.core.clients.files import finalize_file as core_finalize_file  # noqa: F401
@@ -36,7 +35,11 @@ from app.core.clients.proxy import codex_control_request as core_codex_control_r
 from app.core.clients.proxy import compact_responses as core_compact_responses  # noqa: F401
 from app.core.clients.proxy import transcribe_audio as core_transcribe_audio  # noqa: F401
 from app.core.clients.proxy_websocket import UpstreamWebSocketTransportError
-from app.core.errors import openai_error, response_failed_event
+from app.core.errors import (
+    OpenAIErrorEnvelope,
+    openai_error,
+    response_failed_event,
+)
 from app.core.metrics.prometheus import (
     PROMETHEUS_AVAILABLE,
     bridge_durable_recover_total,
@@ -52,12 +55,9 @@ from app.core.utils.request_id import ensure_request_id, ensure_request_scope_id
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
 from app.core.utils.time import utcnow
 from app.db.models import (
-    Account,
-    HttpBridgeRowlessRecoveryState,
     HttpBridgeSessionState,
     StickySessionKind,
 )
-from app.db.session import SessionLocal
 from app.modules.api_keys.service import (
     ApiKeyData,
     ApiKeyUsageReservationData,
@@ -72,7 +72,6 @@ from app.modules.proxy._service.compact import (
     _sticky_key_from_compact_payload as _sticky_key_from_compact_payload,
 )
 from app.modules.proxy._service.http_bridge.helpers import (
-    _await_task_deferring_cancellation,
     _effective_http_bridge_idle_ttl_seconds,
     _http_bridge_durable_lease_ttl_seconds,
     _http_bridge_durable_lookup_allows_turn_state_takeover,
@@ -86,6 +85,8 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_request_budget_seconds,
     _http_bridge_request_needs_unanchored_handoff,
     _http_bridge_request_stage,
+    _http_bridge_requires_cluster_registration,
+    _http_bridge_retry_circuit_attempt_selection_for_pending_requests,
     _http_bridge_runtime_config,
     _http_bridge_should_attempt_local_bootstrap_rebind,
     _http_bridge_should_attempt_local_previous_response_recovery,
@@ -104,14 +105,11 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _reserve_http_bridge_unanchored_handoff,
     _trim_http_bridge_previous_response_input_items,
 )
-from app.modules.proxy._service.http_bridge.quarantine import (
-    _HTTP_BRIDGE_QUARANTINE_REJECTED_STALE_ANCHOR_REASON,
-    _http_bridge_session_key_quarantined,
-    _quarantine_http_bridge_session,
+from app.modules.proxy._service.http_bridge.owner_forwarding import (
+    _owner_forward_failure_allows_local_recovery,
 )
-from app.modules.proxy._service.http_bridge.request_submit import _text_with_account_installation_id
-from app.modules.proxy._service.http_bridge.retry_circuit import (
-    _http_bridge_retry_circuit_error_message,
+from app.modules.proxy._service.http_bridge.quarantine import (
+    _http_bridge_session_key_quarantined,
 )
 from app.modules.proxy._service.http_bridge.service_stubs import (
     _build_rewritten_stream_response_failed_event,
@@ -172,6 +170,7 @@ from app.modules.proxy._service.support import (
     _is_local_account_cap_code,
     _signal_propagated_capacity_startup_ready,
     _signal_propagated_capacity_startup_wait,
+    _signal_propagated_responses_service_cleanup_ready,
     _ttft_event_visible_at,
     _WebSocketRequestState,
 )
@@ -210,6 +209,7 @@ from app.modules.proxy._service.warmup import (
 )
 from app.modules.proxy.affinity import (
     _AffinityPolicy,
+    _codex_backend_identity,
     _extract_model_class,
     _prompt_cache_key_from_request_model,
     _request_allows_bare_session_cap_spillover,
@@ -225,143 +225,22 @@ from app.modules.proxy.continuity import (
     without_http_bridge_session_affinity_headers,
 )
 from app.modules.proxy.durable_bridge_coordinator import DurableBridgeLookup
-from app.modules.proxy.durable_bridge_repository import (
-    durable_bridge_api_key_scope,
-    durable_bridge_hash,
-)
+from app.modules.proxy.durable_bridge_repository import durable_bridge_hash
 from app.modules.proxy.durable_bridge_runtime import http_bridge_owner_process_epoch
 from app.modules.proxy.helpers import (
     _normalize_error_code,
 )
 from app.modules.proxy.replay_safety import (
-    AccountNeutralCodexTurnMetadataEvidence,
-    abandoned_pending_agent_boundary_rejection_reason,
-    account_neutral_codex_turn_metadata_identity,
-    project_responses_input_for_abandoned_pending_fresh_replay,
     project_responses_input_for_account_neutral_fresh_replay,
     responses_input_suffix_matches_pending_tool_calls,
-    responses_input_suffix_matches_transition_manifest,
     responses_input_suffix_retains_prior_output,
     responses_payload_is_account_neutral_fresh_replay,
-)
-from app.modules.proxy.rowless_recovery import (
-    RowlessRecoveryCaptureIntent,
-    approved_rowless_recovery_projection,
-    build_rowless_recovery_capture_facts,
-    rowless_actual_wire_fingerprint,
-    rowless_strong_session_hash,
-    rowless_task_authority_digest,
-)
-from app.modules.proxy.rowless_recovery_repository import (
-    RowlessRecoveryRepository,
-    RowlessRecoveryStateError,
 )
 
 logger = logging.getLogger("app.modules.proxy.service")
 T = TypeVar("T")
 _REQUEST_TRANSPORT_HTTP = "http"
 _RESPONSE_CREATE_GATE_RETRY_SLEEP_SECONDS = 10.0
-# Keep the old authority/marker schemas readable for rollback safety, but use
-# the upstream durable-owner/full-resend recovery path for all live requests.
-_DURABLE_RECOVERY_MARKER_REQUEST_PATH_ENABLED = False
-_ROWLESS_SEMANTIC_REBASE_REQUEST_PATH_ENABLED = False
-_OBSERVABLE_REPLAY_SUFFIX_ITEM_TYPES = frozenset(
-    {
-        "agent_message",
-        "apply_patch_call",
-        "apply_patch_call_output",
-        "custom_tool_call",
-        "custom_tool_call_output",
-        "function_call",
-        "function_call_output",
-        "reasoning",
-    }
-)
-
-
-def _durable_recovery_marker_request_path_active(lookup: DurableBridgeLookup | None) -> bool:
-    return bool(
-        _DURABLE_RECOVERY_MARKER_REQUEST_PATH_ENABLED
-        and lookup is not None
-        and lookup.recovery_is_required_for_latest_anchor()
-    )
-
-
-def _full_resend_suffix_shape_for_observability(
-    input_items: list[JsonValue],
-    *,
-    stored_count: int,
-) -> str:
-    """Return a bounded, content-free shape for rejected replay proofs."""
-
-    labels: list[str] = []
-    for item in input_items[stored_count : stored_count + 8]:
-        if not isinstance(item, dict):
-            labels.append("scalar")
-            continue
-        item_type = item.get("type")
-        role = item.get("role")
-        if (
-            item_type in (None, "message")
-            and isinstance(role, str)
-            and role in {"assistant", "developer", "system", "user"}
-        ):
-            labels.append(str(role))
-        elif isinstance(item_type, str) and item_type in _OBSERVABLE_REPLAY_SUFFIX_ITEM_TYPES:
-            labels.append(item_type)
-        elif isinstance(item_type, str) and item_type in {"input_file", "input_image", "input_text"}:
-            labels.append("input_part")
-        else:
-            labels.append("other")
-    if len(input_items) - stored_count > 8:
-        labels.append("more")
-    return ">".join(labels) or "empty"
-
-
-def _log_abandoned_pending_full_resend_rejection(
-    *,
-    bridge_session_key: _HTTPBridgeSessionKey,
-    payload: ResponsesRequest,
-    durable_lookup: DurableBridgeLookup | None,
-    reason_code: str | None,
-    stage: str,
-) -> None:
-    """Log one bounded proof branch without request content or raw ids."""
-
-    if (
-        reason_code is None
-        or durable_lookup is None
-        or not durable_lookup.latest_pending_tool_calls
-        or not isinstance(payload.input, list)
-        or not _http_bridge_payload_looks_like_full_resend(payload)
-    ):
-        return
-    stored_count = durable_lookup.latest_input_item_count
-    if stored_count is None or stored_count < 0 or stored_count > len(payload.input):
-        stored_items = "invalid"
-        suffix_items = "invalid"
-        suffix_shape = "unavailable"
-    else:
-        stored_items = str(stored_count)
-        suffix_items = str(len(payload.input) - stored_count)
-        suffix_shape = _full_resend_suffix_shape_for_observability(
-            payload.input,
-            stored_count=stored_count,
-        )
-    _log_http_bridge_event(
-        "abandoned_pending_full_resend_proof_rejected",
-        bridge_session_key,
-        account_id=None,
-        model=payload.model,
-        detail=(
-            f"reason_code={reason_code},stage={stage},"
-            f"stored_items={stored_items},suffix_items={suffix_items},"
-            f"suffix_shape={suffix_shape}"
-        ),
-        cache_key_family=bridge_session_key.affinity_kind,
-        model_class=_extract_model_class(payload.model) if payload.model else None,
-        owner_check_applied=True,
-    )
 
 
 def _http_bridge_continuity_bound_without_safe_replay(request_state: _WebSocketRequestState) -> bool:
@@ -371,6 +250,11 @@ def _http_bridge_continuity_bound_without_safe_replay(request_state: _WebSocketR
     return request_state.hard_continuity_anchor and not (
         request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text
     )
+
+
+def _http_bridge_durable_recovery_predecessor_proven(request_state: _WebSocketRequestState) -> bool:
+    """Return whether the operation has a durable predecessor anchor."""
+    return request_state.previous_response_id is not None or request_state.operation_parent_response_id is not None
 
 
 class _VerifiedDurableFullResend:
@@ -383,7 +267,6 @@ class _VerifiedDurableFullResend:
     _pending_tool_calls: tuple[tuple[str, str], ...] | None
     _stored_input_fingerprint: str
     _stored_input_item_count: int
-    _transition_manifest_digest: str | None
     __slots__ = (
         "_durable_session_id",
         "_full_input_fingerprint",
@@ -392,7 +275,6 @@ class _VerifiedDurableFullResend:
         "_pending_tool_calls",
         "_stored_input_fingerprint",
         "_stored_input_item_count",
-        "_transition_manifest_digest",
     )
     __construction_token = object()
 
@@ -407,7 +289,6 @@ class _VerifiedDurableFullResend:
         stored_input_fingerprint: str,
         full_input_fingerprint: str,
         pending_tool_calls: tuple[tuple[str, str], ...] | None,
-        transition_manifest_digest: str | None = None,
     ) -> None:
         if _token is not self.__construction_token:
             raise TypeError("verified durable full resend proofs are created only by the verifier")
@@ -418,7 +299,6 @@ class _VerifiedDurableFullResend:
         object.__setattr__(self, "_stored_input_fingerprint", stored_input_fingerprint)
         object.__setattr__(self, "_full_input_fingerprint", full_input_fingerprint)
         object.__setattr__(self, "_pending_tool_calls", pending_tool_calls)
-        object.__setattr__(self, "_transition_manifest_digest", transition_manifest_digest)
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("verified durable full resend proofs are immutable")
@@ -451,12 +331,6 @@ class _VerifiedDurableFullResend:
             and durable_lookup.latest_input_item_count == self._stored_input_item_count
             and durable_lookup.latest_input_full_fingerprint == self._stored_input_fingerprint
             and _pending_tool_calls_identity(durable_lookup.latest_pending_tool_calls) == self._pending_tool_calls
-            and (
-                durable_lookup.latest_response_transition_manifest.digest
-                if durable_lookup.latest_response_transition_manifest is not None
-                else None
-            )
-            == self._transition_manifest_digest
             and _fingerprint_input_items(cast(list[JsonValue], input_items)) == self._full_input_fingerprint
         )
 
@@ -492,46 +366,27 @@ class _VerifiedDurableFullResend:
             # inline Responses-Lite developer IDs must remain visible until
             # the exact-manifest check rejects response-owned messages.
             preserve_developer_message_ids=True,
-            preserve_response_owned_agent_message_ids=True,
         )
         pending_tool_calls = durable_lookup.latest_pending_tool_calls
         if replay_projection is None:
             return None
-        transition_manifest = durable_lookup.latest_response_transition_manifest
-        if transition_manifest is not None:
-            safe_fresh_context = pending_tool_calls is not None and responses_input_suffix_matches_transition_manifest(
-                input_items,
-                stored_count=stored_count,
-                response_id=latest_response_id,
+        safe_fresh_context = responses_input_suffix_retains_prior_output(
+            replay_projection.input_items,
+            stored_count=replay_projection.stored_prefix_count,
+            canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+        ) or (
+            pending_tool_calls is not None
+            and responses_input_suffix_matches_pending_tool_calls(
+                replay_projection.input_items,
+                stored_count=replay_projection.stored_prefix_count,
                 pending_tool_calls=pending_tool_calls,
-                transition_manifest=transition_manifest,
+                canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
             )
-        else:
-            safe_fresh_context = (
-                False
-                if pending_tool_calls is None
-                else responses_input_suffix_matches_pending_tool_calls(
-                    replay_projection.input_items,
-                    stored_count=replay_projection.stored_prefix_count,
-                    pending_tool_calls=pending_tool_calls,
-                    canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
-                )
-                if pending_tool_calls
-                else responses_input_suffix_retains_prior_output(
-                    replay_projection.input_items,
-                    stored_count=replay_projection.stored_prefix_count,
-                    canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
-                    # The prefix fingerprint matched the exact context previously
-                    # completed by this same-account session. Only the new
-                    # inter-agent boundary additionally requires an explicitly
-                    # empty manifest.
-                    exact_stored_prefix_without_pending_manifest=True,
-                    allow_response_owned_agent_message=pending_tool_calls == {},
-                )
-            )
+        )
         if not safe_fresh_context:
             return None
-        return cls._seal(
+        return cls(
+            _token=cls.__construction_token,
             durable_session_id=durable_lookup.session_id,
             owner_account_id=owner_account_id,
             latest_response_id=latest_response_id,
@@ -539,32 +394,6 @@ class _VerifiedDurableFullResend:
             stored_input_fingerprint=stored_fingerprint,
             full_input_fingerprint=_fingerprint_input_items(input_items),
             pending_tool_calls=_pending_tool_calls_identity(pending_tool_calls),
-            transition_manifest_digest=(transition_manifest.digest if transition_manifest is not None else None),
-        )
-
-    @classmethod
-    def _seal(
-        cls,
-        *,
-        durable_session_id: str,
-        owner_account_id: str,
-        latest_response_id: str,
-        stored_input_item_count: int,
-        stored_input_fingerprint: str,
-        full_input_fingerprint: str,
-        pending_tool_calls: tuple[tuple[str, str], ...] | None,
-        transition_manifest_digest: str | None = None,
-    ) -> "_VerifiedDurableFullResend":
-        return cls(
-            _token=cls.__construction_token,
-            durable_session_id=durable_session_id,
-            owner_account_id=owner_account_id,
-            latest_response_id=latest_response_id,
-            stored_input_item_count=stored_input_item_count,
-            stored_input_fingerprint=stored_input_fingerprint,
-            full_input_fingerprint=full_input_fingerprint,
-            pending_tool_calls=pending_tool_calls,
-            transition_manifest_digest=transition_manifest_digest,
         )
 
 
@@ -583,269 +412,50 @@ def _verify_durable_full_resend(
     return _VerifiedDurableFullResend._verify(payload, durable_lookup)
 
 
-def _verify_durable_abandoned_pending_full_resend(
-    payload: ResponsesRequest,
-    durable_lookup: DurableBridgeLookup | None,
-) -> _VerifiedDurableFullResend | None:
-    """Seal a full resend that may recover only after exact anchor rejection.
+def _http_bridge_client_full_history_recovery_enabled(request_state: _WebSocketRequestState) -> bool:
+    """Return whether an ambiguous anchored turn may fall back to client replay.
 
-    Unlike ``_verify_durable_full_resend``, this proof does not make a request
-    generally replay-safe.  It binds an exact stored prefix, a non-empty
-    durable pending-call manifest, and a later response-owned inter-agent
-    boundary whose client history contains none of those pending call ids.
-    Callers may use it only after upstream rejects the exact durable anchor
-    before producing any response event.
+    The client can recover an unknown upstream handoff by dropping
+    ``previous_response_id`` and resending its full local history. This is
+    intentionally opt-in: upstream acceptance is still ambiguous and the
+    fallback therefore has at-least-once (possible duplicate) semantics.
     """
-
-    proof, _reason_code = _verify_durable_abandoned_pending_full_resend_with_reason(
-        payload,
-        durable_lookup,
-    )
-    return proof
-
-
-def _verify_durable_abandoned_pending_full_resend_with_reason(
-    payload: ResponsesRequest,
-    durable_lookup: DurableBridgeLookup | None,
-) -> tuple[_VerifiedDurableFullResend | None, str | None]:
-    """Return a sealed proof or its first content-free rejection branch."""
-
-    if durable_lookup is None:
-        return None, "durable_lookup_missing"
-    owner_account_id = durable_lookup.account_id
-    latest_response_id = durable_lookup.latest_response_id
-    stored_count = durable_lookup.latest_input_item_count
-    stored_fingerprint = durable_lookup.latest_input_full_fingerprint
-    pending_tool_calls = durable_lookup.latest_pending_tool_calls
-    if owner_account_id is None:
-        return None, "durable_owner_missing"
-    if latest_response_id is None:
-        return None, "durable_anchor_missing"
-    if stored_count is None or stored_count <= 0 or stored_fingerprint is None:
-        return None, "stored_prefix_invalid"
-    if not pending_tool_calls:
-        return None, "pending_call_manifest_missing"
-    if not isinstance(payload.input, list):
-        return None, "payload_input_not_list"
-    if not _http_bridge_payload_looks_like_full_resend(payload):
-        return None, "payload_not_full_resend"
-    if not _input_prefix_matches_stored_context(
-        payload.input,
-        stored_count=stored_count,
-        stored_fingerprint=stored_fingerprint,
-    ):
-        return None, "stored_prefix_mismatch"
-    input_items = cast(list[JsonValue], payload.input)
-    boundary_rejection = abandoned_pending_agent_boundary_rejection_reason(
-        input_items,
-        stored_count=stored_count,
-        pending_tool_calls=pending_tool_calls,
-    )
-    if boundary_rejection is not None:
-        return None, boundary_rejection
+    settings = _service_get_settings()
     return (
-        _VerifiedDurableFullResend._seal(
-            durable_session_id=durable_lookup.session_id,
-            owner_account_id=owner_account_id,
-            latest_response_id=latest_response_id,
-            stored_input_item_count=stored_count,
-            stored_input_fingerprint=stored_fingerprint,
-            full_input_fingerprint=_fingerprint_input_items(input_items),
-            pending_tool_calls=_pending_tool_calls_identity(pending_tool_calls),
-            transition_manifest_digest=(
-                durable_lookup.latest_response_transition_manifest.digest
-                if durable_lookup.latest_response_transition_manifest is not None
-                else None
-            ),
-        ),
-        None,
+        getattr(settings, "http_responses_session_bridge_ambiguous_continuation_recovery_mode", "fail_closed")
+        == "client_full_history_once"
+        and request_state.previous_response_id is not None
+        and request_state.response_id is None
+        and request_state.response_event_count == 0
+        and not request_state.fresh_upstream_request_is_retry_safe
     )
 
 
-class _VerifiedStoreContextFullResend:
-    """Request-local proof for an exact store-context prefix trim.
-
-    This proof is intentionally separate from durable full-resend evidence.
-    It is minted only while the live bridge still owns the response anchor and
-    only after the incoming full input exactly matches that bridge's stored
-    prefix.  The complete untrimmed request therefore remains available for a
-    single same-account recovery if upstream rejects the proxy-injected anchor
-    before producing any response event.
-    """
-
-    _affinity_key: str
-    _affinity_kind: str
-    _api_key_id: str | None
-    _full_input_fingerprint: str
-    _latest_response_id: str
-    _owner_account_id: str
-    _pending_tool_calls: tuple[tuple[str, str], ...] | None
-    _stored_input_fingerprint: str
-    _stored_input_item_count: int
-    _transition_manifest_digest: str | None
-    __slots__ = (
-        "_affinity_key",
-        "_affinity_kind",
-        "_api_key_id",
-        "_full_input_fingerprint",
-        "_latest_response_id",
-        "_owner_account_id",
-        "_pending_tool_calls",
-        "_stored_input_fingerprint",
-        "_stored_input_item_count",
-        "_transition_manifest_digest",
+def _http_bridge_server_anchored_replay_enabled(request_state: _WebSocketRequestState) -> bool:
+    """Return whether the one permitted server-side anchored replay is unused."""
+    settings = _service_get_settings()
+    return (
+        getattr(settings, "http_responses_session_bridge_ambiguous_continuation_recovery_mode", "fail_closed")
+        in {"server_anchored_replay_once", "server_indefinite_recovery"}
+        and request_state.previous_response_id is not None
+        and request_state.response_id is None
+        and request_state.response_event_count == 0
+        and (
+            request_state.replay_count == 0
+            or getattr(settings, "http_responses_session_bridge_ambiguous_continuation_recovery_mode", "")
+            == "server_indefinite_recovery"
+        )
     )
-    __construction_token = object()
-
-    def __init__(
-        self,
-        *,
-        _token: object,
-        affinity_kind: str,
-        affinity_key: str,
-        api_key_id: str | None,
-        owner_account_id: str,
-        latest_response_id: str,
-        stored_input_item_count: int,
-        stored_input_fingerprint: str,
-        full_input_fingerprint: str,
-        pending_tool_calls: tuple[tuple[str, str], ...] | None,
-        transition_manifest_digest: str | None = None,
-    ) -> None:
-        if _token is not self.__construction_token:
-            raise TypeError("verified store-context full resend proofs are created only by the verifier")
-        object.__setattr__(self, "_affinity_kind", affinity_kind)
-        object.__setattr__(self, "_affinity_key", affinity_key)
-        object.__setattr__(self, "_api_key_id", api_key_id)
-        object.__setattr__(self, "_owner_account_id", owner_account_id)
-        object.__setattr__(self, "_latest_response_id", latest_response_id)
-        object.__setattr__(self, "_stored_input_item_count", stored_input_item_count)
-        object.__setattr__(self, "_stored_input_fingerprint", stored_input_fingerprint)
-        object.__setattr__(self, "_full_input_fingerprint", full_input_fingerprint)
-        object.__setattr__(self, "_pending_tool_calls", pending_tool_calls)
-        object.__setattr__(self, "_transition_manifest_digest", transition_manifest_digest)
-
-    def __setattr__(self, _name: str, _value: object) -> None:
-        raise AttributeError("verified store-context full resend proofs are immutable")
-
-    def __copy__(self) -> "_VerifiedStoreContextFullResend":
-        return self
-
-    def __deepcopy__(self, _memo: dict[int, object]) -> "_VerifiedStoreContextFullResend":
-        return self
-
-    def __reduce_ex__(self, _protocol: object) -> str | tuple[Any, ...]:
-        raise TypeError("verified store-context full resend proofs cannot be serialized")
-
-    def matches(self, payload: ResponsesRequest, session: _HTTPBridgeSession) -> bool:
-        input_items = payload.input
-        return (
-            payload.previous_response_id is None
-            and isinstance(input_items, list)
-            and session.key.affinity_kind == self._affinity_kind
-            and session.key.affinity_key == self._affinity_key
-            and session.key.api_key_id == self._api_key_id
-            and session.account.id == self._owner_account_id
-            and session.last_completed_response_account_id == self._owner_account_id
-            and session.last_completed_response_id == self._latest_response_id
-            and session.last_completed_input_count == self._stored_input_item_count
-            and session.last_completed_input_prefix_fingerprint == self._stored_input_fingerprint
-            and not session.last_pending_tool_call_manifest_invalid
-            and _pending_tool_calls_identity(session.last_pending_tool_calls) == self._pending_tool_calls
-            and (
-                session.last_response_transition_manifest.digest
-                if session.last_response_transition_manifest is not None
-                else None
-            )
-            == self._transition_manifest_digest
-            and _fingerprint_input_items(cast(list[JsonValue], input_items)) == self._full_input_fingerprint
-        )
-
-    @classmethod
-    def _verify(
-        cls,
-        payload: ResponsesRequest,
-        session: _HTTPBridgeSession,
-    ) -> "_VerifiedStoreContextFullResend | None":
-        owner_account_id = session.last_completed_response_account_id
-        latest_response_id = session.last_completed_response_id
-        stored_count = session.last_completed_input_count
-        stored_fingerprint = session.last_completed_input_prefix_fingerprint
-        if (
-            payload.previous_response_id is not None
-            or owner_account_id is None
-            or owner_account_id != session.account.id
-            or latest_response_id is None
-            or stored_count <= 0
-            or stored_fingerprint is None
-            or session.last_pending_tool_call_manifest_invalid
-            or not _http_bridge_payload_looks_like_full_resend(payload)
-            or not isinstance(payload.input, list)
-            or not _input_prefix_matches_stored_context(
-                payload.input,
-                stored_count=stored_count,
-                stored_fingerprint=stored_fingerprint,
-            )
-        ):
-            return None
-        input_items = cast(list[JsonValue], payload.input)
-        replay_projection = project_responses_input_for_account_neutral_fresh_replay(
-            input_items,
-            stored_count=stored_count,
-            preserve_developer_message_ids=True,
-            preserve_response_owned_agent_message_ids=True,
-        )
-        pending_tool_calls = session.last_pending_tool_calls
-        if replay_projection is None:
-            return None
-        transition_manifest = session.last_response_transition_manifest
-        if transition_manifest is not None:
-            safe_fresh_context = responses_input_suffix_matches_transition_manifest(
-                input_items,
-                stored_count=stored_count,
-                response_id=latest_response_id,
-                pending_tool_calls=pending_tool_calls,
-                transition_manifest=transition_manifest,
-            )
-        else:
-            safe_fresh_context = (
-                responses_input_suffix_matches_pending_tool_calls(
-                    replay_projection.input_items,
-                    stored_count=replay_projection.stored_prefix_count,
-                    pending_tool_calls=pending_tool_calls,
-                    canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
-                )
-                if pending_tool_calls
-                else responses_input_suffix_retains_prior_output(
-                    replay_projection.input_items,
-                    stored_count=replay_projection.stored_prefix_count,
-                    canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
-                    exact_stored_prefix_without_pending_manifest=True,
-                    allow_response_owned_agent_message=pending_tool_calls == {},
-                )
-            )
-        if not safe_fresh_context:
-            return None
-        return cls(
-            _token=cls.__construction_token,
-            affinity_kind=session.key.affinity_kind,
-            affinity_key=session.key.affinity_key,
-            api_key_id=session.key.api_key_id,
-            owner_account_id=owner_account_id,
-            latest_response_id=latest_response_id,
-            stored_input_item_count=stored_count,
-            stored_input_fingerprint=stored_fingerprint,
-            full_input_fingerprint=_fingerprint_input_items(input_items),
-            pending_tool_calls=_pending_tool_calls_identity(pending_tool_calls),
-            transition_manifest_digest=(transition_manifest.digest if transition_manifest is not None else None),
-        )
 
 
-def _verify_store_context_full_resend(
-    payload: ResponsesRequest,
-    session: _HTTPBridgeSession,
-) -> _VerifiedStoreContextFullResend | None:
-    return _VerifiedStoreContextFullResend._verify(payload, session)
+def _http_bridge_client_full_history_recovery_error() -> OpenAIErrorEnvelope:
+    payload = openai_error(
+        "previous_response_not_found",
+        "Previous response was not found; retry without previous_response_id.",
+        error_type="invalid_request_error",
+    )
+    payload["error"]["param"] = "previous_response_id"
+    return payload
 
 
 _HTTP_BRIDGE_DEAD_OWNER_NOT_FOUND_DETAIL = "The previous bridge owner is no longer available."
@@ -1219,80 +829,6 @@ async def _registered_turn_state_anchor_lookup(
     return lookup
 
 
-def _rowless_client_metadata_evidence(
-    *,
-    raw_client_metadata: JsonValue | None,
-    normalized_headers: Mapping[str, str],
-    session_id: str,
-    task_identity: str,
-) -> tuple[bool, bool, bool, bool]:
-    """Validate body and direct-header Codex identity carriers."""
-
-    if raw_client_metadata is None:
-        client_metadata: Mapping[str, JsonValue] = {}
-    elif isinstance(raw_client_metadata, Mapping):
-        client_metadata = raw_client_metadata
-    else:
-        return False, False, False, False
-
-    child_signal = any(
-        key in normalized_headers or key in client_metadata for key in ("x-codex-parent-thread-id", "x-openai-subagent")
-    )
-    metadata_thread_present = False
-
-    for key, expected in (("session_id", session_id), ("thread_id", task_identity)):
-        if key not in client_metadata:
-            continue
-        value = client_metadata[key]
-        if not isinstance(value, str) or not value.strip() or value.strip() != expected:
-            return False, child_signal, metadata_thread_present, False
-        if key == "thread_id":
-            metadata_thread_present = True
-
-    flat_turn_id = client_metadata.get("turn_id")
-    if flat_turn_id is not None and not (isinstance(flat_turn_id, str) and bool(flat_turn_id.strip())):
-        return False, child_signal, metadata_thread_present, False
-    turn_metadata_carriers: list[tuple[JsonValue, Literal["body", "direct"]]] = []
-    if "x-codex-turn-metadata" in client_metadata:
-        turn_metadata_carriers.append((client_metadata["x-codex-turn-metadata"], "body"))
-    if "x-codex-turn-metadata" in normalized_headers:
-        turn_metadata_carriers.append((normalized_headers["x-codex-turn-metadata"], "direct"))
-    carrier_identities: list[AccountNeutralCodexTurnMetadataEvidence] = []
-    for raw_turn_metadata, carrier in turn_metadata_carriers:
-        identity = account_neutral_codex_turn_metadata_identity(
-            raw_turn_metadata,
-            carrier=carrier,
-            expected_session_identity=session_id,
-            expected_task_identity=task_identity,
-            expected_turn_identity=flat_turn_id,
-        )
-        if identity is None:
-            return False, child_signal, metadata_thread_present, False
-        carrier_identities.append(identity)
-        metadata_thread_present = True
-    if len(set(carrier_identities)) > 1:
-        return False, child_signal, metadata_thread_present, False
-    if carrier_identities:
-        canonical = carrier_identities[0]
-        flat_projection_pairs = (
-            (client_metadata.get("root_turn_id"), canonical.root_turn_identity),
-            (client_metadata.get("x-codex-installation-id"), canonical.installation_identity),
-            (client_metadata.get("x-codex-window-id"), canonical.window_identity),
-            (normalized_headers.get("x-codex-installation-id"), canonical.installation_identity),
-            (normalized_headers.get("x-codex-window-id"), canonical.window_identity),
-        )
-        if any(flat is not None and flat != nested for flat, nested in flat_projection_pairs):
-            return False, child_signal, metadata_thread_present, False
-
-    automatic_live_recovery = bool(
-        carrier_identities
-        and carrier_identities[0].workspace_kind is not None
-        and carrier_identities[0].workspace_kind.strip()
-        and carrier_identities[0].forked_from_thread_identity is None
-    )
-    return True, child_signal, metadata_thread_present, automatic_live_recovery
-
-
 class _HTTPBridgeStreamingMixin:
     async def validate_http_bridge_legacy_forward_anchor(
         self: Any,
@@ -1399,17 +935,11 @@ class _HTTPBridgeStreamingMixin:
         payload_size_estimate_bytes = len(
             json.dumps(payload.to_payload(), ensure_ascii=True, separators=(",", ":")).encode("utf-8")
         )
-        # File pins are process-local. A remote owner must trust only the
-        # origin-resolved value carried by the authenticated forward context;
-        # re-looking it up here would turn a valid cross-replica pin into a miss.
-        local_file_owner_account_id = (
-            None
-            if forwarded_file_owner_account_id is not None
-            else await self._resolve_file_account_for_responses(payload, headers)
-        )
-        rewritten_file_account_id = resolve_required_account_id(
-            ("signed forwarding context", forwarded_file_owner_account_id),
-            ("local file pin", local_file_owner_account_id),
+        rewritten_file_account_id = await self._resolve_forwarded_file_account_for_responses(
+            payload,
+            headers,
+            forwarded_file_owner_account_id=forwarded_file_owner_account_id,
+            require_forwarded_file_owner=forwarded_request,
         )
         ws_payload_budget_bytes = _ws_transport_payload_budget_bytes(_service_get_settings())
         if runtime_config.enabled and payload_size_estimate_bytes > ws_payload_budget_bytes:
@@ -1445,6 +975,7 @@ class _HTTPBridgeStreamingMixin:
                 suppress_text_done_events=suppress_text_done_events,
                 request_transport=_REQUEST_TRANSPORT_HTTP,
                 rewritten_file_account_id=rewritten_file_account_id,
+                file_account_resolution_complete=True,
                 upstream_stream_transport_override=force_upstream_stream_transport,
                 client_ip=client_ip,
                 enforce_openai_sdk_contract=enforce_openai_sdk_contract,
@@ -1653,7 +1184,9 @@ class _HTTPBridgeStreamingMixin:
             api_key=api_key,
         )
         sticky_key_source = "none"
-        if affinity.kind == StickySessionKind.CODEX_SESSION:
+        if affinity.codex_session_source == "thread_header":
+            sticky_key_source = "thread_header"
+        elif affinity.kind == StickySessionKind.CODEX_SESSION:
             sticky_key_source = (
                 "turn_state_header" if _sticky_key_from_turn_state_header(headers) is not None else "session_header"
             )
@@ -1697,6 +1230,13 @@ class _HTTPBridgeStreamingMixin:
             if not forwarded_request
             else None
         )
+        durable_session_header_alias = (
+            None
+            if _codex_backend_identity(headers).thread_id is not None
+            else session_header_fallback_key.affinity_key
+            if explicit_prompt_cache_key is not None and session_header_fallback_key is not None
+            else incoming_session_header
+        )
         legacy_anchor_lookup = await _legacy_forward_anchor_lookup(
             durable_bridge=self._durable_bridge,
             bridge_session_key=bridge_session_key,
@@ -1724,11 +1264,9 @@ class _HTTPBridgeStreamingMixin:
                     session_key_value=bridge_session_key.affinity_key,
                     api_key_id=bridge_session_key.api_key_id,
                     turn_state=durable_lookup_turn_state,
-                    session_header=(
-                        session_header_fallback_key.affinity_key
-                        if explicit_prompt_cache_key is not None and session_header_fallback_key is not None
-                        else incoming_session_header
-                    ),
+                    # A raw process alias is ambiguous when thread-id exists.
+                    # Exact turn/response aliases remain independent inputs.
+                    session_header=durable_session_header_alias,
                     previous_response_id=payload.previous_response_id,
                 )
             except ProxyResponseError:
@@ -1767,6 +1305,12 @@ class _HTTPBridgeStreamingMixin:
                         exc_info=True,
                     )
                 durable_lookup = None
+        if affinity.abandon_unavailable_legacy_owner:
+            # A verified goal restart deliberately resends all portable state.
+            # The old bridge row is therefore not additional ownership proof:
+            # promoting it to preferred_account_id below would bypass the only
+            # selection path allowed to atomically retire the raw sticky owner.
+            durable_lookup = None
         if durable_lookup is not None and durable_lookup.latest_response_id is not None:
             current_instance = _service_get_settings().http_responses_session_bridge_instance_id
             current_process_epoch = http_bridge_owner_process_epoch()
@@ -1797,180 +1341,10 @@ class _HTTPBridgeStreamingMixin:
         durable_recovery_attempt_claimed = False
         durable_recovery_attempt_session_id: str | None = None
         durable_recovery_attempt_owner_epoch: int | None = None
+        durable_recovery_fresh_replay = False
         durable_full_resend_proof = _verify_durable_full_resend(payload, durable_lookup)
-        (
-            durable_abandoned_pending_full_resend_proof,
-            durable_abandoned_pending_full_resend_rejection_reason,
-        ) = _verify_durable_abandoned_pending_full_resend_with_reason(
-            payload,
-            durable_lookup,
-        )
-        durable_marker_abandoned_pending_candidate = bool(
-            _durable_recovery_marker_request_path_active(durable_lookup)
-            and durable_abandoned_pending_full_resend_proof is not None
-            and durable_abandoned_pending_full_resend_proof.matches(payload, durable_lookup)
-        )
-        durable_marker_verified_recovery_candidate = bool(
-            _durable_recovery_marker_request_path_active(durable_lookup)
-            and (
-                (durable_full_resend_proof is not None and durable_full_resend_proof.matches(payload, durable_lookup))
-                or durable_marker_abandoned_pending_candidate
-            )
-        )
-        if durable_full_resend_proof is None:
-            _log_abandoned_pending_full_resend_rejection(
-                bridge_session_key=bridge_session_key,
-                payload=payload,
-                durable_lookup=durable_lookup,
-                reason_code=durable_abandoned_pending_full_resend_rejection_reason,
-                stage="initial_lookup",
-            )
         durable_full_resend_fresh_bridge_proof: _VerifiedDurableFullResend | None = None
-        durable_marker_abandoned_pending_replay = False
-        durable_marker_verified_recovery = False
         force_local_recovery_creation = False
-        normalized_ingress_headers = {key.lower(): value for key, value in headers.items()}
-        official_session_id_value = normalized_ingress_headers.get("session-id")
-        official_session_id = (
-            official_session_id_value.strip()
-            if isinstance(official_session_id_value, str) and official_session_id_value.strip()
-            else None
-        )
-        conflicting_session_alias = any(
-            isinstance(normalized_ingress_headers.get(alias), str)
-            and bool(normalized_ingress_headers[alias].strip())
-            and normalized_ingress_headers[alias].strip() != official_session_id
-            for alias in ("session_id", "x-codex-session-id", "x-codex-conversation-id")
-        )
-        rowless_thread_identity = normalized_ingress_headers.get("thread-id")
-        rowless_client_request_identity = normalized_ingress_headers.get("x-client-request-id")
-        rowless_thread_identity = (
-            rowless_thread_identity.strip()
-            if isinstance(rowless_thread_identity, str) and rowless_thread_identity.strip()
-            else None
-        )
-        rowless_client_request_identity = (
-            rowless_client_request_identity.strip()
-            if isinstance(rowless_client_request_identity, str) and rowless_client_request_identity.strip()
-            else None
-        )
-        rowless_task_identity = rowless_thread_identity
-        marker_rowless_task_identity = rowless_thread_identity or rowless_client_request_identity
-        raw_client_metadata = bridge_payload.get("client_metadata")
-        rowless_fallback_metadata_valid = True
-        rowless_metadata_thread_present = False
-        rowless_official_workspace_metadata = False
-        rowless_explicit_child_signal = any(
-            header_name in normalized_ingress_headers
-            or (isinstance(raw_client_metadata, Mapping) and header_name in raw_client_metadata)
-            for header_name in ("x-codex-parent-thread-id", "x-openai-subagent")
-        )
-        rowless_turn_metadata_carrier_present = "x-codex-turn-metadata" in normalized_ingress_headers or (
-            isinstance(raw_client_metadata, Mapping) and "x-codex-turn-metadata" in raw_client_metadata
-        )
-        if official_session_id is not None and marker_rowless_task_identity is not None:
-            (
-                rowless_fallback_metadata_valid,
-                rowless_explicit_child_signal,
-                rowless_metadata_thread_present,
-                rowless_official_workspace_metadata,
-            ) = _rowless_client_metadata_evidence(
-                raw_client_metadata=raw_client_metadata,
-                normalized_headers=normalized_ingress_headers,
-                session_id=official_session_id,
-                task_identity=marker_rowless_task_identity,
-            )
-        rowless_task_identity_sources_consistent = (
-            not (
-                rowless_thread_identity is not None
-                and rowless_client_request_identity is not None
-                and rowless_thread_identity != rowless_client_request_identity
-            )
-            and rowless_fallback_metadata_valid
-        )
-        rowless_lookup_identity_eligible = (
-            _ROWLESS_SEMANTIC_REBASE_REQUEST_PATH_ENABLED
-            and rowless_task_identity is not None
-            and official_session_id is not None
-            and explicit_prompt_cache_key is not None
-            and official_session_id == explicit_prompt_cache_key == rowless_task_identity
-        )
-        if (
-            payload.previous_response_id is not None
-            and durable_lookup is None
-            and rowless_lookup_identity_eligible
-            and bridge_session_key.strength == "hard"
-            and bridge_session_key.affinity_kind == "session_header"
-            and rowless_turn_metadata_carrier_present
-            and not rowless_fallback_metadata_valid
-        ):
-            raise ProxyResponseError(
-                400,
-                openai_error(
-                    "rowless_recovery_identity_metadata_invalid",
-                    "The complete-context recovery metadata is invalid or conflicting.",
-                    error_type="invalid_request_error",
-                ),
-            )
-        marker_rowless_lookup_identity_eligible = (
-            _ROWLESS_SEMANTIC_REBASE_REQUEST_PATH_ENABLED
-            and marker_rowless_task_identity is not None
-            and rowless_task_identity_sources_consistent
-            and not rowless_explicit_child_signal
-            and official_session_id is not None
-            and explicit_prompt_cache_key is not None
-            and official_session_id == explicit_prompt_cache_key == marker_rowless_task_identity
-        )
-        rowless_dispatch_identity_eligible = (
-            rowless_lookup_identity_eligible
-            and rowless_task_identity_sources_consistent
-            and not rowless_explicit_child_signal
-            and bridge_session_key.strength == "hard"
-            and bridge_session_key.affinity_kind == "session_header"
-            and incoming_turn_state_header is None
-            and not conflicting_session_alias
-            and (rowless_client_request_identity is None or rowless_client_request_identity == rowless_task_identity)
-        )
-        rowless_automatic_live_recovery_eligible = bool(
-            rowless_dispatch_identity_eligible and rowless_official_workspace_metadata
-        )
-        rowless_capture_facts = (
-            build_rowless_recovery_capture_facts(
-                untrimmed_effective_payload,
-                expected_session_identity=official_session_id,
-                expected_task_identity=rowless_task_identity,
-            )
-            if rowless_lookup_identity_eligible
-            else None
-        )
-        task_authority_digest = (
-            rowless_task_authority_digest(
-                session_id=official_session_id,
-                prompt_cache_key=explicit_prompt_cache_key,
-                thread_id=rowless_task_identity,
-            )
-            if rowless_lookup_identity_eligible
-            and official_session_id is not None
-            and explicit_prompt_cache_key is not None
-            and rowless_task_identity is not None
-            else None
-        )
-        rowless_automatic_live_recovery_eligible = bool(
-            rowless_automatic_live_recovery_eligible
-            and rowless_capture_facts is not None
-            and rowless_capture_facts.retains_prior_output
-        )
-        rowless_api_key_scope = (
-            durable_bridge_api_key_scope(bridge_session_key.api_key_id) if task_authority_digest is not None else None
-        )
-        rowless_strong_hash = (
-            rowless_strong_session_hash("task_authority", task_authority_digest)
-            if task_authority_digest is not None
-            else None
-        )
-        rowless_authority = None
-        marker_rowless_dispatch_identity_eligible = False
-        automatic_marker_supersedes_rowless_authority = False
         payload_looks_like_full_resend = _http_bridge_payload_looks_like_full_resend(payload)
         # Set when the quarantine check below suppresses the durable-anchor
         # injection for a full-resend payload; the session hydration and the
@@ -2002,147 +1376,23 @@ class _HTTPBridgeStreamingMixin:
                 # response-owned messages. Cross-account replay uses the
                 # default ID-stripping projection below.
                 preserve_developer_message_ids=True,
-                preserve_response_owned_agent_message_ids=True,
             )
             safe_fresh_context = False
             if replay_projection is not None:
-                pending_tool_calls = lookup.latest_pending_tool_calls
-                transition_manifest = lookup.latest_response_transition_manifest
-                if (
-                    transition_manifest is not None
-                    and pending_tool_calls is not None
-                    and lookup.latest_response_id is not None
-                ):
-                    safe_fresh_context = responses_input_suffix_matches_transition_manifest(
-                        cast(list[JsonValue], payload.input),
-                        stored_count=stored_count,
-                        response_id=lookup.latest_response_id,
-                        pending_tool_calls=pending_tool_calls,
-                        transition_manifest=transition_manifest,
+                safe_fresh_context = responses_input_suffix_retains_prior_output(
+                    replay_projection.input_items,
+                    stored_count=replay_projection.stored_prefix_count,
+                    canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
+                ) or (
+                    lookup.latest_pending_tool_calls is not None
+                    and responses_input_suffix_matches_pending_tool_calls(
+                        replay_projection.input_items,
+                        stored_count=replay_projection.stored_prefix_count,
+                        pending_tool_calls=lookup.latest_pending_tool_calls,
+                        canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
                     )
-                else:
-                    safe_fresh_context = (
-                        False
-                        if pending_tool_calls is None
-                        else responses_input_suffix_matches_pending_tool_calls(
-                            replay_projection.input_items,
-                            stored_count=replay_projection.stored_prefix_count,
-                            pending_tool_calls=pending_tool_calls,
-                            canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
-                        )
-                        if pending_tool_calls
-                        else responses_input_suffix_retains_prior_output(
-                            replay_projection.input_items,
-                            stored_count=replay_projection.stored_prefix_count,
-                            canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
-                            exact_stored_prefix_without_pending_manifest=True,
-                            allow_response_owned_agent_message=pending_tool_calls == {},
-                        )
-                    )
-            if not safe_fresh_context:
-                _log_http_bridge_event(
-                    "full_resend_proof_rejected",
-                    bridge_session_key,
-                    account_id=None,
-                    model=payload.model,
-                    detail=(
-                        "reason=invalid_or_incomplete_suffix, "
-                        f"stored_items={stored_count}, "
-                        f"suffix_items={len(payload.input) - stored_count}, "
-                        "suffix_shape="
-                        f"{_full_resend_suffix_shape_for_observability(payload.input, stored_count=stored_count)}"
-                    ),
-                    cache_key_family=bridge_session_key.affinity_kind,
-                    model_class=_extract_model_class(payload.model) if payload.model else None,
-                    owner_check_applied=True,
                 )
             return stored_count, lookup.latest_input_full_fingerprint, safe_fresh_context
-
-        async def prepare_durable_recovery_attempt_journal(request_fingerprint: str) -> None:
-            nonlocal durable_recovery_attempt_available
-            nonlocal durable_recovery_attempt_claimed
-            nonlocal durable_recovery_attempt_owner_epoch
-            nonlocal durable_recovery_attempt_session_id
-
-            if durable_lookup is None:
-                return
-            try:
-                existing_attempt = await self._durable_bridge.lookup_recovery_attempt(
-                    session_id=durable_lookup.session_id,
-                    request_fingerprint=request_fingerprint,
-                )
-                if existing_attempt is not None and (
-                    durable_lookup.state != HttpBridgeSessionState.ACTIVE
-                    or not durable_lookup.lease_is_active(now=utcnow())
-                ):
-                    claim_instance_id = _service_get_settings().http_responses_session_bridge_instance_id
-                    claim_owner_epoch = durable_lookup.owner_epoch
-                    owner_is_current = (
-                        durable_lookup.owner_instance_id == claim_instance_id
-                        and durable_lookup.lease_is_active(now=utcnow())
-                    )
-                    if not owner_is_current:
-                        claimed_session = await self._durable_bridge.claim_live_session(
-                            session_key_kind=durable_lookup.canonical_kind,
-                            session_key_value=durable_lookup.canonical_key,
-                            api_key_id=bridge_session_key.api_key_id,
-                            instance_id=claim_instance_id,
-                            lease_ttl_seconds=_http_bridge_durable_lease_ttl_seconds(),
-                            account_id=durable_lookup.account_id,
-                            model=payload.model,
-                            service_tier=None,
-                            latest_turn_state=durable_lookup.latest_turn_state,
-                            latest_response_id=None,
-                            owner_process_epoch=http_bridge_owner_process_epoch(),
-                            # Revalidate the stale lookup under the row lock;
-                            # an active owner that appeared after lookup must
-                            # not be displaced.
-                            allow_takeover=False,
-                        )
-                        if claimed_session.owner_instance_id != claim_instance_id:
-                            raise ProxyResponseError(
-                                502,
-                                openai_error(
-                                    "bridge_continuity_persistence_failed",
-                                    "HTTP responses recovery ownership changed; retry the request.",
-                                ),
-                            )
-                        claim_owner_epoch = claimed_session.owner_epoch
-                    claimed = await self._durable_bridge.mark_recovery_attempt_replayed(
-                        session_id=durable_lookup.session_id,
-                        api_key_id=bridge_session_key.api_key_id,
-                        instance_id=claim_instance_id,
-                        owner_epoch=claim_owner_epoch,
-                        request_fingerprint=request_fingerprint,
-                    )
-                    if not claimed:
-                        raise ProxyResponseError(
-                            502,
-                            openai_error(
-                                "bridge_continuity_persistence_failed",
-                                "HTTP responses recovery ownership changed; retry the request.",
-                            ),
-                        )
-                    durable_recovery_attempt_claimed = True
-                    durable_recovery_attempt_available = False
-                    durable_recovery_attempt_session_id = durable_lookup.session_id
-                    durable_recovery_attempt_owner_epoch = claim_owner_epoch
-                elif existing_attempt is None:
-                    # The request-submit path journals this exact fingerprint
-                    # immediately before dispatch. An ambiguous outcome may
-                    # then consume only one same-owner replay generation.
-                    durable_recovery_attempt_available = True
-            except ProxyResponseError:
-                raise
-            except Exception:
-                logger.warning("Failed to claim HTTP bridge recovery attempt", exc_info=True)
-                raise ProxyResponseError(
-                    502,
-                    openai_error(
-                        "bridge_continuity_persistence_failed",
-                        "HTTP responses recovery state could not be claimed; retry the request.",
-                    ),
-                )
 
         if durable_lookup is not None:
             (
@@ -2160,15 +1410,10 @@ class _HTTPBridgeStreamingMixin:
                 stored_count=durable_full_resend_anchor_count,
             )
             if replay_projection is not None:
-                durable_full_resend_retains_prior_output = (
-                    durable_lookup is not None
-                    and responses_input_suffix_retains_prior_output(
-                        replay_projection.input_items,
-                        stored_count=replay_projection.stored_prefix_count,
-                        canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
-                        exact_stored_prefix_without_pending_manifest=not durable_lookup.latest_pending_tool_calls,
-                        allow_response_owned_agent_message=durable_lookup.latest_pending_tool_calls == {},
-                    )
+                durable_full_resend_retains_prior_output = responses_input_suffix_retains_prior_output(
+                    replay_projection.input_items,
+                    stored_count=replay_projection.stored_prefix_count,
+                    canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
                 )
                 durable_full_resend_fresh_payload = _http_bridge_payload_without_previous_response_id(
                     payload
@@ -2181,12 +1426,85 @@ class _HTTPBridgeStreamingMixin:
                 )
                 del _fresh_state
                 durable_recovery_attempt_fingerprint = durable_bridge_hash(fresh_replay_text)
-                if (
-                    durable_lookup is not None
-                    and durable_full_resend_is_account_neutral
-                    and not durable_marker_verified_recovery_candidate
-                ):
-                    await prepare_durable_recovery_attempt_journal(durable_recovery_attempt_fingerprint)
+                if durable_lookup is not None and durable_full_resend_is_account_neutral:
+                    try:
+                        existing_attempt = await self._durable_bridge.lookup_recovery_attempt(
+                            session_id=durable_lookup.session_id,
+                            request_fingerprint=durable_recovery_attempt_fingerprint,
+                        )
+                        if existing_attempt is not None and (
+                            durable_lookup.state != HttpBridgeSessionState.ACTIVE
+                            or not durable_lookup.lease_is_active(now=utcnow())
+                        ):
+                            claim_instance_id = _service_get_settings().http_responses_session_bridge_instance_id
+                            claim_owner_epoch = durable_lookup.owner_epoch
+                            owner_is_current = (
+                                durable_lookup.owner_instance_id == claim_instance_id
+                                and durable_lookup.lease_is_active(now=utcnow())
+                            )
+                            if not owner_is_current:
+                                claimed_session = await self._durable_bridge.claim_live_session(
+                                    session_key_kind=durable_lookup.canonical_kind,
+                                    session_key_value=durable_lookup.canonical_key,
+                                    api_key_id=bridge_session_key.api_key_id,
+                                    instance_id=claim_instance_id,
+                                    lease_ttl_seconds=_http_bridge_durable_lease_ttl_seconds(),
+                                    account_id=durable_lookup.account_id,
+                                    model=payload.model,
+                                    service_tier=None,
+                                    latest_turn_state=durable_lookup.latest_turn_state,
+                                    latest_response_id=None,
+                                    owner_process_epoch=http_bridge_owner_process_epoch(),
+                                    # Revalidate the stale lookup under the
+                                    # row lock; an active owner that appeared
+                                    # after the lookup must not be displaced.
+                                    allow_takeover=False,
+                                )
+                                if claimed_session.owner_instance_id != claim_instance_id:
+                                    raise ProxyResponseError(
+                                        502,
+                                        openai_error(
+                                            "bridge_continuity_persistence_failed",
+                                            "HTTP responses recovery ownership changed; retry the request.",
+                                        ),
+                                    )
+                                claim_owner_epoch = claimed_session.owner_epoch
+                            claimed = await self._durable_bridge.mark_recovery_attempt_replayed(
+                                session_id=durable_lookup.session_id,
+                                api_key_id=bridge_session_key.api_key_id,
+                                instance_id=claim_instance_id,
+                                owner_epoch=claim_owner_epoch,
+                                request_fingerprint=durable_recovery_attempt_fingerprint,
+                            )
+                            if not claimed:
+                                raise ProxyResponseError(
+                                    502,
+                                    openai_error(
+                                        "bridge_continuity_persistence_failed",
+                                        "HTTP responses recovery ownership changed; retry the request.",
+                                    ),
+                                )
+                            durable_recovery_attempt_claimed = True
+                            durable_recovery_attempt_available = False
+                            durable_recovery_attempt_session_id = durable_lookup.session_id
+                            durable_recovery_attempt_owner_epoch = claim_owner_epoch
+                        elif existing_attempt is None:
+                            # No prior attempt owns this fingerprint. The
+                            # request-submit path will journal it immediately
+                            # before dispatch, and an ambiguous transport
+                            # outcome may then consume the one replay fence.
+                            durable_recovery_attempt_available = True
+                    except ProxyResponseError:
+                        raise
+                    except Exception:
+                        logger.warning("Failed to claim HTTP bridge recovery attempt", exc_info=True)
+                        raise ProxyResponseError(
+                            502,
+                            openai_error(
+                                "bridge_continuity_persistence_failed",
+                                "HTTP responses recovery state could not be claimed; retry the request.",
+                            ),
+                        )
         durable_anchor_trimmable = durable_full_resend_anchor_count is not None
         durable_model_transition_lookup = (
             durable_lookup
@@ -2253,455 +1571,13 @@ class _HTTPBridgeStreamingMixin:
                 and durable_lookup.latest_response_id is not None
                 and (not payload_looks_like_full_resend or durable_anchor_trimmable)
             )
-            verified_quarantine_full_resend = bool(
-                durable_full_resend_proof is not None and durable_full_resend_proof.matches(payload, durable_lookup)
-            )
-            durable_recovery_marker_active = _durable_recovery_marker_request_path_active(durable_lookup)
-            verified_marker_full_resend = bool(
-                verified_quarantine_full_resend
-                or (
-                    durable_abandoned_pending_full_resend_proof is not None
-                    and durable_abandoned_pending_full_resend_proof.matches(payload, durable_lookup)
-                )
-            )
-            if durable_recovery_marker_active and not verified_marker_full_resend:
-                # Codex sends a fresh turn-state affinity value on ordinary root-task
-                # turns. The durable lookup above has already resolved that alias
-                # back to this exact hard session-header marker, so marker-backed
-                # recovery can accept it without weakening rowless/no-row identity.
-                marker_rowless_dispatch_identity_eligible = (
-                    marker_rowless_lookup_identity_eligible
-                    and bridge_session_key.strength == "hard"
-                    and bridge_session_key.affinity_kind == "session_header"
-                    and not conflicting_session_alias
-                    and (
-                        rowless_client_request_identity is None
-                        or rowless_client_request_identity == marker_rowless_task_identity
-                    )
-                )
-                if (
-                    marker_rowless_dispatch_identity_eligible
-                    and not rowless_lookup_identity_eligible
-                    and official_session_id is not None
-                    and explicit_prompt_cache_key is not None
-                    and marker_rowless_task_identity is not None
-                ):
-                    rowless_task_identity = marker_rowless_task_identity
-                    rowless_capture_facts = build_rowless_recovery_capture_facts(
-                        untrimmed_effective_payload,
-                        expected_session_identity=official_session_id,
-                        expected_task_identity=marker_rowless_task_identity,
-                    )
-                    task_authority_digest = rowless_task_authority_digest(
-                        session_id=official_session_id,
-                        prompt_cache_key=explicit_prompt_cache_key,
-                        thread_id=marker_rowless_task_identity,
-                    )
-                    rowless_api_key_scope = durable_bridge_api_key_scope(bridge_session_key.api_key_id)
-                    rowless_strong_hash = rowless_strong_session_hash("task_authority", task_authority_digest)
-                rowless_automatic_live_recovery_eligible = bool(
-                    rowless_official_workspace_metadata
-                    and (rowless_dispatch_identity_eligible or marker_rowless_dispatch_identity_eligible)
-                    and rowless_capture_facts is not None
-                    and rowless_capture_facts.retains_prior_output
-                )
-                if (
-                    task_authority_digest is not None
-                    and rowless_api_key_scope is not None
-                    and rowless_strong_hash is not None
-                    and durable_lookup.latest_response_id is not None
-                    and durable_lookup.account_id is not None
-                ):
-                    stale_anchor_hash = durable_bridge_hash(durable_lookup.latest_response_id)
-                    try:
-                        async with SessionLocal() as rowless_session:
-                            rowless_repository = RowlessRecoveryRepository(rowless_session)
-                            rowless_authority = await rowless_repository.lookup(
-                                api_key_scope=rowless_api_key_scope,
-                                strong_session_hash=rowless_strong_hash,
-                                stale_anchor_hash=stale_anchor_hash,
-                            )
-                            if rowless_authority is None and rowless_capture_facts is not None:
-                                rowless_authority = await rowless_repository.lookup_exact_request_contract(
-                                    api_key_scope=rowless_api_key_scope,
-                                    strong_session_hash=rowless_strong_hash,
-                                    facts=rowless_capture_facts,
-                                )
-                            if (
-                                rowless_authority is None
-                                and marker_rowless_dispatch_identity_eligible
-                                and rowless_capture_facts is not None
-                                and rowless_capture_facts.unresolved_count == 0
-                                and rowless_capture_facts.self_contained
-                                and rowless_capture_facts.account_neutral
-                                and rowless_task_identity is not None
-                                and official_session_id is not None
-                            ):
-                                installation_id = await rowless_session.scalar(
-                                    select(Account.codex_installation_id).where(Account.id == durable_lookup.account_id)
-                                )
-                                if installation_id:
-                                    marker_projected_payload = untrimmed_effective_payload.model_copy(
-                                        update={
-                                            "input": rowless_capture_facts.projected_input,
-                                            "previous_response_id": None,
-                                        }
-                                    )
-                                    _marker_state, marker_text = prepare_bridge_request(marker_projected_payload)
-                                    del _marker_state
-                                    marker_text = _text_with_account_installation_id(marker_text, installation_id)
-                                    rowless_authority = await rowless_repository.capture(
-                                        api_key_scope=rowless_api_key_scope,
-                                        session_key_kind=bridge_session_key.affinity_kind,
-                                        strong_session_hash=rowless_strong_hash,
-                                        stale_anchor_hash=stale_anchor_hash,
-                                        selected_account_intent=durable_lookup.account_id,
-                                        task_identity=rowless_task_identity,
-                                        session_identity=official_session_id,
-                                        task_authority_digest=task_authority_digest,
-                                        facts=dataclasses.replace(
-                                            rowless_capture_facts,
-                                            actual_wire_fingerprint=rowless_actual_wire_fingerprint(marker_text),
-                                        ),
-                                        origin_marker_session_id=durable_lookup.session_id,
-                                    )
-                    except RowlessRecoveryStateError as exc:
-                        raise ProxyResponseError(
-                            502,
-                            openai_error(
-                                "bridge_continuity_persistence_failed",
-                                "The durable-marker semantic-rebase authority could not be fenced safely.",
-                            ),
-                        ) from exc
-                    except Exception as exc:
-                        logger.warning(
-                            "Failed to persist durable-marker rowless recovery authority",
-                            exc_info=True,
-                        )
-                        raise ProxyResponseError(
-                            502,
-                            openai_error(
-                                "bridge_continuity_persistence_failed",
-                                "The durable-marker semantic-rebase authority could not be persisted.",
-                            ),
-                        ) from exc
-                if rowless_authority is not None:
-                    # Legacy authorities can predate marker-origin binding.
-                    # Their terminal state is already sufficient to reject any
-                    # replay, so report that stronger fence before provenance.
-                    if rowless_authority.state == HttpBridgeRowlessRecoveryState.UNKNOWN:
-                        raise ProxyResponseError(
-                            400,
-                            openai_error(
-                                "rowless_recovery_dispatch_outcome_unknown",
-                                "The semantic-rebase dispatch outcome is unknown and cannot be replayed.",
-                                error_type="invalid_request_error",
-                            ),
-                        )
-                    if rowless_authority.state == HttpBridgeRowlessRecoveryState.CONSUMED:
-                        raise ProxyResponseError(
-                            400,
-                            openai_error(
-                                "rowless_recovery_already_consumed",
-                                "This stale semantic-rebase turn was already consumed; "
-                                "continue from its new checkpoint.",
-                                error_type="invalid_request_error",
-                            ),
-                        )
-                    if rowless_authority.origin_marker_session_id != durable_lookup.session_id:
-                        raise ProxyResponseError(
-                            400,
-                            openai_error(
-                                "rowless_recovery_marker_origin_mismatch",
-                                "The semantic-rebase authority belongs to a different durable marker.",
-                                error_type="invalid_request_error",
-                            ),
-                        )
-                    if rowless_authority.selected_account_intent != durable_lookup.account_id:
-                        raise ProxyResponseError(
-                            400,
-                            openai_error(
-                                "rowless_recovery_pinned_account_changed",
-                                "The durable marker account changed; the semantic rebase remains unsent.",
-                                error_type="invalid_request_error",
-                            ),
-                        )
-                else:
-                    diagnostic_capture_facts = rowless_capture_facts
-                    if (
-                        diagnostic_capture_facts is None
-                        and isinstance(untrimmed_effective_payload.input, list)
-                        and len(untrimmed_effective_payload.input) <= 512
-                    ):
-                        diagnostic_capture_facts = build_rowless_recovery_capture_facts(
-                            untrimmed_effective_payload,
-                            expected_session_identity=official_session_id,
-                            expected_task_identity=marker_rowless_task_identity,
-                        )
-                    capture_facts_present = diagnostic_capture_facts is not None
-                    _log_http_bridge_event(
-                        "recovery_required_request_rejected",
-                        bridge_session_key,
-                        account_id=durable_lookup.account_id,
-                        model=payload.model,
-                        detail=(
-                            (
-                                "reason=pending_call_resolution_required"
-                                if durable_lookup.latest_pending_tool_calls
-                                else "reason=complete_context_rehydration_required"
-                            )
-                            + ",identity_session_present="
-                            + str(official_session_id is not None).lower()
-                            + ",identity_prompt_cache_present="
-                            + str(explicit_prompt_cache_key is not None).lower()
-                            + ",identity_thread_present="
-                            + str(rowless_thread_identity is not None).lower()
-                            + ",identity_client_request_present="
-                            + str(rowless_client_request_identity is not None).lower()
-                            + ",identity_sources_consistent="
-                            + str(rowless_task_identity_sources_consistent).lower()
-                            + ",identity_explicit_child_signal="
-                            + str(rowless_explicit_child_signal).lower()
-                            + ",identity_metadata_thread_present="
-                            + str(rowless_metadata_thread_present).lower()
-                            + ",identity_fallback_metadata_valid="
-                            + str(rowless_fallback_metadata_valid).lower()
-                            + ",identity_turn_state_present="
-                            + str(incoming_turn_state_header is not None).lower()
-                            + ",identity_conflicting_session_alias="
-                            + str(conflicting_session_alias).lower()
-                            + ",identity_lookup_eligible="
-                            + str(rowless_lookup_identity_eligible).lower()
-                            + ",identity_marker_dispatch_eligible="
-                            + str(marker_rowless_dispatch_identity_eligible).lower()
-                            + ",capture_facts_present="
-                            + str(capture_facts_present).lower()
-                            + ",capture_diagnostic_bounded="
-                            + str(
-                                isinstance(untrimmed_effective_payload.input, list)
-                                and len(untrimmed_effective_payload.input) <= 512
-                            ).lower()
-                            + ",capture_unresolved_zero="
-                            + str(
-                                diagnostic_capture_facts is not None and diagnostic_capture_facts.unresolved_count == 0
-                            ).lower()
-                            + ",capture_self_contained="
-                            + str(
-                                diagnostic_capture_facts is not None and diagnostic_capture_facts.self_contained
-                            ).lower()
-                            + ",capture_account_neutral="
-                            + str(
-                                diagnostic_capture_facts is not None and diagnostic_capture_facts.account_neutral
-                            ).lower()
-                        ),
-                        cache_key_family=bridge_session_key.affinity_kind,
-                        model_class=_extract_model_class(payload.model) if payload.model else None,
-                        owner_check_applied=True,
-                    )
-                    raise ProxyResponseError(
-                        400,
-                        openai_error(
-                            (
-                                "previous_response_pending_call_resolution_required"
-                                if durable_lookup.latest_pending_tool_calls
-                                else "previous_response_complete_context_required"
-                            ),
-                            (
-                                "The saved response anchor has an unresolved pending call. "
-                                "Retry once with the complete conversation context after resolving that call."
-                                if durable_lookup.latest_pending_tool_calls
-                                else (
-                                    "The saved response anchor requires complete conversation context. "
-                                    "Retry once with a verified complete resend."
-                                )
-                            ),
-                        ),
-                        retryable_same_contract=False,
-                        failure_detail="durable_recovery_required",
-                        upstream_error_code="previous_response_not_found",
-                    )
-            if (
-                durable_recovery_marker_active
-                and verified_marker_full_resend
-                and not (rowless_automatic_live_recovery_eligible and rowless_authority is not None)
-            ):
-                # A prior request already supplied the physical stale-anchor
-                # rejection.  The durable marker is therefore equivalent to
-                # the process-local quarantine for this exact owner/anchor,
-                # but it remains proof-neutral: only the already sealed full
-                # resend objects above may suppress the anchor.
-                fresh_reattach_can_use_durable_anchor = False
-                fresh_reattach_anchor_suppressed_quarantined = True
-                effective_payload = _http_bridge_payload_without_previous_response_id(payload)
-                durable_full_resend_fresh_bridge_proof = (
-                    durable_full_resend_proof
-                    if verified_quarantine_full_resend
-                    else durable_abandoned_pending_full_resend_proof
-                )
-                if not verified_quarantine_full_resend:
-                    abandoned_pending_proof = durable_abandoned_pending_full_resend_proof
-                    if abandoned_pending_proof is None:
-                        raise RuntimeError("verified marker replay lost its sealed abandoned-pending proof")
-                    if not isinstance(payload.input, list):
-                        raise RuntimeError("sealed abandoned-pending proof requires list input")
-                    abandoned_projection = project_responses_input_for_abandoned_pending_fresh_replay(
-                        cast(list[JsonValue], payload.input),
-                        stored_count=abandoned_pending_proof.stored_input_item_count,
-                        pending_tool_calls=dict(durable_lookup.latest_pending_tool_calls or {}),
-                    )
-                    if abandoned_projection is None:
-                        raise RuntimeError("sealed abandoned-pending proof lost its replay projection")
-                    effective_payload = _http_bridge_payload_without_previous_response_id(payload).model_copy(
-                        update={"input": abandoned_projection.input_items}
-                    )
-                    durable_marker_abandoned_pending_replay = True
-                if _ROWLESS_SEMANTIC_REBASE_REQUEST_PATH_ENABLED and durable_lookup.latest_response_id is not None:
-                    try:
-                        async with SessionLocal() as rowless_session:
-                            rowless_repository = RowlessRecoveryRepository(rowless_session)
-                            rowless_authority = await rowless_repository.lookup_stale_anchor_in_scope(
-                                api_key_scope=durable_lookup.api_key_scope,
-                                stale_anchor_hash=durable_bridge_hash(durable_lookup.latest_response_id),
-                            )
-                            if (
-                                rowless_authority is None
-                                and rowless_api_key_scope is not None
-                                and rowless_strong_hash is not None
-                                and rowless_capture_facts is not None
-                            ):
-                                rowless_authority = await rowless_repository.lookup_exact_request_contract(
-                                    api_key_scope=rowless_api_key_scope,
-                                    strong_session_hash=rowless_strong_hash,
-                                    facts=rowless_capture_facts,
-                                )
-                    except RowlessRecoveryStateError as exc:
-                        raise ProxyResponseError(
-                            400,
-                            openai_error(
-                                "rowless_recovery_authority_ambiguous",
-                                "Multiple semantic-rebase authorities match this exact turn; dispatch is unsafe.",
-                                error_type="invalid_request_error",
-                            ),
-                        ) from exc
-                if rowless_authority is not None:
-                    if (
-                        task_authority_digest is not None
-                        and rowless_authority.captured_task_authority_digest != task_authority_digest
-                    ):
-                        raise ProxyResponseError(
-                            400,
-                            openai_error(
-                                "rowless_recovery_task_identity_mismatch",
-                                "The approved semantic rebase belongs to a different Codex task.",
-                                error_type="invalid_request_error",
-                            ),
-                        )
-                    if (
-                        rowless_authority.origin_marker_session_id == durable_lookup.session_id
-                        and rowless_authority.selected_account_intent != durable_lookup.account_id
-                    ):
-                        raise ProxyResponseError(
-                            400,
-                            openai_error(
-                                "rowless_recovery_pinned_account_changed",
-                                "The durable marker account changed; the semantic rebase remains unsent.",
-                                error_type="invalid_request_error",
-                            ),
-                        )
-                    automatic_marker_supersedes_rowless_authority = bool(
-                        rowless_authority.origin_marker_session_id == durable_lookup.session_id
-                        and rowless_authority.selected_account_intent == durable_lookup.account_id
-                        and rowless_authority.state
-                        in {
-                            HttpBridgeRowlessRecoveryState.CAPTURED,
-                            HttpBridgeRowlessRecoveryState.APPROVED,
-                        }
-                    )
-                    if not automatic_marker_supersedes_rowless_authority:
-                        if rowless_authority.state == HttpBridgeRowlessRecoveryState.CAPTURED:
-                            envelope = openai_error(
-                                "previous_response_recovery_authorization_required",
-                                "A dashboard administrator must approve this same-turn semantic rebase.",
-                                error_type="invalid_request_error",
-                            )
-                            envelope["error"]["action"] = "retry_same_turn_after_admin_approval"
-                            raise ProxyResponseError(400, envelope)
-                        if rowless_authority.state == HttpBridgeRowlessRecoveryState.UNKNOWN:
-                            raise ProxyResponseError(
-                                400,
-                                openai_error(
-                                    "rowless_recovery_dispatch_outcome_unknown",
-                                    "The semantic-rebase dispatch outcome is unknown and cannot be replayed.",
-                                    error_type="invalid_request_error",
-                                ),
-                            )
-                        if rowless_authority.state == HttpBridgeRowlessRecoveryState.CONSUMED:
-                            raise ProxyResponseError(
-                                400,
-                                openai_error(
-                                    "rowless_recovery_already_consumed",
-                                    "This stale semantic-rebase turn was already consumed; "
-                                    "continue from its new checkpoint.",
-                                    error_type="invalid_request_error",
-                                ),
-                            )
-                        raise ProxyResponseError(
-                            400,
-                            openai_error(
-                                "rowless_recovery_marker_origin_mismatch",
-                                "The approved semantic rebase belongs to a different durable marker.",
-                                error_type="invalid_request_error",
-                            ),
-                        )
-                durable_marker_verified_recovery = True
-                _marker_request_state, marker_request_text = prepare_bridge_request(effective_payload)
-                del _marker_request_state
-                durable_recovery_attempt_fingerprint = durable_bridge_hash(marker_request_text)
-                if durable_lookup.latest_response_id is None or durable_lookup.account_id is None:
-                    raise RuntimeError("sealed marker recovery lost its owner-bound rejected anchor")
-                existing_marker_attempt = await self._durable_bridge.lookup_recovery_attempt(
-                    session_id=durable_lookup.session_id,
-                    request_fingerprint=durable_recovery_attempt_fingerprint,
-                )
-                if existing_marker_attempt is not None:
-                    # A marker-authorized recovery may contain irreversible
-                    # tool results.  UNKNOWN can mean the prior process died
-                    # after the upstream accepted the request, so it is never
-                    # eligible for the generic lease-expiry replay claim.
-                    # Reject before opening another physical upstream bridge;
-                    # only a terminal replacement checkpoint may clear the
-                    # marker and settle this generation.
-                    raise ProxyResponseError(
-                        502,
-                        openai_error(
-                            "bridge_continuity_persistence_failed",
-                            "The recovery checkpoint has an ambiguous prior delivery; retrying is unsafe.",
-                        ),
-                    )
-                _log_http_bridge_event(
-                    "recovery_required_full_resend_admitted",
-                    bridge_session_key,
-                    account_id=durable_lookup.account_id,
-                    model=payload.model,
-                    detail=(
-                        "proof_source=abandoned_pending_agent_boundary"
-                        if durable_marker_abandoned_pending_replay
-                        else "proof_source=durable_full_resend"
-                    ),
-                    cache_key_family=bridge_session_key.affinity_kind,
-                    model_class=_extract_model_class(payload.model) if payload.model else None,
-                    owner_check_applied=True,
-                )
-            if verified_quarantine_full_resend and _http_bridge_session_key_quarantined(
-                self,
-                bridge_session_key,
-            ):
+            if payload_looks_like_full_resend and _http_bridge_session_key_quarantined(self, bridge_session_key):
                 # The previous attach on this key proved silent/wedged
-                # (#1534). Only a durable-owner-bound proof that the client's
-                # payload carries the complete conversation may suppress the
-                # anchor. A merely multi-item/full-resend-shaped payload can
-                # still omit completed assistant or tool output and must keep
-                # the anchor so it fails closed instead of losing history.
+                # (#1534). The client's own payload already carries the full
+                # conversation, so send it unanchored on the fresh path
+                # instead of rebuilding the same reattach. Delta-only
+                # payloads keep the anchor: it is their only way to convey
+                # prior context (same boundary as the fenced anchor clear).
                 # Evaluated independently of the fresh-reattach eligibility
                 # above: even when that gate is already false (for example a
                 # conversation-scoped payload, a live alias session, or an
@@ -2779,6 +1655,7 @@ class _HTTPBridgeStreamingMixin:
             affinity = _AffinityPolicy()
             incoming_turn_state_header = None
             session_header_fallback_key = None
+            durable_session_header_alias = None
         owner_bound_full_resend_ignores_broad_session = (
             not forwarded_request
             and durable_full_resend_fresh_bridge_proof is not None
@@ -2793,6 +1670,7 @@ class _HTTPBridgeStreamingMixin:
             affinity = _AffinityPolicy(kind=StickySessionKind.CODEX_SESSION)
             incoming_session_header = None
             session_header_fallback_key = None
+            durable_session_header_alias = None
             _log_http_bridge_event(
                 "fresh_reattach_broad_session_owner_ignored",
                 bridge_session_key,
@@ -2811,343 +1689,8 @@ class _HTTPBridgeStreamingMixin:
                 previous_response_trimmed_input_fingerprint = _fingerprint_input_items(previous_response_input_items)
                 effective_payload = effective_payload.model_copy(update={"input": trimmed_input_items})
         request_state, text_data = prepare_bridge_request(effective_payload)
-        # A hard-session reattach can inject the marker's stale anchor after
-        # rowless capture facts are built. Keep the original client payload for
-        # contract proof, but let exactly-once preflight bind that verified
-        # owner-backed anchor.
-        rowless_recovery_stale_anchor_id = untrimmed_effective_payload.previous_response_id
-        if rowless_recovery_stale_anchor_id is None and proxy_injected_previous_response_id:
-            rowless_recovery_stale_anchor_id = effective_payload.previous_response_id
-        if (
-            not durable_marker_verified_recovery
-            and task_authority_digest is not None
-            and rowless_api_key_scope is not None
-            and rowless_strong_hash is not None
-            and rowless_dispatch_identity_eligible
-            and rowless_capture_facts is not None
-            and rowless_capture_facts.unresolved_count == 0
-            and rowless_capture_facts.self_contained
-            and rowless_capture_facts.account_neutral
-            and rowless_task_identity is not None
-            and official_session_id is not None
-            and rowless_recovery_stale_anchor_id is not None
-        ):
-            request_state.rowless_recovery_capture_intent = RowlessRecoveryCaptureIntent(
-                api_key_scope=rowless_api_key_scope,
-                session_key_kind=bridge_session_key.affinity_kind,
-                strong_session_hash=rowless_strong_hash,
-                task_authority_digest=task_authority_digest,
-                task_identity=rowless_task_identity,
-                session_identity=official_session_id,
-                facts=rowless_capture_facts,
-                automatic_live_recovery=rowless_automatic_live_recovery_eligible,
-            )
-        if task_authority_digest is not None and rowless_api_key_scope is not None and rowless_strong_hash is not None:
-            if rowless_authority is None:
-                async with SessionLocal() as rowless_session:
-                    rowless_repository = RowlessRecoveryRepository(rowless_session)
-                    if rowless_recovery_stale_anchor_id is not None:
-                        rowless_authority = await rowless_repository.lookup(
-                            api_key_scope=rowless_api_key_scope,
-                            strong_session_hash=rowless_strong_hash,
-                            stale_anchor_hash=durable_bridge_hash(rowless_recovery_stale_anchor_id),
-                        )
-                    if rowless_authority is None and rowless_capture_facts is not None:
-                        try:
-                            rowless_authority = await rowless_repository.lookup_exact_request_contract(
-                                api_key_scope=rowless_api_key_scope,
-                                strong_session_hash=rowless_strong_hash,
-                                facts=rowless_capture_facts,
-                            )
-                        except RowlessRecoveryStateError as exc:
-                            raise ProxyResponseError(
-                                400,
-                                openai_error(
-                                    "rowless_recovery_authority_ambiguous",
-                                    "Multiple semantic-rebase authorities match this exact turn; dispatch is unsafe.",
-                                    error_type="invalid_request_error",
-                                ),
-                            ) from exc
-            if rowless_authority is not None and not automatic_marker_supersedes_rowless_authority:
-                if rowless_authority.captured_task_authority_digest != task_authority_digest:
-                    raise ProxyResponseError(
-                        400,
-                        openai_error(
-                            "rowless_recovery_task_identity_mismatch",
-                            "The approved semantic rebase belongs to a different Codex task.",
-                            error_type="invalid_request_error",
-                        ),
-                    )
-                if rowless_authority.state == HttpBridgeRowlessRecoveryState.UNKNOWN:
-                    raise ProxyResponseError(
-                        400,
-                        openai_error(
-                            "rowless_recovery_dispatch_outcome_unknown",
-                            "The semantic-rebase dispatch outcome is unknown and cannot be replayed.",
-                            error_type="invalid_request_error",
-                        ),
-                    )
-                if rowless_authority.state == HttpBridgeRowlessRecoveryState.CONSUMED:
-                    raise ProxyResponseError(
-                        400,
-                        openai_error(
-                            "rowless_recovery_already_consumed",
-                            "This stale semantic-rebase turn was already consumed; continue from its new checkpoint.",
-                            error_type="invalid_request_error",
-                        ),
-                    )
-                automatic_preflight_claimed = False
-                automatic_request_state = None
-                automatic_text = None
-                if (
-                    rowless_automatic_live_recovery_eligible
-                    and rowless_authority.state
-                    in {
-                        HttpBridgeRowlessRecoveryState.CAPTURED,
-                        HttpBridgeRowlessRecoveryState.APPROVED,
-                    }
-                    and rowless_capture_facts is not None
-                    and rowless_capture_facts.unresolved_count == 0
-                    and rowless_capture_facts.self_contained
-                    and rowless_capture_facts.account_neutral
-                    and rowless_task_identity is not None
-                    and official_session_id is not None
-                    and rowless_recovery_stale_anchor_id is not None
-                ):
-                    automatic_payload = untrimmed_effective_payload.model_copy(
-                        update={
-                            "input": rowless_capture_facts.projected_input,
-                            "previous_response_id": None,
-                        }
-                    )
-                    automatic_request_state, automatic_text = prepare_bridge_request(automatic_payload)
-                    async with SessionLocal() as rowless_session:
-                        installation_id = await rowless_session.scalar(
-                            select(Account.codex_installation_id).where(
-                                Account.id == rowless_authority.selected_account_intent
-                            )
-                        )
-                    if not installation_id:
-                        raise ProxyResponseError(
-                            400,
-                            openai_error(
-                                "rowless_recovery_pinned_account_changed",
-                                "The pinned account metadata is unavailable; the semantic rebase remains unsent.",
-                                error_type="invalid_request_error",
-                            ),
-                        )
-                    automatic_text = _text_with_account_installation_id(automatic_text, installation_id)
-                    automatic_facts = dataclasses.replace(
-                        rowless_capture_facts,
-                        actual_wire_fingerprint=rowless_actual_wire_fingerprint(automatic_text),
-                    )
-                    claimed_automatic_authority = None
-                    try:
-                        async with SessionLocal() as rowless_session:
-                            claimed_automatic_authority = await RowlessRecoveryRepository(
-                                rowless_session
-                            ).capture_and_claim_automatic_preflight(
-                                api_key_scope=rowless_api_key_scope,
-                                session_key_kind=bridge_session_key.affinity_kind,
-                                strong_session_hash=rowless_strong_hash,
-                                stale_anchor_hash=durable_bridge_hash(rowless_recovery_stale_anchor_id),
-                                selected_account_intent=rowless_authority.selected_account_intent,
-                                task_identity=rowless_task_identity,
-                                session_identity=official_session_id,
-                                task_authority_digest=task_authority_digest,
-                                facts=automatic_facts,
-                                request_id=automatic_request_state.request_id,
-                                wire_request_fingerprint=automatic_facts.actual_wire_fingerprint,
-                                origin_marker_session_id=rowless_authority.origin_marker_session_id,
-                                expected_authority_id=rowless_authority.id,
-                                expected_generation=rowless_authority.generation,
-                            )
-                            # Bind the committed claim before AsyncSession.__aexit__
-                            # can observe cancellation, so cleanup can prove the
-                            # request remained physically unsent.
-                            automatic_request_state.rowless_recovery_authority_id = claimed_automatic_authority.id
-                            automatic_request_state.rowless_recovery_generation = claimed_automatic_authority.generation
-                            automatic_request_state.rowless_recovery_wire_fingerprint = (
-                                claimed_automatic_authority.actual_wire_fingerprint
-                            )
-                    except asyncio.CancelledError:
-                        if claimed_automatic_authority is not None:
-                            rollback_task = asyncio.create_task(
-                                self._rollback_rowless_preflight_setup_failure_if_unbound(automatic_request_state)
-                            )
-                            await _await_task_deferring_cancellation(rollback_task)
-                        raise
-                    except RowlessRecoveryStateError as exc:
-                        raise ProxyResponseError(
-                            400,
-                            openai_error(
-                                "rowless_automatic_recovery_proof_rejected",
-                                "The live Codex turn could not prove a physically-unsent semantic rebase.",
-                                error_type="invalid_request_error",
-                            ),
-                        ) from exc
-                    except Exception as exc:
-                        if claimed_automatic_authority is not None:
-                            rollback_task = asyncio.create_task(
-                                self._rollback_rowless_preflight_setup_failure_if_unbound(automatic_request_state)
-                            )
-                            try:
-                                _, rollback_cancellation = await _await_task_deferring_cancellation(rollback_task)
-                            except Exception:
-                                logger.warning(
-                                    "Failed to restore request-start unsent rowless authority",
-                                    exc_info=True,
-                                )
-                            else:
-                                if rollback_cancellation is not None:
-                                    raise rollback_cancellation
-                        raise ProxyResponseError(
-                            502,
-                            openai_error(
-                                "bridge_continuity_persistence_failed",
-                                "The semantic-rebase authority could not be persisted; retrying is unsafe.",
-                            ),
-                        ) from exc
-                    rowless_authority = claimed_automatic_authority
-                    automatic_preflight_claimed = True
-                if rowless_authority.state == HttpBridgeRowlessRecoveryState.CAPTURED:
-                    envelope = openai_error(
-                        "previous_response_recovery_authorization_required",
-                        "A dashboard administrator must approve this same-turn semantic rebase.",
-                        error_type="invalid_request_error",
-                    )
-                    envelope["error"]["action"] = "retry_same_turn_after_admin_approval"
-                    raise ProxyResponseError(400, envelope)
-                if automatic_preflight_claimed:
-                    if rowless_capture_facts is None:  # pragma: no cover - eligibility requires it
-                        raise AssertionError("automatic rowless recovery lost its captured projection")
-                    projected_input = rowless_capture_facts.projected_input
-                else:
-                    projected_input = approved_rowless_recovery_projection(
-                        untrimmed_effective_payload,
-                        captured_input_item_count=rowless_authority.captured_input_item_count,
-                        captured_input_fingerprint=rowless_authority.captured_input_fingerprint,
-                        non_input_contract_fingerprint=rowless_authority.non_input_contract_fingerprint,
-                        direct_call_ledger_digest=rowless_authority.settled_direct_call_ledger_digest,
-                        projected_payload_fingerprint=rowless_authority.projected_payload_fingerprint,
-                    )
-                if not (
-                    rowless_dispatch_identity_eligible
-                    or (
-                        rowless_authority.origin_marker_session_id is not None
-                        and marker_rowless_dispatch_identity_eligible
-                    )
-                ):
-                    raise ProxyResponseError(
-                        400,
-                        openai_error(
-                            "rowless_recovery_exact_identity_required",
-                            "Retry with the exact captured root-task routing identity.",
-                            error_type="invalid_request_error",
-                        ),
-                    )
-                if projected_input is None:
-                    raise ProxyResponseError(
-                        400,
-                        openai_error(
-                            "rowless_recovery_exact_same_turn_required",
-                            "Retry the exact captured turn after administrator approval; "
-                            "new suffix items are not allowed.",
-                            error_type="invalid_request_error",
-                        ),
-                    )
-                effective_payload = untrimmed_effective_payload.model_copy(
-                    update={"input": projected_input, "previous_response_id": None}
-                )
-                # The semantic rebase has replaced the temporary reattach
-                # anchor with a claimed, self-contained wire. Do not let the
-                # later store-context path trim or rebuild that exact wire.
-                proxy_injected_previous_response_id = False
-                fresh_upstream_request_text = None
-                if automatic_preflight_claimed:
-                    if automatic_request_state is None or automatic_text is None:  # pragma: no cover
-                        raise AssertionError("automatic rowless recovery lost its in-memory wire")
-                    request_state = automatic_request_state
-                    text_data = automatic_text
-                else:
-                    request_state, text_data = prepare_bridge_request(effective_payload)
-                    async with SessionLocal() as rowless_session:
-                        installation_id = await rowless_session.scalar(
-                            select(Account.codex_installation_id).where(
-                                Account.id == rowless_authority.selected_account_intent
-                            )
-                        )
-                    if not installation_id:
-                        raise ProxyResponseError(
-                            400,
-                            openai_error(
-                                "rowless_recovery_pinned_account_changed",
-                                "The pinned account metadata is unavailable; the semantic rebase remains unsent.",
-                                error_type="invalid_request_error",
-                            ),
-                        )
-                    text_data = _text_with_account_installation_id(text_data, installation_id)
-                if rowless_actual_wire_fingerprint(text_data) != rowless_authority.actual_wire_fingerprint:
-                    raise ProxyResponseError(
-                        400,
-                        openai_error(
-                            "rowless_recovery_actual_wire_changed",
-                            "The exact upstream wire changed after approval; the semantic rebase remains unsent.",
-                            error_type="invalid_request_error",
-                        ),
-                    )
-                request_state.request_text = text_data
-                request_state.rowless_recovery_authority_id = rowless_authority.id
-                request_state.rowless_recovery_generation = rowless_authority.generation
-                request_state.rowless_recovery_task_authority_digest = rowless_authority.captured_task_authority_digest
-                rowless_wire_fingerprint = rowless_authority.actual_wire_fingerprint
-                request_state.rowless_recovery_wire_fingerprint = rowless_wire_fingerprint
-                request_state.preferred_account_id = rowless_authority.selected_account_intent
-                request_state.input_item_count = rowless_authority.captured_input_item_count
-                request_state.input_full_fingerprint = rowless_authority.captured_input_fingerprint
-                request_state.rowless_recovery_capture_intent = None
-                if not automatic_preflight_claimed:
-                    try:
-                        async with SessionLocal() as rowless_session:
-                            await RowlessRecoveryRepository(rowless_session).claim_dispatch_preflight(
-                                authority_id=rowless_authority.id,
-                                generation=rowless_authority.generation,
-                                request_id=request_state.request_id,
-                                wire_request_fingerprint=rowless_wire_fingerprint,
-                                task_authority_digest=rowless_authority.captured_task_authority_digest,
-                            )
-                    except RowlessRecoveryStateError as exc:
-                        raise ProxyResponseError(
-                            400,
-                            openai_error(
-                                "rowless_recovery_dispatch_already_claimed",
-                                "This semantic-rebase generation has already been claimed and cannot be replayed.",
-                                error_type="invalid_request_error",
-                            ),
-                        ) from exc
-                    except Exception as exc:
-                        raise ProxyResponseError(
-                            502,
-                            openai_error(
-                                "bridge_continuity_persistence_failed",
-                                "The semantic-rebase dispatch fence could not be persisted.",
-                            ),
-                        ) from exc
-                force_local_recovery_creation = True
-            elif durable_lookup is not None:
-                # A normal durable checkpoint is not eligible for a new
-                # rowless authority.  The broader candidate exists only so a
-                # previously captured non-cascading tombstone can be found
-                # after the failed turn created a transient replacement row.
-                request_state.rowless_recovery_capture_intent = None
         request_state.enforce_openai_sdk_contract = enforce_openai_sdk_contract
         request_state.affinity_policy = affinity
-        if durable_marker_abandoned_pending_replay and isinstance(payload.input, list):
-            # Upstream receives the fail-closed projection while the new
-            # durable anchor remains bound to the exact complete client
-            # context that sealed the abandoned-pending proof.
-            request_state.input_item_count = len(payload.input)
-            request_state.input_full_fingerprint = _fingerprint_input_items(cast(list[JsonValue], payload.input))
         _apply_http_bridge_downstream_turn_state(
             request_state,
             downstream_turn_state=downstream_turn_state,
@@ -3210,11 +1753,32 @@ class _HTTPBridgeStreamingMixin:
                 session_id=request_state.session_id,
                 surface="http_bridge",
             )
-            request_state.preferred_account_id = resolve_required_account_id(
-                ("durable bridge", request_state.preferred_account_id),
-                ("live bridge", local_previous_response_owner),
-                ("previous-response index", indexed_previous_response_owner),
-            )
+            try:
+                request_state.preferred_account_id = resolve_required_account_id(
+                    ("durable bridge", request_state.preferred_account_id),
+                    ("live bridge", local_previous_response_owner),
+                    ("previous-response index", indexed_previous_response_owner),
+                )
+            except ProxyResponseError:
+                # The request-log owner cache is intentionally only a fast
+                # path. If it conflicts with a durable anchor, re-read the
+                # authoritative request-log row once before failing closed;
+                # this repairs stale in-process pins without adding a DB read
+                # to the normal continuation path.
+                if durable_lookup is None or indexed_previous_response_owner is None:
+                    raise
+                indexed_previous_response_owner = await self._resolve_websocket_previous_response_owner(
+                    previous_response_id=request_state.previous_response_id,
+                    api_key=api_key,
+                    session_id=request_state.session_id,
+                    surface="http_bridge",
+                    force_request_log_lookup=True,
+                )
+                request_state.preferred_account_id = resolve_required_account_id(
+                    ("durable bridge", request_state.preferred_account_id),
+                    ("live bridge", local_previous_response_owner),
+                    ("previous-response index", indexed_previous_response_owner),
+                )
         durable_lookup_requires_owner = durable_lookup is not None and (
             request_state.previous_response_id is not None
             or bridge_session_key.strength == "hard"
@@ -3262,73 +1826,6 @@ class _HTTPBridgeStreamingMixin:
             # Only the trim branch below (which verifies the stored prefix
             # fingerprint) is allowed to flip this flag to ``True``.
             request_state.fresh_upstream_request_is_retry_safe = False
-        elif durable_marker_verified_recovery:
-            # The durable marker and the sealed abandoned-pending proof have
-            # already authorized this exact same-account projection. Bind the
-            # attempt journal to that exact projected wire body; the terminal
-            # checkpoint separately retains the sealed complete client input
-            # count/fingerprint above. The projection remains pinned to the
-            # durable owner account rather than becoming account-neutral.
-            request_state.fresh_upstream_request_text = text_data
-            request_state.fresh_upstream_request_is_retry_safe = True
-            request_state.fresh_upstream_request_is_account_neutral = False
-            if durable_recovery_attempt_fingerprint is None or durable_lookup is None:
-                raise RuntimeError("sealed marker recovery lost its durable journal identity")
-            request_state.recovery_attempt_fingerprint = durable_recovery_attempt_fingerprint
-            request_state.recovery_attempt_session_id = durable_lookup.session_id
-            request_state.recovery_attempt_owner_epoch = durable_lookup.owner_epoch
-            request_state.marker_recovery_terminal_settlement_required = True
-            request_state.marker_recovery_claim_request_id = request_id
-            request_state.marker_recovery_rejected_response_id = durable_lookup.latest_response_id
-            request_state.marker_recovery_claimed = True
-            marker_session_id = durable_lookup.session_id
-            marker_owner_epoch = durable_lookup.owner_epoch
-
-            async def rollback_failed_marker_claim() -> None:
-                await self._rollback_marker_recovery_claim_before_dispatch(
-                    request_state,
-                    api_key_id=bridge_session_key.api_key_id,
-                    durable_session_id=marker_session_id,
-                    durable_owner_epoch=marker_owner_epoch,
-                )
-
-            try:
-                marker_attempt = await self._durable_bridge.claim_and_record_live_session_recovery_attempt(
-                    session_id=durable_lookup.session_id,
-                    instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
-                    owner_epoch=durable_lookup.owner_epoch,
-                    account_id=durable_lookup.account_id,
-                    rejected_response_id=durable_lookup.latest_response_id,
-                    attempt_fingerprint=durable_recovery_attempt_fingerprint,
-                    claim_request_id=request_id,
-                    journal_request_id=request_state.request_id,
-                    model=request_state.model,
-                )
-            except asyncio.CancelledError:
-                rollback_task = asyncio.create_task(rollback_failed_marker_claim())
-                try:
-                    await asyncio.shield(rollback_task)
-                except asyncio.CancelledError:
-                    await rollback_task
-                raise
-            except Exception as exc:
-                await rollback_failed_marker_claim()
-                raise ProxyResponseError(
-                    502,
-                    openai_error(
-                        "bridge_continuity_persistence_failed",
-                        "The recovery generation could not be journaled; retrying is unsafe.",
-                    ),
-                ) from exc
-            if marker_attempt is None:
-                request_state.marker_recovery_claimed = False
-                raise ProxyResponseError(
-                    502,
-                    openai_error(
-                        "bridge_continuity_persistence_failed",
-                        "Another complete-context request already owns this recovery generation.",
-                    ),
-                )
         elif (
             effective_payload.previous_response_id is not None
             and payload_looks_like_full_resend
@@ -3347,20 +1844,6 @@ class _HTTPBridgeStreamingMixin:
             del _fresh_state
             request_state.fresh_upstream_request_text = client_full_resend_fresh_upstream_request_text
             request_state.fresh_upstream_request_is_retry_safe = True
-            request_state.fresh_upstream_request_is_account_neutral = (
-                _http_bridge_payload_is_account_neutral_fresh_replay(client_full_resend_payload)
-            )
-
-        async def rollback_marker_recovery_setup_failure() -> None:
-            if not request_state.marker_recovery_claimed or durable_lookup is None:
-                return
-            await self._rollback_marker_recovery_claim_before_dispatch(
-                request_state,
-                api_key_id=bridge_session_key.api_key_id,
-                durable_session_id=durable_lookup.session_id,
-                durable_owner_epoch=durable_lookup.owner_epoch,
-            )
-
         settings = _service_get_settings()
         request_deadline = request_state.started_at + _http_bridge_request_budget_seconds(settings)
         session_creation_headers = (
@@ -3390,19 +1873,13 @@ class _HTTPBridgeStreamingMixin:
                     cast(list[JsonValue], payload.input),
                     stored_count=durable_full_resend_anchor_count,
                     preserve_developer_message_ids=True,
-                    preserve_response_owned_agent_message_ids=True,
                 )
                 if eligibility_projection is None:
                     return False
-                durable_full_resend_retains_prior_output = (
-                    durable_lookup is not None
-                    and responses_input_suffix_retains_prior_output(
-                        eligibility_projection.input_items,
-                        stored_count=eligibility_projection.stored_prefix_count,
-                        canonical_lite_developer_index=eligibility_projection.canonical_lite_developer_index,
-                        exact_stored_prefix_without_pending_manifest=not durable_lookup.latest_pending_tool_calls,
-                        allow_response_owned_agent_message=durable_lookup.latest_pending_tool_calls == {},
-                    )
+                durable_full_resend_retains_prior_output = responses_input_suffix_retains_prior_output(
+                    eligibility_projection.input_items,
+                    stored_count=eligibility_projection.stored_prefix_count,
+                    canonical_lite_developer_index=eligibility_projection.canonical_lite_developer_index,
                 )
                 if not durable_full_resend_retains_prior_output:
                     return False
@@ -3455,6 +1932,21 @@ class _HTTPBridgeStreamingMixin:
             nonlocal text_data
             nonlocal untrimmed_effective_payload
 
+            preserve_operation_identity = durable_recovery_attempt_claimed or durable_recovery_fresh_replay
+            prior_operation_id = request_state.operation_id if preserve_operation_identity else None
+            prior_operation_fingerprint = request_state.operation_fingerprint if preserve_operation_identity else None
+            prior_operation_parent_response_id = (
+                request_state.operation_parent_response_id or request_state.previous_response_id
+                if preserve_operation_identity
+                else None
+            )
+            prior_operation_registered = request_state.operation_registered if preserve_operation_identity else False
+            prior_operation_attempt_generation = (
+                request_state.operation_attempt_generation if preserve_operation_identity else 0
+            )
+            prior_operation_persisted_response_id = (
+                request_state.operation_persisted_response_id if preserve_operation_identity else None
+            )
             failed_owner_id = request_state.preferred_account_id
             _log_http_bridge_event(
                 "owner_unavailable_fresh_resend",
@@ -3479,6 +1971,14 @@ class _HTTPBridgeStreamingMixin:
             if fresh_payload is None:
                 raise RuntimeError("account-neutral replay projection missing after eligibility check")
             request_state, text_data = prepare_bridge_request(fresh_payload)
+            if preserve_operation_identity:
+                request_state.operation_id = prior_operation_id
+                request_state.operation_fingerprint = prior_operation_fingerprint
+                request_state.operation_parent_response_id = prior_operation_parent_response_id
+                request_state.operation_registered = prior_operation_registered
+                request_state.operation_attempt_generation = prior_operation_attempt_generation
+                request_state.operation_persisted_response_id = prior_operation_persisted_response_id
+                request_state.operation_rebind_required = True
             request_state.enforce_openai_sdk_contract = enforce_openai_sdk_contract
             request_state.affinity_policy = affinity
             request_state.excluded_account_ids.update(fresh_replay_excluded_account_ids)
@@ -3508,8 +2008,7 @@ class _HTTPBridgeStreamingMixin:
             file_required_preferred_account = False
 
         if durable_recovery_attempt_claimed:
-            if not durable_marker_verified_recovery_candidate:
-                switch_to_account_neutral_replay()
+            switch_to_account_neutral_replay()
             request_state.recovery_attempt_fingerprint = durable_recovery_attempt_fingerprint
             request_state.recovery_attempt_session_id = durable_recovery_attempt_session_id
             request_state.recovery_attempt_owner_epoch = durable_recovery_attempt_owner_epoch
@@ -3533,7 +2032,7 @@ class _HTTPBridgeStreamingMixin:
             )
             switch_to_account_neutral_replay()
 
-        if required_continuity_owner_missing and request_state.rowless_recovery_capture_intent is None:
+        if required_continuity_owner_missing:
             owner_unavailable = ProxyResponseError(
                 502,
                 openai_error(
@@ -3569,7 +2068,19 @@ class _HTTPBridgeStreamingMixin:
                     previous_response_id=request_state.previous_response_id,
                     gateway_safe_mode=runtime_config.gateway_safe_mode,
                     allow_forward_to_owner=(
-                        not fresh_replay_excluded_account_ids and not force_local_recovery_creation
+                        not fresh_replay_excluded_account_ids
+                        and not force_local_recovery_creation
+                        and not affinity.abandon_unavailable_legacy_owner
+                    ),
+                    # A single-instance restart can leave an anchored durable
+                    # row owned by the previous process epoch. Once the old
+                    # owner is proven dead, let the initial continuation
+                    # rebind locally; clustered deployments still route or
+                    # fail closed through the normal owner path.
+                    allow_previous_response_recovery_rebind=(
+                        request_state.previous_response_id is not None
+                        and dead_owner_anchor
+                        and not _http_bridge_requires_cluster_registration(settings)
                     ),
                     forwarded_request=forwarded_request,
                     forwarded_original_request_unanchored=original_request_unanchored,
@@ -3580,7 +2091,6 @@ class _HTTPBridgeStreamingMixin:
                     preferred_account_id=request_state.preferred_account_id,
                     preferred_account_has_continuity_provenance=preferred_account_has_continuity_provenance,
                     fallback_on_preferred_account_unavailable=not file_required_preferred_account,
-                    allow_previous_response_recovery_rebind=(request_state.rowless_recovery_capture_intent is not None),
                     request_usage_budget=request_state.request_usage_budget,
                     request_deadline=request_deadline,
                     session_header_fallback_key=session_header_fallback_key,
@@ -3588,40 +2098,7 @@ class _HTTPBridgeStreamingMixin:
                     deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
                     defer_account_health_writes=request_state.api_key_reservation is not None,
                 )
-            except asyncio.CancelledError:
-
-                async def rollback_cancelled_setup() -> None:
-                    await self._rollback_rowless_preflight_setup_failure_if_unbound(request_state)
-                    await rollback_marker_recovery_setup_failure()
-
-                rollback_task = asyncio.create_task(rollback_cancelled_setup())
-                try:
-                    await asyncio.shield(rollback_task)
-                except asyncio.CancelledError:
-                    await rollback_task
-                raise
             except ProxyResponseError as exc:
-                if (
-                    request_state.rowless_recovery_authority_id is not None
-                    and request_state.rowless_recovery_generation is not None
-                    and request_state.rowless_recovery_wire_fingerprint is not None
-                ):
-                    async with SessionLocal() as rowless_session:
-                        restored = await RowlessRecoveryRepository(rowless_session).rollback_preflight_setup_failure(
-                            authority_id=request_state.rowless_recovery_authority_id,
-                            generation=request_state.rowless_recovery_generation,
-                            request_id=request_state.request_id,
-                            wire_request_fingerprint=request_state.rowless_recovery_wire_fingerprint,
-                        )
-                    if not restored:
-                        raise ProxyResponseError(
-                            502,
-                            openai_error(
-                                "bridge_continuity_persistence_failed",
-                                "The failed semantic-rebase setup could not be restored safely.",
-                            ),
-                        ) from exc
-                    raise
                 if not owner_unavailable_allows_account_neutral_replay(exc):
                     exc_code, _exc_message = _proxy_error_code_message(exc)
                     if not unanchored_fork_spill_attempted and _http_bridge_unanchored_fork_can_spill_on_cap(
@@ -3667,10 +2144,8 @@ class _HTTPBridgeStreamingMixin:
                         ):
                             yield line
                         if _service_time().monotonic() >= request_deadline:
-                            await rollback_marker_recovery_setup_failure()
                             raise
                         continue
-                    await rollback_marker_recovery_setup_failure()
                     raise
                 _log_http_bridge_event(
                     "owner_unavailable_fresh_resend",
@@ -3683,13 +2158,8 @@ class _HTTPBridgeStreamingMixin:
                 )
                 switch_to_account_neutral_replay()
                 continue
-            except Exception:
-                await self._rollback_rowless_preflight_setup_failure_if_unbound(request_state)
-                await rollback_marker_recovery_setup_failure()
-                raise
             break
         if isinstance(session_or_forward, _HTTPBridgeOwnerForward):
-            await rollback_marker_recovery_setup_failure()
             await _current_origin_legacy_owner_anchor_lookup(
                 durable_bridge=self._durable_bridge,
                 bridge_session_key=session_or_forward.key,
@@ -3716,6 +2186,8 @@ class _HTTPBridgeStreamingMixin:
                     yield line
                 return
             except ProxyResponseError as exc:
+                if not _owner_forward_failure_allows_local_recovery(exc):
+                    raise
                 if forwarded_any:
                     yield _partial_output_proxy_error_event_block(
                         exc,
@@ -3765,11 +2237,7 @@ class _HTTPBridgeStreamingMixin:
                                 session_key_value=bridge_session_key.affinity_key,
                                 api_key_id=bridge_session_key.api_key_id,
                                 turn_state=takeover_turn_state,
-                                session_header=(
-                                    session_header_fallback_key.affinity_key
-                                    if explicit_prompt_cache_key is not None and session_header_fallback_key is not None
-                                    else incoming_session_header
-                                ),
+                                session_header=durable_session_header_alias,
                                 previous_response_id=effective_payload.previous_response_id,
                             )
                         except Exception:
@@ -3780,21 +2248,6 @@ class _HTTPBridgeStreamingMixin:
                         else:
                             if _http_bridge_durable_lookup_allows_turn_state_takeover(fresh_turn_state_lookup):
                                 durable_lookup = fresh_turn_state_lookup
-                                (
-                                    durable_abandoned_pending_full_resend_proof,
-                                    durable_abandoned_pending_full_resend_rejection_reason,
-                                ) = _verify_durable_abandoned_pending_full_resend_with_reason(
-                                    payload,
-                                    fresh_turn_state_lookup,
-                                )
-                                if _verify_durable_full_resend(payload, fresh_turn_state_lookup) is None:
-                                    _log_abandoned_pending_full_resend_rejection(
-                                        bridge_session_key=bridge_session_key,
-                                        payload=payload,
-                                        durable_lookup=fresh_turn_state_lookup,
-                                        reason_code=durable_abandoned_pending_full_resend_rejection_reason,
-                                        stage="takeover_lookup",
-                                    )
                                 if fresh_turn_state_lookup is None:
                                     durable_full_resend_anchor_count = None
                                     durable_full_resend_anchor_fingerprint = None
@@ -4028,13 +2481,7 @@ class _HTTPBridgeStreamingMixin:
                             }
                         )
                         if durable_lookup.latest_response_id != session.last_completed_response_id:
-                            session.last_pending_tool_call_manifest_invalid = (
-                                durable_lookup.latest_pending_tool_calls is None
-                            )
-                            session.last_pending_tool_calls = dict(durable_lookup.latest_pending_tool_calls or {})
-                            session.last_response_transition_manifest = (
-                                durable_lookup.latest_response_transition_manifest
-                            )
+                            session.last_pending_tool_calls = {}
                         session.last_completed_response_id = durable_lookup.latest_response_id
                         session.last_completed_response_account_id = durable_lookup.account_id
                         session.last_completed_input_count = durable_full_resend_anchor_count
@@ -4096,7 +2543,6 @@ class _HTTPBridgeStreamingMixin:
                         request_state.request_stage if owner_forward_fresh_replay else "reattach"
                     )
                     retry_request_state.preferred_account_id = request_state.preferred_account_id
-                    retry_request_state.file_required_preferred_account = file_required_preferred_account
                     retry_request_state.excluded_account_ids.update(request_state.excluded_account_ids)
                     if recovery_anchor_input_count is not None:
                         retry_request_state.input_item_count = recovery_anchor_input_count
@@ -4161,12 +2607,9 @@ class _HTTPBridgeStreamingMixin:
         ):
             if durable_lookup.latest_response_id != session.last_completed_response_id:
                 # The pending tool calls were recorded for the session's own
-                # last completed response.  Rebind them to the durable anchor,
-                # preserving an unavailable manifest as invalid instead of
-                # silently treating it as a verified empty manifest.
-                session.last_pending_tool_call_manifest_invalid = durable_lookup.latest_pending_tool_calls is None
-                session.last_pending_tool_calls = dict(durable_lookup.latest_pending_tool_calls or {})
-                session.last_response_transition_manifest = durable_lookup.latest_response_transition_manifest
+                # last completed response; a durable anchor pointing elsewhere
+                # must not trigger interrupted-output injection.
+                session.last_pending_tool_calls = {}
             session.last_completed_response_id = durable_lookup.latest_response_id
             # The durable anchor is owned by the durable session's account, which
             # may differ from this session's account after a failover. Record the
@@ -4219,7 +2662,6 @@ class _HTTPBridgeStreamingMixin:
         ) and (not _http_bridge_payload_looks_like_full_resend(effective_payload) or session_anchor_trimmable)
         session_anchor_candidate = (
             session.codex_session
-            and request_state.rowless_recovery_authority_id is None
             # Honor the quarantine decision end to end: the durable anchor
             # skipped above must not come back as a session-level injection.
             and not fresh_reattach_anchor_suppressed_quarantined
@@ -4291,7 +2733,6 @@ class _HTTPBridgeStreamingMixin:
         store_context_trim_applied = False
         store_context_original_count = 0
         store_context_original_fingerprint: str | None = None
-        store_context_full_resend_proof: _VerifiedStoreContextFullResend | None = None
         if (
             has_previous_response_id
             and stored_count > 0
@@ -4302,10 +2743,6 @@ class _HTTPBridgeStreamingMixin:
             incoming_input_list = cast(list[JsonValue], incoming_input)
             incoming_prefix_fingerprint = _fingerprint_input_items(incoming_input_list[:stored_count])
             if incoming_prefix_fingerprint == stored_fingerprint:
-                store_context_full_resend_proof = _verify_store_context_full_resend(
-                    untrimmed_effective_payload,
-                    session,
-                )
                 store_context_trim_applied = True
                 store_context_original_count = len(incoming_input_list)
                 store_context_original_fingerprint = _fingerprint_input_items(incoming_input_list)
@@ -4326,14 +2763,10 @@ class _HTTPBridgeStreamingMixin:
                     stored_count,
                     effective_payload.previous_response_id,
                 )
-        injected_input_items = (
-            None
-            if request_state.rowless_recovery_authority_id is not None
-            else _http_bridge_interrupted_tool_outputs_input(
-                session,
-                payload=submit_payload,
-                request_id=request_id,
-            )
+        injected_input_items = _http_bridge_interrupted_tool_outputs_input(
+            session,
+            payload=submit_payload,
+            request_id=request_id,
         )
         if injected_input_items is not None:
             submit_payload = submit_payload.model_copy(update={"input": injected_input_items})
@@ -4389,46 +2822,13 @@ class _HTTPBridgeStreamingMixin:
                 # keep the replay-safety decision made when the anchor was
                 # injected.
                 request_state.fresh_upstream_request_is_retry_safe = (
-                    store_context_full_resend_proof is not None
+                    (durable_full_resend_anchor_count is None or durable_full_resend_has_safe_fresh_context)
                     if store_context_trim_applied
                     else previous_request_state.fresh_upstream_request_is_retry_safe
                 )
-                if request_state.fresh_upstream_request_is_retry_safe:
-                    fresh_replay_payload = _http_bridge_payload_without_previous_response_id(
-                        untrimmed_effective_payload
-                    )
-                    request_state.fresh_upstream_request_is_account_neutral = (
-                        _http_bridge_payload_is_account_neutral_fresh_replay(fresh_replay_payload)
-                    )
-            elif durable_marker_verified_recovery:
-                # Interrupted-tool normalization re-prepares the projected
-                # request. Preserve both authorities across that mechanical
-                # rewrite: the final projected wire text/journal identity and
-                # the original complete client input for the new durable
-                # terminal checkpoint.
-                request_state.fresh_upstream_request_text = text_data
-                request_state.fresh_upstream_request_is_retry_safe = True
-                request_state.fresh_upstream_request_is_account_neutral = False
-                request_state.recovery_attempt_fingerprint = previous_request_state.recovery_attempt_fingerprint
-                request_state.recovery_attempt_session_id = previous_request_state.recovery_attempt_session_id
-                request_state.recovery_attempt_owner_epoch = previous_request_state.recovery_attempt_owner_epoch
-                request_state.recovery_attempt_claimed = previous_request_state.recovery_attempt_claimed
-                request_state.marker_recovery_terminal_settlement_required = (
-                    previous_request_state.marker_recovery_terminal_settlement_required
-                )
-                request_state.marker_recovery_claimed = previous_request_state.marker_recovery_claimed
-                request_state.marker_recovery_claim_request_id = previous_request_state.marker_recovery_claim_request_id
-                request_state.marker_recovery_rejected_response_id = (
-                    previous_request_state.marker_recovery_rejected_response_id
-                )
-                request_state.input_item_count = previous_request_state.input_item_count
-                request_state.input_full_fingerprint = previous_request_state.input_full_fingerprint
             elif client_full_resend_fresh_upstream_request_text is not None:
                 request_state.fresh_upstream_request_text = client_full_resend_fresh_upstream_request_text
                 request_state.fresh_upstream_request_is_retry_safe = True
-                request_state.fresh_upstream_request_is_account_neutral = (
-                    previous_request_state.fresh_upstream_request_is_account_neutral
-                )
         initial_handoff_session = session
         initial_handoff_scope_id = ensure_request_scope_id() if original_request_unanchored else None
         if initial_handoff_scope_id is not None:
@@ -4456,9 +2856,22 @@ class _HTTPBridgeStreamingMixin:
             durable_recovery_fresh_replay = False
             retry_request_state: _WebSocketRequestState | None = None
 
+            async def release_recovery_origin_lease() -> None:
+                if durable_recovery_attempt_session_id is None or durable_recovery_attempt_owner_epoch is None:
+                    return
+                try:
+                    await self._durable_bridge.release_live_session(
+                        session_id=durable_recovery_attempt_session_id,
+                        instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+                        owner_epoch=durable_recovery_attempt_owner_epoch,
+                        draining=False,
+                    )
+                except Exception:
+                    logger.warning("Failed to release HTTP bridge recovery origin lease", exc_info=True)
+
             async def rollback_pre_dispatch_recovery_claim() -> None:
                 if not (
-                    durable_recovery_fresh_replay
+                    (durable_recovery_fresh_replay or durable_recovery_attempt_claimed)
                     and (retry_request_state is None or not retry_request_state.recovery_attempt_dispatched)
                     and durable_recovery_attempt_fingerprint is not None
                     and durable_recovery_attempt_session_id is not None
@@ -4466,13 +2879,15 @@ class _HTTPBridgeStreamingMixin:
                 ):
                     return
                 try:
-                    await self._durable_bridge.rollback_recovery_attempt_replayed(
+                    rolled_back = await self._durable_bridge.rollback_recovery_attempt_replayed(
                         session_id=durable_recovery_attempt_session_id,
                         api_key_id=bridge_session_key.api_key_id,
                         instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
                         owner_epoch=durable_recovery_attempt_owner_epoch,
                         request_fingerprint=durable_recovery_attempt_fingerprint,
                     )
+                    if rolled_back:
+                        await release_recovery_origin_lease()
                 except Exception:
                     logger.warning("Failed to roll back pre-dispatch HTTP bridge recovery claim", exc_info=True)
 
@@ -4480,6 +2895,19 @@ class _HTTPBridgeStreamingMixin:
                 yield event_block
                 yielded_any = True
         except ProxyResponseError as exc:
+            if (
+                request_state.operation_registered
+                and request_state.operation_id is not None
+                and session.durable_session_id is not None
+                and session.durable_owner_epoch is not None
+                and _http_bridge_durable_recovery_predecessor_proven(request_state)
+            ):
+                # The API-level recovery loop must only run when this request
+                # has an actual durable operation fence. Settings alone are
+                # insufficient during a rolling migration where the durable
+                # tables may be unavailable and the bridge falls back to an
+                # in-memory session.
+                setattr(exc, "http_bridge_durable_recovery_eligible", True)
             if yielded_any:
                 yield _partial_output_proxy_error_event_block(
                     exc,
@@ -4753,6 +3181,10 @@ class _HTTPBridgeStreamingMixin:
                         session,
                         error_code="stream_incomplete",
                         error_message="Upstream websocket closed before response.completed",
+                        # Keep the origin lease fenced while the replacement
+                        # session is admitted and the one-shot journal is
+                        # either rolled back or settled. Releasing it here
+                        # would make both transitions fail their owner fence.
                         preserve_durable_lease=True,
                     )
                     switch_to_account_neutral_replay()
@@ -4775,72 +3207,6 @@ class _HTTPBridgeStreamingMixin:
             should_attempt_previous_response_recovery = (
                 effective_payload.previous_response_id is not None
                 and _http_bridge_should_attempt_local_previous_response_recovery(exc)
-            )
-            recovery_error = exc.payload.get("error") if isinstance(exc.payload, dict) else None
-            recovery_error_code = (
-                str(recovery_error["code"]) if isinstance(recovery_error, dict) and recovery_error.get("code") else None
-            )
-            stale_anchor_rejected = bool(
-                isinstance(recovery_error, dict)
-                and (
-                    recovery_error_code == "bridge_previous_response_not_found"
-                    or _is_previous_response_not_found_error(
-                        code=recovery_error_code,
-                        param=(str(recovery_error["param"]) if recovery_error.get("param") is not None else None),
-                        message=(str(recovery_error["message"]) if recovery_error.get("message") is not None else None),
-                    )
-                )
-            )
-            proxy_injected_stale_anchor = bool(
-                should_attempt_previous_response_recovery
-                and stale_anchor_rejected
-                and request_state.proxy_injected_previous_response_id
-                and request_state.response_event_count == 0
-                and untrimmed_effective_payload.previous_response_id is None
-            )
-            durable_stale_anchor_replay = bool(
-                proxy_injected_stale_anchor
-                and request_state.proxy_injected_anchor_had_full_resend_payload
-                and durable_lookup is not None
-                and durable_full_resend_proof is not None
-                and durable_full_resend_proof.matches(untrimmed_effective_payload, durable_lookup)
-            )
-            store_context_stale_anchor_replay = bool(
-                proxy_injected_stale_anchor
-                and request_state.proxy_injected_anchor_had_full_resend_payload
-                and store_context_full_resend_proof is not None
-                and store_context_full_resend_proof.matches(untrimmed_effective_payload, session)
-            )
-            client_provided_stale_anchor_replay = bool(
-                should_attempt_previous_response_recovery
-                and stale_anchor_rejected
-                and not request_state.proxy_injected_previous_response_id
-                and request_state.response_event_count == 0
-                and effective_payload.previous_response_id is not None
-                and durable_lookup is not None
-                and durable_full_resend_proof is not None
-                and durable_full_resend_proof.matches(untrimmed_effective_payload, durable_lookup)
-            )
-            abandoned_pending_stale_anchor_replay = bool(
-                should_attempt_previous_response_recovery
-                and stale_anchor_rejected
-                and request_state.response_event_count == 0
-                and durable_lookup is not None
-                and durable_abandoned_pending_full_resend_proof is not None
-                and durable_abandoned_pending_full_resend_proof.matches(
-                    untrimmed_effective_payload,
-                    durable_lookup,
-                )
-                and (
-                    request_state.proxy_injected_previous_response_id
-                    or effective_payload.previous_response_id is not None
-                )
-            )
-            proof_gated_stale_anchor_replay = (
-                durable_stale_anchor_replay
-                or store_context_stale_anchor_replay
-                or client_provided_stale_anchor_replay
-                or abandoned_pending_stale_anchor_replay
             )
             should_attempt_context_overflow_fresh_turn_recovery = (
                 is_context_overflow
@@ -4909,166 +3275,6 @@ class _HTTPBridgeStreamingMixin:
                     error_message="Upstream websocket closed before response.completed",
                 )
                 raise
-            elif proof_gated_stale_anchor_replay:
-                # Keep the durable response anchor until the replacement
-                # request reaches response.completed and atomically publishes
-                # its new anchor. Quarantine plus the sealed full-resend proof
-                # below is the only authority to bypass the rejected anchor,
-                # including an explicit client anchor whose complete resend
-                # exactly matches this durable session's stored prefix.
-                # If replacement creation, reservation, or pre-dispatch send
-                # fails, the old durable row remains intact: delta requests
-                # stay anchored/fail closed and a later verified full resend
-                # can retry safely.
-                _quarantine_http_bridge_session(
-                    self,
-                    session,
-                    reason=_HTTP_BRIDGE_QUARANTINE_REJECTED_STALE_ANCHOR_REASON,
-                )
-                if PROMETHEUS_AVAILABLE and bridge_durable_recover_total is not None:
-                    bridge_durable_recover_total.labels(
-                        path=(
-                            "stale_anchor_store_context_full_resend"
-                            if store_context_stale_anchor_replay
-                            else "stale_anchor_full_resend"
-                        )
-                    ).inc()
-                proof_source = (
-                    "abandoned_pending_agent_boundary"
-                    if abandoned_pending_stale_anchor_replay
-                    else "client_explicit"
-                    if client_provided_stale_anchor_replay
-                    else "store_context"
-                    if store_context_stale_anchor_replay
-                    else "durable"
-                )
-                _log_http_bridge_event(
-                    "previous_response_recover_full_resend",
-                    bridge_session_key,
-                    account_id=session.account.id,
-                    model=effective_payload.model,
-                    detail=(f"outcome=single_unanchored_same_account_replay, proof_source={proof_source}"),
-                    cache_key_family=bridge_session_key.affinity_kind,
-                    model_class=_extract_model_class(effective_payload.model) if effective_payload.model else None,
-                    owner_check_applied=True,
-                )
-                await self._reset_http_bridge_session_after_local_terminal_error(
-                    session,
-                    error_code="previous_response_anchor_invalid",
-                    error_message="A verified previous response anchor was rejected before execution",
-                    preserve_durable_lease=True,
-                )
-                recovery_path = (
-                    "stale_anchor_store_context_full_resend"
-                    if store_context_stale_anchor_replay
-                    else "stale_anchor_full_resend"
-                )
-                retry_payload = _http_bridge_payload_without_previous_response_id(untrimmed_effective_payload)
-                if abandoned_pending_stale_anchor_replay:
-                    if not isinstance(untrimmed_effective_payload.input, list):
-                        raise
-                    abandoned_projection = project_responses_input_for_abandoned_pending_fresh_replay(
-                        cast(list[JsonValue], untrimmed_effective_payload.input),
-                        stored_count=durable_abandoned_pending_full_resend_proof.stored_input_item_count,
-                        pending_tool_calls=dict(durable_lookup.latest_pending_tool_calls or {}),
-                    )
-                    if abandoned_projection is None:
-                        raise
-                    retry_payload = retry_payload.model_copy(update={"input": abandoned_projection.input_items})
-                retry_previous_response_id = None
-                retry_request_stage = "durable_recovery"
-                retry_preferred_account_id = session.account.id
-                allow_previous_response_recovery_rebind = False
-            elif proxy_injected_stale_anchor:
-                # The upstream explicitly rejected an anchor that the proxy,
-                # rather than the client, injected on this request. Without a
-                # verified complete full-resend payload it would be unsafe to
-                # drop that anchor in-place: doing so could silently lose
-                # conversation history. Quarantine the logical session key so
-                # only the next owner-bound verified complete resend takes the
-                # unanchored fresh path; merely full-resend-shaped and
-                # delta-only requests retain the anchor and fail closed.
-                _quarantine_http_bridge_session(
-                    self,
-                    session,
-                    reason=_HTTP_BRIDGE_QUARANTINE_REJECTED_STALE_ANCHOR_REASON,
-                )
-                marker_persisted = False
-                if (
-                    session.durable_session_id is not None
-                    and session.durable_owner_epoch is not None
-                    and request_state.previous_response_id is not None
-                ):
-                    try:
-                        marker_persisted = await self._durable_bridge.mark_live_session_recovery_required(
-                            session_id=session.durable_session_id,
-                            instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
-                            owner_epoch=session.durable_owner_epoch,
-                            account_id=session.account.id,
-                            rejected_response_id=request_state.previous_response_id,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Failed to persist durable HTTP bridge recovery-required marker",
-                            exc_info=True,
-                        )
-                if durable_lookup is not None and not marker_persisted:
-                    raise ProxyResponseError(
-                        502,
-                        openai_error(
-                            "bridge_continuity_persistence_failed",
-                            "The rejected response anchor could not be fenced; retry the request.",
-                        ),
-                        retryable_same_contract=False,
-                        failure_detail="recovery_required_marker_not_persisted",
-                        upstream_error_code="previous_response_not_found",
-                    ) from exc
-                _log_http_bridge_event(
-                    "previous_response_anchor_rejected_quarantined",
-                    bridge_session_key,
-                    account_id=session.account.id,
-                    model=effective_payload.model,
-                    detail="outcome=await_verified_full_resend",
-                    cache_key_family=bridge_session_key.affinity_kind,
-                    model_class=_extract_model_class(effective_payload.model) if effective_payload.model else None,
-                    owner_check_applied=True,
-                )
-                await self._reset_http_bridge_session_after_local_terminal_error(
-                    session,
-                    error_code="previous_response_anchor_invalid",
-                    error_message="The proxy-injected previous response anchor was rejected before execution",
-                    preserve_durable_lease=True,
-                )
-                pending_call_resolution_required = bool(
-                    durable_lookup is not None and durable_lookup.latest_pending_tool_calls
-                )
-                raise ProxyResponseError(
-                    400,
-                    openai_error(
-                        (
-                            "previous_response_pending_call_resolution_required"
-                            if pending_call_resolution_required
-                            else "previous_response_complete_context_required"
-                        ),
-                        (
-                            "The saved response anchor has an unresolved pending call. "
-                            "Retry once with the complete conversation context after resolving that call."
-                            if pending_call_resolution_required
-                            else (
-                                "The upstream rejected the saved response anchor. "
-                                "Retry once with the complete conversation context."
-                            )
-                        ),
-                    ),
-                    failure_phase=exc.failure_phase,
-                    retryable_same_contract=False,
-                    failure_detail="durable_recovery_required",
-                    failure_exception_type=exc.failure_exception_type,
-                    upstream_status_code=(
-                        exc.upstream_status_code if exc.upstream_status_code is not None else exc.status_code
-                    ),
-                    upstream_error_code="previous_response_not_found",
-                ) from exc
             else:
                 if PROMETHEUS_AVAILABLE and bridge_durable_recover_total is not None:
                     bridge_durable_recover_total.labels(path="local_previous_response_error").inc()
@@ -5107,69 +3313,72 @@ class _HTTPBridgeStreamingMixin:
                 retry_preferred_account_id = request_state.preferred_account_id
                 allow_previous_response_recovery_rebind = True
 
-            while True:
-                try:
-                    session = await self._get_or_create_http_bridge_session(
-                        bridge_session_key,
-                        headers=dict(session_creation_headers),
-                        affinity=affinity,
-                        api_key=api_key,
-                        request_model=retry_payload.model,
-                        request_service_tier=request_state.requested_service_tier,
-                        idle_ttl_seconds=_effective_http_bridge_idle_ttl_seconds(
+            try:
+                while True:
+                    try:
+                        session = await self._get_or_create_http_bridge_session(
+                            bridge_session_key,
+                            headers=dict(session_creation_headers),
                             affinity=affinity,
-                            idle_ttl_seconds=idle_ttl_seconds,
-                            codex_idle_ttl_seconds=codex_idle_ttl_seconds,
-                            prompt_cache_idle_ttl_seconds=prompt_cache_idle_ttl_seconds,
-                        ),
-                        max_sessions=max_sessions,
-                        previous_response_id=retry_previous_response_id,
-                        gateway_safe_mode=runtime_config.gateway_safe_mode,
-                        allow_forward_to_owner=False,
-                        forwarded_request=False,
-                        allow_previous_response_recovery_rebind=allow_previous_response_recovery_rebind,
-                        session_header_fallback_key=session_header_fallback_key,
-                        durable_lookup=durable_lookup,
-                        request_stage=retry_request_stage,
-                        preferred_account_id=retry_preferred_account_id,
-                        preferred_account_has_continuity_provenance=preferred_account_has_continuity_provenance,
-                        fallback_on_preferred_account_unavailable=not (
-                            (file_required_preferred_account or proof_gated_stale_anchor_replay)
-                            and retry_preferred_account_id is not None
-                        ),
-                        request_usage_budget=estimate_api_key_request_usage(retry_payload),
-                        request_deadline=request_deadline,
-                        exclude_account_ids=request_state.excluded_account_ids or None,
-                        deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
-                        defer_account_health_writes=request_state.api_key_reservation is not None,
-                    )
-                except ProxyResponseError as capacity_exc:
-                    wait_plan = _http_bridge_capacity_wait_plan(capacity_exc, request_deadline=request_deadline)
-                    if wait_plan is None:
-                        raise
-                    bounded_wait_seconds, account_capacity_wait_seconds, message = wait_plan
-                    logger.info(
-                        "Waiting for an account to recover before retrying HTTP bridge local recovery session "
-                        "request_id=%s model=%s sleep_seconds=%.1f recovery_hint_seconds=%.1f path=%s error=%s",
-                        request_id,
-                        retry_payload.model,
-                        bounded_wait_seconds,
-                        account_capacity_wait_seconds,
-                        recovery_path,
-                        message,
-                    )
-                    async for line in _iter_account_capacity_wait_sse(
-                        request_id=request_id,
-                        reason=message,
-                        sleep_seconds=bounded_wait_seconds,
-                        emit_keepalives=not propagate_http_errors,
-                        request_state=request_state,
-                    ):
-                        yield line
-                    if _service_time().monotonic() >= request_deadline:
-                        raise
-                    continue
-                break
+                            api_key=api_key,
+                            request_model=retry_payload.model,
+                            request_service_tier=request_state.requested_service_tier,
+                            idle_ttl_seconds=_effective_http_bridge_idle_ttl_seconds(
+                                affinity=affinity,
+                                idle_ttl_seconds=idle_ttl_seconds,
+                                codex_idle_ttl_seconds=codex_idle_ttl_seconds,
+                                prompt_cache_idle_ttl_seconds=prompt_cache_idle_ttl_seconds,
+                            ),
+                            max_sessions=max_sessions,
+                            previous_response_id=retry_previous_response_id,
+                            gateway_safe_mode=runtime_config.gateway_safe_mode,
+                            allow_forward_to_owner=False,
+                            forwarded_request=False,
+                            allow_previous_response_recovery_rebind=allow_previous_response_recovery_rebind,
+                            session_header_fallback_key=session_header_fallback_key,
+                            durable_lookup=durable_lookup,
+                            request_stage=retry_request_stage,
+                            preferred_account_id=retry_preferred_account_id,
+                            preferred_account_has_continuity_provenance=preferred_account_has_continuity_provenance,
+                            fallback_on_preferred_account_unavailable=not (
+                                file_required_preferred_account and retry_preferred_account_id is not None
+                            ),
+                            request_usage_budget=estimate_api_key_request_usage(retry_payload),
+                            request_deadline=request_deadline,
+                            exclude_account_ids=request_state.excluded_account_ids or None,
+                            deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
+                            defer_account_health_writes=request_state.api_key_reservation is not None,
+                        )
+                    except ProxyResponseError as capacity_exc:
+                        wait_plan = _http_bridge_capacity_wait_plan(capacity_exc, request_deadline=request_deadline)
+                        if wait_plan is None:
+                            raise
+                        bounded_wait_seconds, account_capacity_wait_seconds, message = wait_plan
+                        logger.info(
+                            "Waiting for an account to recover before retrying HTTP bridge local recovery session "
+                            "request_id=%s model=%s sleep_seconds=%.1f recovery_hint_seconds=%.1f path=%s error=%s",
+                            request_id,
+                            retry_payload.model,
+                            bounded_wait_seconds,
+                            account_capacity_wait_seconds,
+                            recovery_path,
+                            message,
+                        )
+                        async for line in _iter_account_capacity_wait_sse(
+                            request_id=request_id,
+                            reason=message,
+                            sleep_seconds=bounded_wait_seconds,
+                            emit_keepalives=not propagate_http_errors,
+                            request_state=request_state,
+                        ):
+                            yield line
+                        if _service_time().monotonic() >= request_deadline:
+                            raise
+                        continue
+                    break
+            except BaseException:
+                await rollback_pre_dispatch_recovery_claim()
+                raise
             _record_bridge_reattach(path=recovery_path, outcome="success")
 
             local_recovery_scope_id = ensure_request_scope_id() if original_request_unanchored else None
@@ -5199,36 +3408,56 @@ class _HTTPBridgeStreamingMixin:
                     retry_payload,
                     reservation=retry_api_key_reservation,
                 )
+                if (
+                    recovery_path == "local_previous_response_error"
+                    and request_state.operation_registered
+                    and request_state.operation_id is not None
+                    and session.durable_session_id is not None
+                    and session.durable_owner_epoch is not None
+                ):
+                    reset_operation_event_spool = getattr(self._durable_bridge, "reset_operation_event_spool", None)
+                    if callable(reset_operation_event_spool):
+                        reset_ok = await reset_operation_event_spool(
+                            operation_id=request_state.operation_id,
+                            session_id=session.durable_session_id,
+                            instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+                            owner_epoch=session.durable_owner_epoch,
+                        )
+                        if not reset_ok:
+                            raise ProxyResponseError(
+                                502,
+                                openai_error(
+                                    "bridge_continuity_persistence_failed",
+                                    "HTTP response recovery spool could not be reset; retry the request.",
+                                ),
+                            )
+                # A recovery request is the one bounded server-side replay;
+                # prevent a second cooldown bypass if this fresh socket also
+                # fails before response.created.
+                if recovery_path == "local_previous_response_error":
+                    retry_request_state.replay_count = max(1, request_state.replay_count + 1)
+                # Keep the durable operation identity attached to the
+                # server-owned recovery attempt. Re-registering the same
+                # fingerprint would be interpreted as an already-dispatched
+                # unknown operation and suppress the intended one-shot replay.
+                retry_request_state.operation_id = request_state.operation_id
+                retry_request_state.operation_fingerprint = request_state.operation_fingerprint
+                retry_request_state.operation_parent_response_id = request_state.operation_parent_response_id
+                retry_request_state.operation_registered = request_state.operation_registered
+                retry_request_state.operation_attempt_generation = request_state.operation_attempt_generation
+                retry_request_state.operation_persisted_response_id = request_state.operation_persisted_response_id
+                retry_request_state.operation_rebind_required = request_state.operation_rebind_required
+                if recovery_path == "local_previous_response_error":
+                    # The prior response.failed/error made the operation
+                    # terminal. Re-enter record_operation so its owner fence
+                    # atomically moves it back to submitted before send.
+                    retry_request_state.operation_rebind_required = True
                 retry_request_state.enforce_openai_sdk_contract = enforce_openai_sdk_contract
-                if abandoned_pending_stale_anchor_replay:
-                    # The upstream must receive only the fail-closed projection,
-                    # but continuity is still owned by the client's verified
-                    # full resend.  Persist that original prefix so the next
-                    # client full resend can trim against the recovered anchor
-                    # instead of replaying the projected history again.
-                    abandoned_pending_client_input = cast(
-                        list[JsonValue],
-                        untrimmed_effective_payload.input,
-                    )
-                    retry_request_state.input_item_count = len(abandoned_pending_client_input)
-                    retry_request_state.input_full_fingerprint = _fingerprint_input_items(
-                        abandoned_pending_client_input
-                    )
                 if durable_recovery_fresh_replay and durable_recovery_attempt_fingerprint is not None:
                     retry_request_state.recovery_attempt_fingerprint = durable_recovery_attempt_fingerprint
                     retry_request_state.recovery_attempt_session_id = request_state.recovery_attempt_session_id
                     retry_request_state.recovery_attempt_owner_epoch = request_state.recovery_attempt_owner_epoch
                     retry_request_state.recovery_attempt_claimed = True
-                    retry_request_state.marker_recovery_terminal_settlement_required = (
-                        request_state.marker_recovery_terminal_settlement_required
-                    )
-                    retry_request_state.marker_recovery_claimed = request_state.marker_recovery_claimed
-                    retry_request_state.marker_recovery_claim_request_id = (
-                        request_state.marker_recovery_claim_request_id
-                    )
-                    retry_request_state.marker_recovery_rejected_response_id = (
-                        request_state.marker_recovery_rejected_response_id
-                    )
                 _apply_http_bridge_downstream_turn_state(
                     retry_request_state,
                     downstream_turn_state=downstream_turn_state,
@@ -5237,7 +3466,6 @@ class _HTTPBridgeStreamingMixin:
                 retry_request_state.transport = _REQUEST_TRANSPORT_HTTP
                 retry_request_state.request_stage = retry_request_stage
                 retry_request_state.preferred_account_id = retry_preferred_account_id
-                retry_request_state.file_required_preferred_account = file_required_preferred_account
                 retry_request_state.excluded_account_ids.update(request_state.excluded_account_ids)
 
                 retry_events: AsyncGenerator[str, None] = self._stream_http_bridge_session_events(
@@ -5299,8 +3527,11 @@ class _HTTPBridgeStreamingMixin:
         preserve_durable_lease: bool = False,
     ) -> None:
         async with self._http_bridge_lock:
-            if self._http_bridge_sessions.get(session.key) is session:
-                self._http_bridge_sessions.pop(session.key, None)
+            # Pending settlement below may block or fail before resource close
+            # starts. Transfer canonical routing into detached lifecycle
+            # ownership first so capacity, invalidation, and shutdown continue
+            # to see the live socket and leases throughout that interval.
+            self._detach_http_bridge_session_locked(session.key, expected_session=session)
         async with session.pending_lock:
             session.queued_request_count = 0
         await self._fail_pending_websocket_requests(
@@ -5380,6 +3611,23 @@ class _HTTPBridgeStreamingMixin:
                     request_state.request_id,
                     exc.error_code,
                 )
+                if getattr(
+                    _service_get_settings(),
+                    "http_responses_session_bridge_ambiguous_continuation_recovery_mode",
+                    "fail_closed",
+                ) == "server_indefinite_recovery" and _http_bridge_server_anchored_replay_enabled(request_state):
+                    # Let the outer server-owned recovery loop classify this
+                    # eventless transport failure as retryable. Returning a
+                    # synthetic response.failed event would make the loop
+                    # believe the attempt completed successfully after one try.
+                    raise ProxyResponseError(
+                        502,
+                        openai_error(
+                            "stream_idle_timeout",
+                            str(exc),
+                            error_type="server_error",
+                        ),
+                    ) from exc
                 return (
                     False,
                     format_sse_event(
@@ -5394,9 +3642,150 @@ class _HTTPBridgeStreamingMixin:
                     ),
                 )
 
+        def operation_fenced_cooldown_wait_enabled() -> bool:
+            """Allow a hard turn to wait until its durable fence can arbitrate recovery."""
+            return (
+                getattr(
+                    _service_get_settings(),
+                    "http_responses_session_bridge_ambiguous_continuation_recovery_mode",
+                    "fail_closed",
+                )
+                in {"server_anchored_replay_once", "server_indefinite_recovery"}
+                and getattr(_service_get_settings(), "http_responses_session_bridge_operation_ledger_enabled", True)
+                and request_state.hard_continuity_anchor
+                and session.durable_session_id is not None
+                and session.durable_owner_epoch is not None
+                and request_state.previous_response_id is None
+                and request_state.response_id is None
+                and request_state.response_event_count == 0
+            )
+
         def continuity_bound_without_safe_replay() -> bool:
             """Do not hold a client stream through a cooldown we cannot use."""
-            return _http_bridge_continuity_bound_without_safe_replay(request_state)
+            return _http_bridge_continuity_bound_without_safe_replay(request_state) and not (
+                _http_bridge_server_anchored_replay_enabled(request_state) or operation_fenced_cooldown_wait_enabled()
+            )
+
+        async def wait_through_operation_fenced_startup_cooldown() -> bool:
+            if session.key.strength != "hard" or not operation_fenced_cooldown_wait_enabled():
+                return False
+            retry_cooldown_seconds = await self._http_bridge_precreated_retry_cooldown_seconds(session)
+            if retry_cooldown_seconds <= 0:
+                return False
+            remaining_budget_seconds = request_deadline - _service_time().monotonic()
+            if remaining_budget_seconds <= 0:
+                return False
+            wait_seconds = min(retry_cooldown_seconds, remaining_budget_seconds)
+            async with session.pending_lock:
+                if session.queued_request_count >= queue_limit:
+                    raise ProxyResponseError(
+                        429,
+                        openai_error(
+                            "bridge_queue_full",
+                            "HTTP responses session bridge queue is full",
+                            error_type="rate_limit_error",
+                        ),
+                    )
+                session.queued_request_count += 1
+            _log_http_bridge_event(
+                "wait_operation_fenced_cooldown",
+                session.key,
+                account_id=session.account.id,
+                model=session.request_model,
+                detail="hard_turn_operation_fence",
+                cache_key_family=session.key.affinity_kind,
+            )
+            logger.info(
+                "HTTP bridge waiting through retry-circuit cooldown before durable hard-turn arbitration "
+                "request_id=%s wait_seconds=%.1f remaining_budget_seconds=%.1f",
+                request_state.request_id,
+                wait_seconds,
+                remaining_budget_seconds,
+            )
+            # No upstream request has been dispatched on this path.  After the
+            # cooldown, normal submission still has to create or claim the
+            # durable operation fence before response.create can be sent.
+            try:
+                current_instance = _service_get_settings().http_responses_session_bridge_instance_id
+                lease_refresh_interval_seconds = max(
+                    1.0,
+                    min(
+                        _http_bridge_durable_lease_ttl_seconds() / 3.0,
+                        wait_seconds,
+                    ),
+                )
+                remaining_wait_seconds = wait_seconds
+                while remaining_wait_seconds > 0:
+                    sleep_seconds = min(remaining_wait_seconds, lease_refresh_interval_seconds)
+                    await asyncio.sleep(sleep_seconds)
+                    remaining_wait_seconds = max(0.0, remaining_wait_seconds - sleep_seconds)
+                    if remaining_wait_seconds <= 0:
+                        break
+                    try:
+                        owner_lookup = await self._durable_bridge.renew_live_session(
+                            session_id=session.durable_session_id,
+                            api_key_id=session.key.api_key_id,
+                            instance_id=current_instance,
+                            owner_epoch=session.durable_owner_epoch,
+                            lease_ttl_seconds=_http_bridge_durable_lease_ttl_seconds(),
+                            latest_turn_state=session.downstream_turn_state,
+                            latest_response_id=None,
+                        )
+                    except Exception as exc:
+                        session.closed = True
+                        session.upstream_control.reconnect_requested = True
+                        session.upstream_control.retire_after_drain = True
+                        raise ProxyResponseError(
+                            502,
+                            openai_error(
+                                "bridge_continuity_persistence_failed",
+                                "HTTP responses session ownership could not be renewed; retry the request.",
+                            ),
+                        ) from exc
+                    if (
+                        owner_lookup is None
+                        or owner_lookup.owner_instance_id != current_instance
+                        or owner_lookup.owner_epoch != session.durable_owner_epoch
+                    ):
+                        session.closed = True
+                        session.upstream_control.reconnect_requested = True
+                        session.upstream_control.retire_after_drain = True
+                        raise ProxyResponseError(
+                            502,
+                            openai_error(
+                                "bridge_continuity_persistence_failed",
+                                "HTTP responses session ownership changed during cooldown; retry the request.",
+                            ),
+                        )
+            finally:
+                async with session.pending_lock:
+                    session.queued_request_count = max(0, session.queued_request_count - 1)
+            return True
+
+        async def operation_fenced_request_budget_terminal_event() -> str | None:
+            if not operation_fenced_cooldown_wait_enabled() or _service_time().monotonic() < request_deadline:
+                return None
+            await self._release_websocket_request_state_reservation(request_state)
+            request_state.api_key_reservation = None
+            if propagate_http_errors:
+                raise ProxyResponseError(
+                    503,
+                    openai_error(
+                        "upstream_request_timeout",
+                        "HTTP responses session bridge recovery exceeded the request budget.",
+                        error_type="server_error",
+                    ),
+                )
+            return format_sse_event(
+                cast(
+                    Mapping[str, JsonValue],
+                    response_failed_event(
+                        "stream_idle_timeout",
+                        "HTTP responses session bridge recovery exceeded the request budget",
+                        response_id=_websocket_downstream_response_id(request_state),
+                    ),
+                )
+            )
 
         async def startup_continuity_cooldown_terminal_event() -> str | None:
             if (
@@ -5406,8 +3795,7 @@ class _HTTPBridgeStreamingMixin:
                 or request_state.response_event_count > 0
             ):
                 return None
-            retry_snapshot = await self._http_bridge_retry_circuit_snapshot(session)
-            retry_cooldown_seconds = retry_snapshot.retry_after_seconds
+            retry_cooldown_seconds = await self._http_bridge_precreated_retry_cooldown_seconds(session)
             if retry_cooldown_seconds <= 0:
                 return None
             if PROMETHEUS_AVAILABLE and stream_idle_timeout_total is not None:
@@ -5424,43 +3812,31 @@ class _HTTPBridgeStreamingMixin:
                 request_state.request_id,
                 retry_cooldown_seconds,
             )
-
-            async def rollback_unsent_recovery_claims() -> None:
-                await self._rollback_rowless_preflight_setup_failure_if_unbound(request_state)
-                await self._rollback_marker_recovery_claim_before_dispatch(
-                    request_state,
-                    api_key_id=session.key.api_key_id,
-                    durable_session_id=session.durable_session_id,
-                    durable_owner_epoch=session.durable_owner_epoch,
-                )
-
-            rollback_task = asyncio.create_task(rollback_unsent_recovery_claims())
-            _, rollback_cancellation = await _await_task_deferring_cancellation(rollback_task)
-            if rollback_cancellation is not None:
-                raise rollback_cancellation
             # This path returns before the request is submitted, so the normal
             # detach/finally cleanup cannot settle an API-key reservation.
             # Release it before handing the synthetic terminal event to the
             # non-streaming collector.
             await self._release_websocket_request_state_reservation(request_state)
             request_state.api_key_reservation = None
+            if propagate_http_errors and _http_bridge_client_full_history_recovery_enabled(request_state):
+                raise ProxyResponseError(
+                    400,
+                    _http_bridge_client_full_history_recovery_error(),
+                )
             if propagate_http_errors:
                 if request_state.durable_owner_dead:
                     raise _http_bridge_dead_owner_previous_response_not_found_proxy_error(
                         previous_response_id=_http_bridge_dead_owner_previous_response_id(request_state),
                     )
-                retry_after_seconds = max(1, math.ceil(retry_cooldown_seconds))
                 raise ProxyResponseError(
                     503,
                     openai_error(
                         "upstream_request_timeout",
-                        _http_bridge_retry_circuit_error_message(
-                            retry_snapshot.last_detail,
-                            retry_after_seconds=retry_after_seconds,
-                        ),
+                        "HTTP responses session bridge is cooling down after repeated upstream "
+                        "timeouts; retry shortly.",
                         error_type="server_error",
                     ),
-                    retry_after_seconds=retry_after_seconds,
+                    retry_after_seconds=max(1, math.ceil(retry_cooldown_seconds)),
                 )
             return format_sse_event(
                 cast(
@@ -5479,6 +3855,12 @@ class _HTTPBridgeStreamingMixin:
             )
 
         while True:
+            budget_terminal_event = await operation_fenced_request_budget_terminal_event()
+            if budget_terminal_event is not None:
+                yield budget_terminal_event
+                return
+            if await wait_through_operation_fenced_startup_cooldown():
+                continue
             startup_terminal_event = await startup_continuity_cooldown_terminal_event()
             if startup_terminal_event is not None:
                 yield startup_terminal_event
@@ -5502,6 +3884,7 @@ class _HTTPBridgeStreamingMixin:
                 lifecycle = request_state.deferred_account_backoff_lifecycle
                 if lifecycle is not None:
                     lifecycle.settlement_owned = True
+                _signal_propagated_responses_service_cleanup_ready()
             except ProxyResponseError as exc:
                 if request_state.bridge_soft_capacity_reroute_allowed:
                     raise
@@ -5559,12 +3942,17 @@ class _HTTPBridgeStreamingMixin:
                     raise
                 if gate_contention and session.closed:
                     raise
+                # Durable hard-turn admission may rewrite the request state
+                # with a completed predecessor before a pre-dispatch capacity
+                # failure.  Retry the exact rewritten body rather than the
+                # stale outer-loop payload, or the next attempt could lose the
+                # injected previous_response_id and its continuity anchor.
+                text_data = request_state.request_text or text_data
                 continue
             break
         event_queue = request_state.event_queue
         assert event_queue is not None
-        initial_retry_snapshot = await self._http_bridge_retry_circuit_snapshot(session)
-        initial_retry_cooldown_seconds = initial_retry_snapshot.retry_after_seconds
+        initial_retry_cooldown_seconds = await self._http_bridge_precreated_retry_cooldown_seconds(session)
         if (
             initial_retry_cooldown_seconds > 0
             and session.key.strength == "hard"
@@ -5607,23 +3995,25 @@ class _HTTPBridgeStreamingMixin:
             # gate, reservation, and pending queue entry while marking the
             # upstream handoff for retirement.
             await self._detach_http_bridge_request(session, request_state=request_state)
+            if propagate_http_errors and _http_bridge_client_full_history_recovery_enabled(request_state):
+                raise ProxyResponseError(
+                    400,
+                    _http_bridge_client_full_history_recovery_error(),
+                )
             if propagate_http_errors:
                 if request_state.durable_owner_dead:
                     raise _http_bridge_dead_owner_previous_response_not_found_proxy_error(
                         previous_response_id=_http_bridge_dead_owner_previous_response_id(request_state),
                     )
-                retry_after_seconds = max(1, math.ceil(initial_retry_cooldown_seconds))
                 raise ProxyResponseError(
                     503,
                     openai_error(
                         "upstream_request_timeout",
-                        _http_bridge_retry_circuit_error_message(
-                            initial_retry_snapshot.last_detail,
-                            retry_after_seconds=retry_after_seconds,
-                        ),
+                        "HTTP responses session bridge is cooling down after repeated upstream "
+                        "timeouts; retry shortly.",
                         error_type="server_error",
                     ),
-                    retry_after_seconds=retry_after_seconds,
+                    retry_after_seconds=max(1, math.ceil(initial_retry_cooldown_seconds)),
                 )
             yield terminal_event
             return
@@ -5780,6 +4170,9 @@ class _HTTPBridgeStreamingMixin:
                         if not completed_delivery_in_progress:
                             keepalive_count += 1
                         if not completed_delivery_in_progress and keepalive_count >= max_keepalive_count:
+                            timed_out_retry_circuit_attempt_selection = (
+                                _http_bridge_retry_circuit_attempt_selection_for_pending_requests((request_state,))
+                            )
                             if not response_started:
                                 retried = False
                                 if not circuit_keepalive_waiting:
@@ -5848,6 +4241,13 @@ class _HTTPBridgeStreamingMixin:
                                         retry_cooldown_seconds,
                                         continuity_bound,
                                     )
+                                    if propagate_http_errors and _http_bridge_client_full_history_recovery_enabled(
+                                        request_state
+                                    ):
+                                        raise ProxyResponseError(
+                                            400,
+                                            _http_bridge_client_full_history_recovery_error(),
+                                        )
                                     yield format_sse_event(
                                         cast(
                                             Mapping[str, JsonValue],
@@ -5891,6 +4291,13 @@ class _HTTPBridgeStreamingMixin:
                                             retry_cooldown_seconds,
                                             retry_cooldown_remaining_budget,
                                         )
+                                        if propagate_http_errors and _http_bridge_client_full_history_recovery_enabled(
+                                            request_state
+                                        ):
+                                            raise ProxyResponseError(
+                                                400,
+                                                _http_bridge_client_full_history_recovery_error(),
+                                            )
                                         yield format_sse_event(
                                             cast(
                                                 Mapping[str, JsonValue],
@@ -5956,9 +4363,10 @@ class _HTTPBridgeStreamingMixin:
                                             if keepalive_event is not None:
                                                 yield keepalive_event
                                             continue
-                                        await self._record_http_bridge_retry_circuit_failure(
+                                        await self._record_http_bridge_retry_circuit_failure_for_attempt_selection(
                                             session,
                                             detail="stream_idle_timeout",
+                                            selection=timed_out_retry_circuit_attempt_selection,
                                         )
                                         if PROMETHEUS_AVAILABLE and stream_idle_timeout_total is not None:
                                             stream_idle_timeout_total.labels(surface="http_bridge").inc()

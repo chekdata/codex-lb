@@ -7,6 +7,7 @@ poc/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.hypothesis/
 .mypy_cache/
 .ruff_cache/
 
@@ -57,5 +58,6 @@ certs/
 .omx/
 PROMPT.md
 SUMMARY.md
+DECISIONS.md
 .superpowers/
 .agents/worktrees/

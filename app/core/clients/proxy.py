@@ -58,11 +58,11 @@ from app.core.errors import (
 )
 from app.core.openai.exceptions import ClientPayloadError
 from app.core.openai.model_registry import get_model_registry
-from app.core.openai.models import CompactResponsePayload, OpenAIError
+from app.core.openai.models import CompactResponsePayload, OpenAIError, normalize_compaction_item_id
 from app.core.openai.parsing import (
+    classify_event_type,
     parse_compact_response_payload,
     parse_error_payload,
-    parse_sse_event,
 )
 from app.core.openai.requests import (
     ResponsesCompactRequest,
@@ -82,13 +82,14 @@ from app.core.resilience.network_recovery import (
     is_proxy_endpoint_failure,
     process_network_error_code,
 )
+from app.core.runtime_logging import safe_log_field
 from app.core.types import JsonObject, JsonValue
 from app.core.upstream_proxy import ResolvedUpstreamRoute
 from app.core.usage.live_hub import publish_live_usage
 from app.core.usage.live_snapshots import EVENT_MARKER, parse_rate_limit_event_text, parse_rate_limit_headers
 from app.core.utils.json_guards import is_json_mapping
 from app.core.utils.request_id import get_request_id
-from app.core.utils.sse import format_sse_event, parse_sse_data_json
+from app.core.utils.sse import format_sse_event, parse_sse_data_json, sse_event_type_from_block
 
 CODEX_INSTALLATION_ID_HEADER = "x-codex-installation-id"
 CODEX_TURN_METADATA_HEADER = "x-codex-turn-metadata"
@@ -125,6 +126,11 @@ _SSE_EVENT_TYPE_ALIASES = {
     "response.audio.delta": "response.output_audio.delta",
     "response.audio_transcript.delta": "response.output_audio_transcript.delta",
 }
+# Bare (unquoted) alias names gate the block-level alias normalizer: they
+# match both the JSON `"type":"<alias>"` in a data line and a stale
+# `event: <alias>` framing line. False positives (an alias name inside delta
+# text) just take the full-parse path.
+_SSE_EVENT_TYPE_ALIAS_MARKERS = tuple(_SSE_EVENT_TYPE_ALIASES)
 _SSE_LINE_BOUNDARY_RE = re.compile(r"\r\n|\r|\n")
 _RESPONSE_STREAM_TERMINAL_EVENT_TYPES = frozenset(
     {
@@ -437,11 +443,41 @@ SSEResponse: TypeAlias = aiohttp.ClientResponse | SSEResponseProtocol
 
 class _CodexSSEContent:
     def __init__(self, response: Any) -> None:
-        self._response = response
+        content = getattr(response, "content", None)
+        if isinstance(content, bytes | bytearray):
+            self._body: bytes | None = bytes(content)
+        elif isinstance(content, str):
+            # Duck-typed upstream responses may expose a decoded string body
+            # (mirrors _codex_response_body); str has no iter_chunked.
+            self._body = content.encode()
+        else:
+            self._body = None
+        self._content = content
 
     def iter_chunked(self, size: int) -> "SSEChunkIteratorProtocol":
-        del size
-        return cast(SSEChunkIteratorProtocol, self._response.content.iter_chunked(1024))
+        if self._body is not None:
+            return cast(SSEChunkIteratorProtocol, _BytesSSEChunkIterator(bytes(self._body), size))
+        if self._content is None:
+            raise TypeError("SSE response content is missing")
+        return cast(SSEChunkIteratorProtocol, self._content.iter_chunked(size))
+
+
+class _BytesSSEChunkIterator:
+    def __init__(self, body: bytes, size: int) -> None:
+        self._body = body
+        self._size = max(1, size)
+        self._offset = 0
+
+    def __aiter__(self) -> "_BytesSSEChunkIterator":
+        return self
+
+    async def __anext__(self) -> bytes:
+        if self._offset >= len(self._body):
+            raise StopAsyncIteration
+        end = min(len(self._body), self._offset + self._size)
+        chunk = self._body[self._offset : end]
+        self._offset = end
+        return chunk
 
 
 class _CodexSSEResponse:
@@ -450,6 +486,7 @@ class _CodexSSEResponse:
     def __init__(self, response: Any) -> None:
         self._response = response
         self.status = _codex_response_status(response)
+        self.headers = _codex_response_headers(response)
         self.content = _CodexSSEContent(response)
 
     async def json(self, *, content_type: str | None = None) -> JsonValue:
@@ -478,6 +515,7 @@ class ProxyResponseError(Exception):
         upstream_error_code: str | None = None,
         failed_session: aiohttp.ClientSession | None = None,
         retry_after_seconds: int | None = None,
+        reservation_released: bool = False,
     ) -> None:
         super().__init__(f"Proxy response error ({status_code})")
         self.status_code = status_code
@@ -490,6 +528,7 @@ class ProxyResponseError(Exception):
         self.upstream_error_code = upstream_error_code
         self.failed_session = failed_session
         self.retry_after_seconds = retry_after_seconds
+        self.reservation_released = reservation_released
 
 
 def is_confirmed_pre_dispatch_transport_error(exc: ProxyResponseError) -> bool:
@@ -971,26 +1010,24 @@ def _maybe_log_upstream_request_start(
 
     if privacy_policy.redacts_sensitive_details:
         account_id = "<redacted>"
-        payload_summary = "sensitive private payload redacted"
         payload_json = None
     if "upstream_summary" in trace_channels:
         logger.info(
-            "upstream_request_start request_id=%s kind=%s method=%s target=%s account_id=%s headers=%s payload=%s",
-            request_id,
-            kind,
-            method,
-            target,
-            account_id,
-            header_keys,
-            payload_summary,
+            "upstream_request_start request_id=%s kind=%s method=%s target=%s account_id=%s headers=%s payload=omitted",
+            safe_log_field(request_id),
+            safe_log_field(kind),
+            safe_log_field(method),
+            safe_log_field(target),
+            safe_log_field(account_id),
+            safe_log_field(",".join(header_keys)),
         )
     if "upstream_payload" in trace_channels and payload_json is not None:
         logger.info(
-            "upstream_request_payload request_id=%s kind=%s target=%s payload=%s",
-            request_id,
-            kind,
-            target,
-            payload_json,
+            "upstream_request_payload request_id=%s kind=%s target=%s payload_bytes=%s",
+            safe_log_field(request_id),
+            safe_log_field(kind),
+            safe_log_field(target),
+            len(payload_json.encode("utf-8")),
         )
 
 
@@ -1202,6 +1239,324 @@ async def _iter_sse_events(
         yield bytes(buffer).decode("utf-8", errors="replace")
 
 
+async def _compact_response_payload_from_sse(
+    resp: SSEResponse, idle_timeout_seconds: float, max_event_bytes: int
+) -> JsonValue:
+    last_payload: dict[str, JsonValue] | None = None
+    output_items: dict[int, dict[str, JsonValue]] = {}
+    unindexed_output_items: list[dict[str, JsonValue]] = []
+    async for event_block in _iter_sse_events(resp, idle_timeout_seconds, max_event_bytes):
+        payload = parse_sse_data_json(event_block)
+        if payload is None:
+            continue
+        last_payload = payload
+        event_type = payload.get("type")
+        if event_type in {"response.output_item.added", "response.output_item.done"}:
+            output_index = payload.get("output_index")
+            item = payload.get("item")
+            if not isinstance(item, dict):
+                continue
+            if isinstance(output_index, int):
+                output_items[output_index] = dict(item)
+            elif event_type == "response.output_item.done":
+                # Some compatible upstream responses omit output_index on the
+                # terminal item even though response.completed has no output.
+                unindexed_output_items.append(dict(item))
+        if event_type == "response.completed":
+            response = payload.get("response")
+            if isinstance(response, dict):
+                existing_output = response.get("output")
+                if (output_items or unindexed_output_items) and not (
+                    isinstance(existing_output, list) and existing_output
+                ):
+                    merged_response = dict(response)
+                    merged_response["output"] = [
+                        *[item for _, item in sorted(output_items.items())],
+                        *unindexed_output_items,
+                    ]
+                    return merged_response
+                return response
+            raise ValueError("response.completed event missing response object")
+        if event_type in {"response.failed", "response.incomplete", "error"}:
+            raise _proxy_response_error_from_compact_sse_terminal(payload, event_type)
+    if last_payload is not None:
+        raise ValueError("upstream SSE ended before response.completed")
+    raise ValueError("empty upstream SSE response")
+
+
+async def _compact_response_payload_from_success_response(
+    resp: Any,
+    *,
+    idle_timeout_seconds: float,
+    max_event_bytes: int,
+) -> JsonValue:
+    headers = _codex_response_headers(resp)
+    content_type = next((value for key, value in headers.items() if key.lower() == "content-type"), "")
+    content = getattr(resp, "content", None)
+    if "text/event-stream" in content_type.lower() or (
+        not content_type and callable(getattr(content, "iter_chunked", None))
+    ):
+        return await _compact_response_payload_from_sse(cast(SSEResponse, resp), idle_timeout_seconds, max_event_bytes)
+    return await _codex_response_json(resp)
+
+
+def _normalize_compact_response_payload_shape(payload: JsonValue) -> JsonValue:
+    if not is_json_mapping(payload):
+        return payload
+    object_value = payload.get("object")
+    if isinstance(object_value, str) and object_value.startswith("response.compact"):
+        return payload
+    compaction_item = _compact_output_item_from_payload(payload)
+    if compaction_item is None:
+        return payload
+    normalized: dict[str, JsonValue] = {
+        "object": "response.compaction",
+        "output": [compaction_item],
+    }
+    for key in ("id", "status", "usage", "service_tier"):
+        value = payload.get(key)
+        if value is not None:
+            normalized[key] = value
+    return normalized
+
+
+def _responses_compact_payload_for_responses_endpoint(payload: ResponsesCompactRequest) -> dict[str, JsonValue]:
+    payload_dict = dict(payload.to_payload())
+    input_value = payload_dict.get("input")
+    input_items = list(input_value) if isinstance(input_value, list) else [input_value]
+    if not (input_items and is_json_mapping(input_items[-1]) and input_items[-1].get("type") == "compaction_trigger"):
+        input_items.append({"type": "compaction_trigger"})
+    payload_dict["input"] = input_items
+    return payload_dict
+
+
+def _compact_output_item_from_payload(payload: Mapping[str, JsonValue]) -> dict[str, JsonValue] | None:
+    output = payload.get("output")
+    if isinstance(output, list):
+        for raw_item in output:
+            if not is_json_mapping(raw_item):
+                continue
+            item_type = raw_item.get("type")
+            if isinstance(item_type, str) and item_type in {"compaction", "compaction_summary"}:
+                normalized = _normalize_compact_output_item(raw_item)
+                if normalized is not None:
+                    return normalized
+        # Remote compaction output places the compaction summary after any
+        # historical message items, so the message-shaped fallback must pick
+        # the last usable message instead of leaking earlier history.
+        for raw_item in reversed(output):
+            if not is_json_mapping(raw_item):
+                continue
+            item_type = raw_item.get("type")
+            if item_type == "message":
+                normalized = _compact_output_item_from_message(raw_item)
+                if normalized is not None:
+                    return normalized
+    summary = payload.get("compaction_summary")
+    if is_json_mapping(summary):
+        return _normalize_compact_output_item(summary)
+    return None
+
+
+def _compact_output_item_from_message(item: Mapping[str, JsonValue]) -> dict[str, JsonValue] | None:
+    text = _compact_message_text(item)
+    if not text:
+        return None
+    normalized: dict[str, JsonValue] = {
+        "type": "compaction",
+        "encrypted_content": text,
+    }
+    item_id = normalize_compaction_item_id(item.get("id"))
+    if item_id is not None:
+        normalized["id"] = item_id
+    status = item.get("status")
+    if isinstance(status, str) and status.strip():
+        normalized["status"] = status
+    return normalized
+
+
+def _compact_message_text(item: Mapping[str, JsonValue]) -> str | None:
+    direct_text = item.get("text")
+    if isinstance(direct_text, str) and direct_text:
+        return direct_text
+    content = item.get("content")
+    content_parts: list[Mapping[str, JsonValue]]
+    if is_json_mapping(content):
+        content_parts = [content]
+    elif isinstance(content, list):
+        content_parts = [part for part in content if is_json_mapping(part)]
+    else:
+        content_parts = []
+    text_parts: list[str] = []
+    for part in content_parts:
+        text = part.get("text")
+        if isinstance(text, str) and text:
+            text_parts.append(text)
+    if text_parts:
+        return "".join(text_parts)
+    return None
+
+
+def _normalize_compact_output_item(item: Mapping[str, JsonValue]) -> dict[str, JsonValue] | None:
+    encrypted_content = item.get("encrypted_content")
+    if not isinstance(encrypted_content, str):
+        return None
+    normalized: dict[str, JsonValue] = {
+        "type": "compaction",
+        "encrypted_content": encrypted_content,
+    }
+    item_id = normalize_compaction_item_id(item.get("id"))
+    if item_id is not None:
+        normalized["id"] = item_id
+    status = item.get("status")
+    if isinstance(status, str) and status.strip():
+        normalized["status"] = status
+    return normalized
+
+
+def _proxy_response_error_from_compact_sse_terminal(
+    payload: Mapping[str, JsonValue],
+    event_type: object,
+) -> ProxyResponseError:
+    error_payload = _compact_sse_terminal_error_payload(payload, event_type)
+    error_code, error_message = _error_details_from_envelope(error_payload)
+    status_code = _compact_sse_terminal_status_code(payload, error_payload=error_payload)
+    return ProxyResponseError(
+        status_code,
+        error_payload,
+        failure_phase="upstream",
+        failure_detail=error_message,
+        upstream_status_code=status_code,
+        upstream_error_code=error_code,
+    )
+
+
+def _proxy_response_error_from_compact_sse_stream_exception(
+    exc: StreamIdleTimeoutError | StreamEventTooLargeError,
+    *,
+    upstream_status_code: int | None,
+) -> ProxyResponseError:
+    if isinstance(exc, StreamIdleTimeoutError):
+        return ProxyResponseError(
+            502,
+            openai_error("stream_idle_timeout", "Upstream stream idle timeout"),
+            failure_phase="upstream",
+            failure_detail="stream_idle_timeout",
+            failure_exception_type=type(exc).__name__,
+            upstream_status_code=upstream_status_code,
+            upstream_error_code="stream_idle_timeout",
+        )
+    return ProxyResponseError(
+        502,
+        openai_error("stream_event_too_large", str(exc)),
+        failure_phase="upstream",
+        failure_detail=str(exc),
+        failure_exception_type=type(exc).__name__,
+        upstream_status_code=upstream_status_code,
+        upstream_error_code="stream_event_too_large",
+    )
+
+
+def _compact_sse_terminal_error_payload(
+    payload: Mapping[str, JsonValue],
+    event_type: object,
+) -> OpenAIErrorEnvelope:
+    error = parse_error_payload(dict(payload))
+    if error:
+        return {"error": _openai_error_detail(error)}
+    if event_type == "error":
+        error_code = payload.get("code")
+        error_message = payload.get("message")
+        if isinstance(error_code, str) and error_code and isinstance(error_message, str) and error_message:
+            error_type = payload.get("error_type")
+            if not isinstance(error_type, str) or not error_type.strip():
+                error_type = "server_error"
+            detail: OpenAIErrorDetail = {
+                "code": error_code,
+                "message": error_message,
+                "type": error_type,
+            }
+            param = payload.get("param")
+            if isinstance(param, str) and param:
+                detail["param"] = param
+            return {"error": detail}
+    response = payload.get("response")
+    if is_json_mapping(response):
+        response_error = parse_error_payload(dict(response))
+        if response_error:
+            return {"error": _openai_error_detail(response_error)}
+    message = _extract_upstream_message(cast(Mapping[str, Any], payload))
+    if not message and is_json_mapping(response):
+        message = _extract_upstream_message(cast(Mapping[str, Any], response))
+    code = "incomplete" if event_type == "response.incomplete" else "upstream_error"
+    return openai_error(code, message or f"Upstream SSE terminal event: {event_type}")
+
+
+def _compact_sse_terminal_status_code(
+    payload: Mapping[str, JsonValue],
+    *,
+    error_payload: OpenAIErrorEnvelope | None = None,
+) -> int:
+    response = payload.get("response")
+    candidates: list[JsonValue] = []
+    if is_json_mapping(response):
+        candidates.extend(
+            [
+                response.get("status_code"),
+                response.get("statusCode"),
+                response.get("status"),
+            ]
+        )
+    candidates.extend([payload.get("status_code"), payload.get("statusCode"), payload.get("status")])
+    for value in candidates:
+        if isinstance(value, int) and not isinstance(value, bool) and 400 <= value <= 599:
+            return value
+    candidates_for_error: tuple[Mapping[str, JsonValue], ...] = tuple(
+        candidate for candidate in (error_payload, response, payload) if is_json_mapping(candidate)
+    )
+    for candidate in candidates_for_error:
+        error = parse_error_payload(dict(candidate))
+        if error is None:
+            if candidate is payload and payload.get("type") == "error":
+                root_error = {key: payload[key] for key in ("code", "message", "param", "error_type") if key in payload}
+                error = OpenAIError.model_validate(
+                    {
+                        **root_error,
+                        "type": root_error.get("error_type"),
+                    }
+                )
+            else:
+                continue
+        inferred_status = _status_code_from_openai_error(error)
+        if inferred_status is not None:
+            return inferred_status
+    return 502
+
+
+def _status_code_from_openai_error(error: OpenAIError) -> int | None:
+    error_type = error.type
+    error_code = error.code
+    if error_type == "authentication_error" or error_code in {
+        "invalid_api_key",
+        "invalid_authentication",
+        "token_invalidated",
+    }:
+        return 401
+    if error_type == "permission_error" or error_code == "insufficient_permissions":
+        return 403
+    if error_code == "not_found":
+        return 404
+    if error_type == "rate_limit_error" or error_code in {
+        "rate_limit_exceeded",
+        "usage_limit_reached",
+        "insufficient_quota",
+    }:
+        return 429
+    if error_type == "invalid_request_error":
+        return 400
+    return None
+
+
 async def _error_response_body(resp: ErrorResponse) -> tuple[object | None, str | None]:
     try:
         return await resp.json(content_type=None), None
@@ -1350,11 +1705,73 @@ def _normalize_sse_data_line(line: str) -> str:
     return line
 
 
+def _normalize_sse_event_type_line(line: str) -> str:
+    if not line.startswith("event:"):
+        return line
+    value = line[6:]
+    if value.startswith(" "):
+        value = value[1:]
+    normalized_type = _SSE_EVENT_TYPE_ALIASES.get(value)
+    if normalized_type is None:
+        return line
+    return f"event: {normalized_type}"
+
+
+def _normalize_multi_data_sse_block(
+    event_block: str,
+    lines: list[str],
+    line_separator: str,
+    terminator: str,
+) -> str:
+    # Fragments of a payload split across multiple `data:` lines are not
+    # individually decodable, so alias detection must run on the combined
+    # payload (the SSE spec joins data-line values with "\n"). Decode it
+    # before touching the `event:` framing line so both surfaces are
+    # rewritten together; if the combined payload cannot be decoded, leave
+    # the whole block — framing line included — untouched rather than
+    # emitting a partially rewritten frame.
+    payload = parse_sse_data_json(event_block)
+    if payload is None:
+        return event_block
+
+    data_replacement: str | None = None
+    event_type = payload.get("type")
+    if isinstance(event_type, str) and event_type in _SSE_EVENT_TYPE_ALIASES:
+        payload["type"] = _SSE_EVENT_TYPE_ALIASES[event_type]
+        data_replacement = f"data: {json.dumps(payload, ensure_ascii=True, separators=(',', ':'))}"
+
+    normalized_lines: list[str] = []
+    changed = False
+    data_line_emitted = False
+    for line in lines:
+        if line.startswith("data:"):
+            if data_replacement is None:
+                normalized_lines.append(line)
+            elif not data_line_emitted:
+                # The rewritten payload re-serializes compactly, so the
+                # fragments collapse into one canonical `data:` line.
+                normalized_lines.append(data_replacement)
+                data_line_emitted = True
+                changed = True
+            continue
+        normalized_line = _normalize_sse_event_type_line(line)
+        if normalized_line != line:
+            changed = True
+        normalized_lines.append(normalized_line)
+    if not changed:
+        return event_block
+
+    normalized = line_separator.join(normalized_lines)
+    if terminator:
+        return normalized + terminator
+    return normalized
+
+
 def _normalize_sse_event_block(event_block: str) -> str:
     if not event_block:
         return event_block
 
-    if '"type":' not in event_block:
+    if not any(marker in event_block for marker in _SSE_EVENT_TYPE_ALIAS_MARKERS):
         return event_block
 
     if event_block.endswith("\r\n\r\n"):
@@ -1378,10 +1795,17 @@ def _normalize_sse_event_block(event_block: str) -> str:
     if not lines:
         return event_block
 
+    if sum(1 for line in lines if line.startswith("data:")) > 1:
+        return _normalize_multi_data_sse_block(event_block, lines, line_separator, terminator)
+
     normalized_lines: list[str] = []
     changed = False
     for line in lines:
-        normalized_line = _normalize_sse_data_line(line)
+        # Rewrite both surfaces of a legacy alias: the JSON payload's `type`
+        # and the SSE `event:` framing line. Rewriting only the data line
+        # would emit mismatched framing when the block is relayed verbatim
+        # downstream instead of being re-serialized.
+        normalized_line = _normalize_sse_event_type_line(_normalize_sse_data_line(line))
         if normalized_line != line:
             changed = True
         normalized_lines.append(normalized_line)
@@ -1400,37 +1824,42 @@ def _normalize_stream_event_payload(payload: dict[str, JsonValue]) -> dict[str, 
         normalized = dict(payload)
         normalized["type"] = _SSE_EVENT_TYPE_ALIASES[event_type]
         return normalized
-    error = parse_error_payload(payload)
-    if error is not None:
-        detail = error.model_dump(exclude_none=True)
-        event = response_failed_event(
-            _normalize_error_code(detail.get("code"), detail.get("type")),
-            detail.get("message", "Upstream websocket error"),
-            error_type=detail.get("type") or "server_error",
-            response_id=get_request_id(),
-            error_param=detail.get("param"),
-        )
-        _copy_quota_error_metadata(event["response"]["error"], detail)
-        return cast(dict[str, JsonValue], event)
-    if event_type == "error":
-        message = _extract_upstream_message(payload) or "Upstream websocket error"
-        code = payload.get("code")
-        error_type = payload.get("error_type") or payload.get("type")
-        normalized_code = _normalize_error_code(
-            code if isinstance(code, str) else None,
-            error_type if isinstance(error_type, str) else None,
-        )
-        if not isinstance(code, str) and normalized_code == "error":
-            normalized_code = "upstream_error"
-        return cast(
-            dict[str, JsonValue],
-            response_failed_event(
-                normalized_code,
-                message,
-                error_type=error_type if isinstance(error_type, str) and error_type != "error" else "server_error",
+    # Error-envelope schema validation is the only pydantic work on this hot
+    # path: classify from the parsed dict first and validate only error-shaped
+    # frames (``type == "error"`` or a top-level ``error`` envelope) so delta
+    # frames never reach the pydantic adapter.
+    if classify_event_type(payload) == "error" or isinstance(payload.get("error"), dict):
+        error = parse_error_payload(payload)
+        if error is not None:
+            detail = error.model_dump(exclude_none=True)
+            event = response_failed_event(
+                _normalize_error_code(detail.get("code"), detail.get("type")),
+                detail.get("message", "Upstream websocket error"),
+                error_type=detail.get("type") or "server_error",
                 response_id=get_request_id(),
-            ),
-        )
+                error_param=detail.get("param"),
+            )
+            _copy_quota_error_metadata(event["response"]["error"], detail)
+            return cast(dict[str, JsonValue], event)
+        if event_type == "error":
+            message = _extract_upstream_message(payload) or "Upstream websocket error"
+            code = payload.get("code")
+            error_type = payload.get("error_type") or payload.get("type")
+            normalized_code = _normalize_error_code(
+                code if isinstance(code, str) else None,
+                error_type if isinstance(error_type, str) else None,
+            )
+            if not isinstance(code, str) and normalized_code == "error":
+                normalized_code = "upstream_error"
+            return cast(
+                dict[str, JsonValue],
+                response_failed_event(
+                    normalized_code,
+                    message,
+                    error_type=error_type if isinstance(error_type, str) and error_type != "error" else "server_error",
+                    response_id=get_request_id(),
+                ),
+            )
     return payload
 
 
@@ -1439,6 +1868,21 @@ def _normalize_stream_payload_for_http_block(
     *,
     enforce_openai_sdk_contract: bool = True,
 ) -> tuple[str, str | None]:
+    # Cheap path for the dominant delta traffic: a canonically framed block
+    # exposes its event type on the `event:` line, so no JSON parse is needed.
+    # Full parsing remains for `error` frames and any block carrying an
+    # `"error"` substring (the SDK-contract rewrite in
+    # `_normalize_stream_event_payload` keys off a top-level error envelope),
+    # legacy alias types (rewritten payloads), and non-canonical or data-only
+    # framing (the event type then comes from the payload itself).
+    cheap_event_type = sse_event_type_from_block(event_block)
+    if (
+        cheap_event_type is not None
+        and cheap_event_type != "error"
+        and cheap_event_type not in _SSE_EVENT_TYPE_ALIASES
+        and '"error"' not in event_block
+    ):
+        return event_block, cheap_event_type
     if not enforce_openai_sdk_contract:
         payload = parse_sse_data_json(event_block)
         if payload is None:
@@ -1806,7 +2250,12 @@ async def _stream_websocket_events(
     total_timeout_seconds: float | None,
     max_event_bytes: int,
     enforce_openai_sdk_contract: bool = True,
-) -> AsyncIterator[str]:
+) -> AsyncIterator[tuple[str, str | None]]:
+    """Yield ``(sse_block, event_type)`` pairs.
+
+    The event type is extracted from the payload parsed once here so that
+    downstream consumers never re-decode the formatted block.
+    """
     deadline = None if total_timeout_seconds is None else time.monotonic() + total_timeout_seconds
 
     while True:
@@ -1849,9 +2298,10 @@ async def _stream_websocket_events(
         if not isinstance(payload, dict):
             continue
         normalized = payload if not enforce_openai_sdk_contract else _normalize_stream_event_payload(payload)
-        event_type = normalized.get("type")
-        yield format_sse_event(normalized)
-        if isinstance(event_type, str) and _is_response_stream_terminal_event_type(
+        raw_event_type = normalized.get("type")
+        event_type = raw_event_type if isinstance(raw_event_type, str) else None
+        yield format_sse_event(normalized), event_type
+        if event_type is not None and _is_response_stream_terminal_event_type(
             event_type,
             enforce_openai_sdk_contract=enforce_openai_sdk_contract,
         ):
@@ -1865,7 +2315,8 @@ async def _stream_codex_websocket_events(
     total_timeout_seconds: float | None,
     max_event_bytes: int,
     enforce_openai_sdk_contract: bool = True,
-) -> AsyncIterator[str]:
+) -> AsyncIterator[tuple[str, str | None]]:
+    """Yield ``(sse_block, event_type)`` pairs; see ``_stream_websocket_events``."""
     deadline = None if total_timeout_seconds is None else time.monotonic() + total_timeout_seconds
 
     while True:
@@ -1915,9 +2366,10 @@ async def _stream_codex_websocket_events(
         if not isinstance(payload, dict):
             continue
         normalized = payload if not enforce_openai_sdk_contract else _normalize_stream_event_payload(payload)
-        event_type = normalized.get("type")
-        yield format_sse_event(normalized)
-        if isinstance(event_type, str) and _is_response_stream_terminal_event_type(
+        raw_event_type = normalized.get("type")
+        event_type = raw_event_type if isinstance(raw_event_type, str) else None
+        yield format_sse_event(normalized), event_type
+        if event_type is not None and _is_response_stream_terminal_event_type(
             event_type,
             enforce_openai_sdk_contract=enforce_openai_sdk_contract,
         ):
@@ -1952,7 +2404,8 @@ async def _stream_responses_via_websocket(
     route_trace: UpstreamProxyRouteTrace | None = None,
     allow_direct_egress: bool = True,
     enforce_openai_sdk_contract: bool = True,
-) -> AsyncIterator[str]:
+) -> AsyncIterator[tuple[str, str | None]]:
+    """Yield ``(sse_block, event_type)`` pairs from the upstream websocket."""
     websocket_url = _to_websocket_upstream_url(url)
     request_started_at = time.monotonic()
     request_payload = _prepare_websocket_response_create_payload(payload_dict)
@@ -2131,7 +2584,7 @@ async def _stream_responses_via_websocket(
                 enforce_openai_sdk_contract=enforce_openai_sdk_contract,
             )
         )
-        async for event in event_iter:
+        async for event, event_type in event_iter:
             archive_text(
                 direction="server_to_codex",
                 kind="responses",
@@ -2143,14 +2596,13 @@ async def _stream_responses_via_websocket(
                 headers=headers,
                 extra={"event_format": "sse"},
             )
-            parsed_event = parse_sse_event(event)
-            if parsed_event and _is_response_stream_terminal_event_type(
-                parsed_event.type,
+            if event_type is not None and _is_response_stream_terminal_event_type(
+                event_type,
                 enforce_openai_sdk_contract=enforce_openai_sdk_contract,
             ):
                 seen_terminal = True
                 await _record_lifecycle_success()
-            yield event
+            yield event, event_type
         if not seen_terminal:
             await _record_lifecycle_failure(aiohttp.ClientError("Upstream websocket closed without terminal event"))
     except Exception as exc:
@@ -2688,7 +3140,7 @@ async def stream_responses(
                 publish_live_usage(
                     parse_rate_limit_event_text(event_block),
                     account_id=codex_lb_account_id,
-                    chatgpt_account_id=None if codex_lb_account_id else account_id,
+                    chatgpt_account_id=account_id,
                 )
             yield event_block
 
@@ -2859,7 +3311,7 @@ async def _stream_responses_with_session(
                     publish_live_usage(
                         parse_rate_limit_headers(getattr(raw_resp, "headers", None)),
                         account_id=codex_lb_account_id,
-                        chatgpt_account_id=None if codex_lb_account_id else account_id,
+                        chatgpt_account_id=account_id,
                     )
                 if resp.status >= 400:
                     if raise_for_status:
@@ -2906,13 +3358,7 @@ async def _stream_responses_with_session(
                         event_block,
                         enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                     )
-                    event = parse_sse_event(event_block)
-                    if event:
-                        if event.type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES or (
-                            event.type == "error" and not enforce_openai_sdk_contract
-                        ):
-                            seen_terminal = True
-                    elif isinstance(normalized_event_type, str) and (
+                    if isinstance(normalized_event_type, str) and (
                         normalized_event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES
                         or (normalized_event_type == "error" and not enforce_openai_sdk_contract)
                     ):
@@ -2953,7 +3399,7 @@ async def _stream_responses_with_session(
                 publish_live_usage(
                     parse_rate_limit_headers(getattr(resp, "headers", None)),
                     account_id=codex_lb_account_id,
-                    chatgpt_account_id=None if codex_lb_account_id else account_id,
+                    chatgpt_account_id=account_id,
                 )
             if resp.status >= 400:
                 if raise_for_status:
@@ -3000,13 +3446,7 @@ async def _stream_responses_with_session(
                     event_block,
                     enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                 )
-                event = parse_sse_event(event_block)
-                if event:
-                    if event.type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES or (
-                        event.type == "error" and not enforce_openai_sdk_contract
-                    ):
-                        seen_terminal = True
-                elif isinstance(normalized_event_type, str) and (
+                if isinstance(normalized_event_type, str) and (
                     normalized_event_type in _RESPONSE_STREAM_TERMINAL_EVENT_TYPES
                     or (normalized_event_type == "error" and not enforce_openai_sdk_contract)
                 ):
@@ -3114,7 +3554,7 @@ async def _stream_responses_with_session(
     try:
         if transport == "websocket":
             try:
-                async for event_block in _stream_responses_via_websocket(
+                async for event_block, event_type in _stream_responses_via_websocket(
                     payload_dict=payload_dict,
                     url=url,
                     headers=upstream_headers,
@@ -3132,14 +3572,11 @@ async def _stream_responses_with_session(
                 ):
                     if status_code is None:
                         status_code = 101
-                    event = parse_sse_event(event_block)
-                    if event:
-                        event_type = event.type
-                        if _is_response_stream_terminal_event_type(
-                            event_type,
-                            enforce_openai_sdk_contract=enforce_openai_sdk_contract,
-                        ):
-                            seen_terminal = True
+                    if event_type is not None and _is_response_stream_terminal_event_type(
+                        event_type,
+                        enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+                    ):
+                        seen_terminal = True
                     yield event_block
             except aiohttp.WSServerHandshakeError as exc:
                 if not _should_fallback_to_http_after_websocket_handshake_error(transport_mode, exc):
@@ -3599,7 +4036,7 @@ class _CompactCommandTransport:
     async def execute(self) -> CompactResponsePayload:
         settings = get_settings()
         upstream_base = settings.upstream_base_url.rstrip("/")
-        url = f"{upstream_base}/codex/responses/compact"
+        url = f"{upstream_base}/codex/responses"
         require_route_or_direct_egress_opt_in(
             route=self.route,
             allow_direct_egress=self.allow_direct_egress,
@@ -3612,12 +4049,14 @@ class _CompactCommandTransport:
             self.headers,
             self.access_token,
             upstream_account_id,
-            accept="application/json",
+            accept="text/event-stream",
         )
         pre_request_started_at = time.monotonic()
         compact_timeout_seconds = _effective_compact_total_timeout(settings.upstream_compact_timeout_seconds)
         effective_connect_timeout = _effective_compact_connect_timeout(settings.upstream_connect_timeout_seconds)
-        payload_dict = dict(self.payload.to_payload())
+        payload_dict = _responses_compact_payload_for_responses_endpoint(self.payload)
+        payload_dict["store"] = False
+        payload_dict["stream"] = True
         if settings.image_inline_fetch_enabled:
             payload_dict = await _inline_input_image_urls(
                 payload_dict,
@@ -3737,7 +4176,18 @@ class _CompactCommandTransport:
                         upstream_status_code=status_code,
                     )
                 try:
-                    data = await _codex_response_json(resp)
+                    data = await _compact_response_payload_from_success_response(
+                        _CodexSSEResponse(resp),
+                        idle_timeout_seconds=compact_timeout_seconds or settings.stream_idle_timeout_seconds,
+                        max_event_bytes=settings.max_sse_event_bytes,
+                    )
+                except (StreamIdleTimeoutError, StreamEventTooLargeError) as exc:
+                    raise _proxy_response_error_from_compact_sse_stream_exception(
+                        exc,
+                        upstream_status_code=status_code,
+                    ) from exc
+                except ProxyResponseError:
+                    raise
                 except Exception as exc:
                     error_code = "upstream_error"
                     error_message = "Invalid JSON from upstream"
@@ -3752,12 +4202,14 @@ class _CompactCommandTransport:
                         failure_exception_type=failure_exception_type,
                         upstream_status_code=status_code,
                     ) from exc
+                raw_data = data
+                data = _normalize_compact_response_payload_shape(data)
                 parsed = parse_compact_response_payload(data)
                 archive_json(
                     direction="server_to_codex",
                     kind="compact",
                     transport="http",
-                    payload=data,
+                    payload=raw_data,
                     account_id=self.account_id,
                     method="POST",
                     url=url,
@@ -3815,7 +4267,11 @@ class _CompactCommandTransport:
                         upstream_status_code=resp.status,
                     )
                 try:
-                    data = await resp.json(content_type=None)
+                    data = await _compact_response_payload_from_success_response(
+                        resp,
+                        idle_timeout_seconds=compact_timeout_seconds or settings.stream_idle_timeout_seconds,
+                        max_event_bytes=settings.max_sse_event_bytes,
+                    )
                 except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
                     message = str(exc) or "Request to upstream timed out"
                     error_code = process_network_error_code(
@@ -3838,6 +4294,13 @@ class _CompactCommandTransport:
                         upstream_status_code=resp.status,
                         failed_session=_failed_shared_session_for_process_network_error(error_code, self.session),
                     ) from exc
+                except (StreamIdleTimeoutError, StreamEventTooLargeError) as exc:
+                    raise _proxy_response_error_from_compact_sse_stream_exception(
+                        exc,
+                        upstream_status_code=resp.status,
+                    ) from exc
+                except ProxyResponseError:
+                    raise
                 except Exception as exc:
                     error_code = "upstream_error"
                     error_message = "Invalid JSON from upstream"
@@ -3852,12 +4315,14 @@ class _CompactCommandTransport:
                         failure_exception_type=failure_exception_type,
                         upstream_status_code=resp.status,
                     ) from exc
+                raw_data = data
+                data = _normalize_compact_response_payload_shape(data)
                 parsed = parse_compact_response_payload(data)
                 archive_json(
                     direction="server_to_codex",
                     kind="compact",
                     transport="http",
-                    payload=data,
+                    payload=raw_data,
                     account_id=self.account_id,
                     method="POST",
                     url=url,

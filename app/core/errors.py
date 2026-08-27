@@ -13,7 +13,6 @@ class OpenAIErrorDetail(TypedDict, total=False):
     plan_type: str
     resets_at: int | float
     resets_in_seconds: int | float
-    action: str
 
 
 class OpenAIErrorEnvelope(TypedDict):
@@ -46,10 +45,6 @@ class ResponseFailedEvent(TypedDict):
 PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE = "Upstream websocket closed before response.completed"
 PREVIOUS_RESPONSE_NOT_FOUND_CODE = "previous_response_not_found"
 PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE = "Previous response was not found; retry without previous_response_id."
-_INVALID_PREVIOUS_RESPONSE_ID_MESSAGE_RE = re.compile(
-    r"^invalid\s+(?:previous_response_id|'previous_response_id'|\"previous_response_id\"|`previous_response_id`)\.?$",
-    re.IGNORECASE,
-)
 
 
 def openai_error(
@@ -81,16 +76,16 @@ def is_previous_response_not_found_message(message: str | None) -> bool:
     if message is None:
         return False
     normalized = " ".join(message.lower().split())
-    return ("previous response" in normalized and "not found" in normalized) or (
-        _is_canonical_invalid_previous_response_id_message(message)
-    )
+    return "previous response" in normalized and "not found" in normalized
 
 
-def _is_canonical_invalid_previous_response_id_message(message: str | None) -> bool:
+def _is_invalid_previous_response_id_message(message: str | None) -> bool:
     if message is None:
         return False
     normalized = " ".join(message.lower().split())
-    return _INVALID_PREVIOUS_RESPONSE_ID_MESSAGE_RE.fullmatch(normalized) is not None
+    if normalized.endswith("."):
+        normalized = normalized[:-1]
+    return normalized == "invalid `previous_response_id`"
 
 
 def previous_response_id_from_not_found_message(message: str | None) -> str | None:
@@ -116,11 +111,13 @@ def is_previous_response_not_found_error(
 ) -> bool:
     if code == PREVIOUS_RESPONSE_NOT_FOUND_CODE:
         return True
-    if code != "invalid_request_error" or param not in {None, "previous_response_id"}:
+    if code != "invalid_request_error":
         return False
-    if param == "previous_response_id":
-        return is_previous_response_not_found_message(message)
-    return _is_canonical_invalid_previous_response_id_message(message)
+    if param is None:
+        return _is_invalid_previous_response_id_message(message)
+    if param != "previous_response_id":
+        return False
+    return is_previous_response_not_found_message(message) or _is_invalid_previous_response_id_message(message)
 
 
 def response_failed_event(

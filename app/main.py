@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import mimetypes
 import os
 import stat
 import sys
@@ -45,6 +46,7 @@ from app.core.middleware import (
     add_request_body_limit_middleware,
     add_request_decompression_middleware,
     add_request_id_middleware,
+    add_required_capability_http_middleware,
     add_trusted_proxy_headers_middleware,
 )
 from app.core.middleware.dashboard_gzip import add_dashboard_gzip_middleware
@@ -52,15 +54,18 @@ from app.core.middleware.inflight import InFlightMiddleware
 from app.core.openai.model_refresh_scheduler import build_model_refresh_scheduler
 from app.core.resilience.backpressure import BackpressureMiddleware
 from app.core.resilience.bulkhead import BulkheadMiddleware, get_bulkhead
+from app.core.resilience.loop_lag_monitor import run_event_loop_lag_monitor
 from app.core.resilience.memory_monitor import configure as configure_memory_monitor
 from app.core.retention.scheduler import build_data_retention_scheduler
 from app.core.scheduling.leader_election import get_leader_election
 from app.core.shutdown import close_control_plane_task_admission
+from app.core.timeout_invariants import validate_runtime_timeout_invariants
 from app.core.usage.refresh_scheduler import build_usage_refresh_scheduler
 from app.core.usage.reset_credits_refresh_scheduler import build_rate_limit_reset_credits_scheduler
 from app.core.utils.time import utcnow
 from app.db.session import SessionLocal, close_db, close_session, init_background_db, init_db
 from app.modules.accounts import api as accounts_api
+from app.modules.accounts.deletion import build_account_deletion_scheduler
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.accounts.usage_rollup_scheduler import build_account_usage_rollup_scheduler
 from app.modules.api_keys import api as api_keys_api
@@ -78,7 +83,6 @@ from app.modules.health import api as health_api
 from app.modules.model_sources import api as model_sources_api
 from app.modules.oauth import api as oauth_api
 from app.modules.proxy import api as proxy_api
-from app.modules.proxy import rowless_recovery_api
 from app.modules.proxy.cap_partitioning import refresh_cap_partition
 from app.modules.proxy.durable_bridge_coordinator import DurableBridgeSessionCoordinator
 from app.modules.proxy.durable_bridge_repository import missing_durable_bridge_tables
@@ -102,11 +106,64 @@ from app.modules.sticky_sessions.cleanup_scheduler import (
     _abandoned_bridge_retention_seconds,
     build_sticky_session_cleanup_scheduler,
 )
+from app.modules.telemetry import api as telemetry_api
+from app.modules.telemetry.scheduler import build_telemetry_scheduler
 from app.modules.usage import api as usage_api
 from app.modules.usage.additional_quota_keys import reload_additional_quota_registry
 from app.modules.usage.live_ingest import start_live_usage_ingestor, stop_live_usage_ingestor
 
 logger = logging.getLogger(__name__)
+
+# On Windows, ``mimetypes`` merges HKCR registry mappings where third-party
+# software commonly remaps web extensions (``.js`` -> ``text/plain``), and
+# browsers enforce strict MIME checking for ES module scripts, so a poisoned
+# mapping renders the dashboard as a blank page (issue #1698). ``FileResponse``
+# resolves ``media_type`` through ``mimetypes.guess_type``, so pin every
+# extension the built dashboard serves; ``add_type`` wins over the merged
+# registry table on all platforms.
+_WEB_ASSET_MIME_TYPES: dict[str, str] = {
+    ".js": "text/javascript",
+    ".mjs": "text/javascript",
+    ".css": "text/css",
+    ".svg": "image/svg+xml",
+    ".json": "application/json",
+    ".woff2": "font/woff2",
+    ".woff": "font/woff",
+    ".html": "text/html",
+}
+
+
+def _ensure_web_asset_mime_types() -> None:
+    for extension, mime_type in _WEB_ASSET_MIME_TYPES.items():
+        mimetypes.add_type(mime_type, extension)
+
+
+_ensure_web_asset_mime_types()
+
+
+async def run_http_bridge_heartbeat_maintenance(proxy_service: Any) -> None:
+    """Per-replica bridge upkeep driven by the ring heartbeat.
+
+    Both passes are request-independent by design: durable ownership must be
+    reconciled even on a replica nothing is routing to, and the idle sweep is
+    otherwise only reached from ``_get_or_create_http_bridge_session``, so a
+    replica that stops taking bridge requests would keep its idle sessions'
+    upstream WebSockets open until restart (issue #1354). Each pass is isolated
+    so one failing cannot skip the other or stop the heartbeat.
+    """
+    if proxy_service is None:
+        return
+    for attribute, failure_message in (
+        ("reconcile_durable_http_bridge_ownership", "HTTP bridge durable ownership reconciliation failed"),
+        ("prune_idle_http_bridge_sessions", "HTTP bridge idle sweep failed"),
+    ):
+        pass_callable = getattr(proxy_service, attribute, None)
+        if pass_callable is None:
+            continue
+        try:
+            await pass_callable()
+        except Exception:
+            logger.warning(failure_message, exc_info=True)
 
 
 def _log_abandoned_lease_release(task: asyncio.Task[None]) -> None:
@@ -141,6 +198,26 @@ async def _release_leader_lease_within(timeout: float) -> None:
     exc = release_task.exception()
     if exc is not None:
         logger.warning("Failed to release scheduler leader lease during shutdown", exc_info=exc)
+
+
+async def _drain_proxy_persistence_tasks(
+    proxy_service: Any,
+    timeout_seconds: float,
+    *,
+    task_name_prefixes: tuple[str, ...] | None = None,
+    failure_message: str,
+) -> bool:
+    """Drain proxy persistence work within the caller's committed deadline."""
+    if proxy_service is None or not hasattr(proxy_service, "drain_persistence_tasks"):
+        return True
+    try:
+        kwargs: dict[str, Any] = {"timeout_seconds": timeout_seconds}
+        if task_name_prefixes is not None:
+            kwargs["task_name_prefixes"] = task_name_prefixes
+        return bool(await proxy_service.drain_persistence_tasks(**kwargs))
+    except Exception:
+        logger.warning(failure_message, exc_info=True)
+        return False
 
 
 async def _drain_detached_control_plane_tasks(timeout_seconds: float) -> None:
@@ -257,6 +334,7 @@ async def lifespan(app: FastAPI):
     reload_additional_quota_registry()
     settings = get_settings()
     warn_removed_settings()
+    validate_runtime_timeout_invariants(settings)
     # Anchor round-robin tie-break decorrelation to this replica's stable bridge
     # instance identity so peer replicas spread exact ties across equally-good
     # accounts instead of all herding onto the lexicographically-first account.
@@ -288,6 +366,15 @@ async def lifespan(app: FastAPI):
                     "instance_id": settings.http_responses_session_bridge_instance_id,
                     "deleted": deleted_bridge_rows,
                 },
+            )
+        purged_operation_rows = await DurableBridgeSessionCoordinator(SessionLocal).purge_operation_spool(
+            cutoff=utcnow()
+            - timedelta(seconds=settings.http_responses_session_bridge_operation_spool_retention_seconds),
+        )
+        if purged_operation_rows > 0:
+            logger.info(
+                "Purged expired durable HTTP bridge operation transcript rows",
+                extra={"deleted": purged_operation_rows},
             )
     from app.core.auth.api_key_cache import get_api_key_cache
     from app.core.cache.invalidation import (
@@ -405,8 +492,13 @@ async def lifespan(app: FastAPI):
     automations_scheduler = build_automations_scheduler()
     rate_limit_reset_credits_scheduler = build_rate_limit_reset_credits_scheduler()
     account_usage_rollup_scheduler = build_account_usage_rollup_scheduler()
+    account_deletion_scheduler = build_account_deletion_scheduler()
     data_retention_scheduler = build_data_retention_scheduler()
-    start_live_usage_ingestor()
+    telemetry_scheduler = build_telemetry_scheduler()
+    # Hold the instance: this lifespan owns it (and keeps it strongly rooted)
+    # even if a nested lifespan on another loop replaces the module-global
+    # singleton in the meantime; shutdown below stops exactly this instance.
+    live_usage_ingestor = start_live_usage_ingestor()
     await usage_scheduler.start()
     await api_key_limit_reset_scheduler.start()
     await api_key_last_used_flush_scheduler.start()
@@ -417,7 +509,9 @@ async def lifespan(app: FastAPI):
     await automations_scheduler.start()
     await rate_limit_reset_credits_scheduler.start()
     await account_usage_rollup_scheduler.start()
+    await account_deletion_scheduler.start()
     await data_retention_scheduler.start()
+    await telemetry_scheduler.start()
     if settings.metrics_enabled and PROMETHEUS_AVAILABLE:
         import uvicorn
 
@@ -484,12 +578,7 @@ async def lifespan(app: FastAPI):
                 await svc.heartbeat(iid, endpoint_base_url=bridge_endpoint_base_url)
             except Exception:
                 logger.warning("Ring heartbeat failed", exc_info=True)
-            proxy_service = getattr(app.state, "proxy_service", None)
-            if proxy_service is not None and hasattr(proxy_service, "reconcile_durable_http_bridge_ownership"):
-                try:
-                    await proxy_service.reconcile_durable_http_bridge_ownership()
-                except Exception:
-                    logger.warning("HTTP bridge durable ownership reconciliation failed", exc_info=True)
+            await run_http_bridge_heartbeat_maintenance(getattr(app.state, "proxy_service", None))
             await refresh_cap_partition(svc.list_active, iid)
 
     async def _register_and_heartbeat(svc: RingMembershipService, iid: str) -> None:
@@ -519,6 +608,13 @@ async def lifespan(app: FastAPI):
     ring_service = RingMembershipService(SessionLocal)
     instance_id = settings.http_responses_session_bridge_instance_id
     heartbeat_task = asyncio.create_task(_register_and_heartbeat(ring_service, instance_id))
+    loop_lag_task: asyncio.Task[None] | None = None
+    if settings.event_loop_lag_warn_threshold_seconds > 0:
+        loop_lag_task = asyncio.create_task(
+            run_event_loop_lag_monitor(
+                warn_threshold_seconds=settings.event_loop_lag_warn_threshold_seconds,
+            )
+        )
     startup_module._startup_complete = True
 
     try:
@@ -538,14 +634,13 @@ async def lifespan(app: FastAPI):
         recovery_settlements_drained = True
         # Settle detached recovery journals while their origin leases are
         # still held; bridge teardown below may release those owner fences.
-        if proxy_service is not None and hasattr(proxy_service, "drain_persistence_tasks"):
-            try:
-                recovery_settlements_drained = await proxy_service.drain_persistence_tasks(
-                    timeout_seconds=settings.shutdown_drain_timeout_seconds,
-                    task_name_prefixes=("http-bridge-recovery-settlement-",),
-                )
-            except Exception:
-                logger.warning("Failed to pre-drain proxy settlement tasks during shutdown", exc_info=True)
+        remaining_drain_seconds = shutdown_state.remaining_drain_timeout_seconds() or 0.0
+        recovery_settlements_drained = await _drain_proxy_persistence_tasks(
+            proxy_service,
+            remaining_drain_seconds,
+            task_name_prefixes=("http-bridge-recovery-settlement-",),
+            failure_message="Failed to pre-drain proxy settlement tasks during shutdown",
+        )
         if (
             recovery_settlements_drained
             and proxy_service is not None
@@ -563,18 +658,25 @@ async def lifespan(app: FastAPI):
         # Drain AFTER the bridge teardown: failing a bridge's pending
         # requests writes their request logs, which enqueues more
         # persistence tasks that this drain must cover.
-        if proxy_service is not None and hasattr(proxy_service, "drain_persistence_tasks"):
-            try:
-                remaining_drain_seconds = shutdown_state.remaining_drain_timeout_seconds() or 0.0
-                await proxy_service.drain_persistence_tasks(timeout_seconds=remaining_drain_seconds)
-            except Exception:
-                logger.warning("Failed to drain proxy persistence tasks during shutdown", exc_info=True)
+        remaining_drain_seconds = shutdown_state.remaining_drain_timeout_seconds() or 0.0
+        await _drain_proxy_persistence_tasks(
+            proxy_service,
+            remaining_drain_seconds,
+            failure_message="Failed to drain proxy persistence tasks during shutdown",
+        )
 
         # Cancel heartbeat and age the shared ring row near expiry.
         if heartbeat_task is not None:
             heartbeat_task.cancel()
             try:
                 await asyncio.wait_for(heartbeat_task, timeout=2)
+            except (asyncio.CancelledError, TimeoutError):
+                pass
+
+        if loop_lag_task is not None:
+            loop_lag_task.cancel()
+            try:
+                await asyncio.wait_for(loop_lag_task, timeout=2)
             except (asyncio.CancelledError, TimeoutError):
                 pass
 
@@ -636,10 +738,12 @@ async def lifespan(app: FastAPI):
         # touch is never parked in a pending map with no remaining flusher.
         await api_key_last_used_flush_scheduler.stop()
         await usage_scheduler.stop()
-        await stop_live_usage_ingestor()
+        await stop_live_usage_ingestor(live_usage_ingestor)
         await rate_limit_reset_credits_scheduler.stop()
         await account_usage_rollup_scheduler.stop()
+        await account_deletion_scheduler.stop()
         await data_retention_scheduler.stop()
+        await telemetry_scheduler.stop()
         # Release the scheduler leader lease only after every leader-gated
         # scheduler has stopped so no local tick re-acquires it; followers can
         # then take over immediately instead of waiting out the lease TTL.
@@ -690,6 +794,7 @@ def create_app() -> FastAPI:
     add_request_decompression_middleware(app)
     add_request_body_limit_middleware(app)
     add_multipart_content_encoding_middleware(app)
+    add_required_capability_http_middleware(app)
     add_request_id_middleware(app)
     add_api_firewall_middleware(app)
     app.add_middleware(cast(Any, MetricsMiddleware), enabled=settings.metrics_enabled)
@@ -734,11 +839,11 @@ def create_app() -> FastAPI:
     app.include_router(quota_planner_api.router)
     app.include_router(reports_api.router)
     app.include_router(conversation_archive_api.router)
-    app.include_router(rowless_recovery_api.router)
     app.include_router(runtime_api.router)
     app.include_router(oauth_api.router)
     app.include_router(dashboard_auth_api.router)
     app.include_router(settings_api.router)
+    app.include_router(telemetry_api.router)
     app.include_router(firewall_api.router)
     app.include_router(fleet_api.router)
     app.include_router(sticky_sessions_api.router)
@@ -802,9 +907,9 @@ async def _ensure_bridge_durable_schema_ready(settings) -> bool:
         return True
     missing = ", ".join(missing_tables)
     if settings.database_migrations_fail_fast:
-        raise RuntimeError(f"HTTP bridge durable schema is missing required items: {missing}")
+        raise RuntimeError(f"HTTP bridge durable schema is missing required tables: {missing}")
     logger.warning(
-        "HTTP bridge durable schema is missing required items but startup fail-fast is disabled",
+        "HTTP bridge durable schema is missing required tables but startup fail-fast is disabled",
         extra={"missing_tables": missing_tables},
     )
     return False

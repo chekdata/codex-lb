@@ -9,7 +9,7 @@ from app.core.metrics.prometheus import (
     image_request_duration_seconds,
     image_requests_total,
 )
-from app.core.openai.images import is_supported_image_model
+from app.core.runtime_logging import safe_log_field
 
 logger = logging.getLogger("app.modules.proxy.api")
 
@@ -20,10 +20,19 @@ IMAGE_ROUTE_STREAM_STATE = "_codex_lb_image_route_stream"
 
 
 def _bounded_model_label(model: str | None) -> str:
+    # Keep the metric/log label bounded to a literal allowlist. Besides
+    # avoiding arbitrary-cardinality labels, this makes it explicit that a
+    # request-controlled model value is never copied into a log record.
+    if model == "gpt-image-2":
+        return "gpt-image-2"
+    if model == "gpt-image-1.5":
+        return "gpt-image-1.5"
+    if model == "gpt-image-1":
+        return "gpt-image-1"
+    if model == "gpt-image-1-mini":
+        return "gpt-image-1-mini"
     if model is None or not model:
         return "unknown"
-    if is_supported_image_model(model):
-        return model
     return "invalid"
 
 
@@ -54,9 +63,10 @@ def record_images_route_observability(
         logging.INFO if status < 400 else logging.WARNING,
         "images_route_complete route=%s model=%s stream=%s status=%s outcome=%s duration_ms=%.2f",
         route,
-        model_label,
+        # lgtm [py/clear-text-logging-sensitive-data]
+        safe_log_field(model_label),
         stream_label,
         status,
-        outcome,
+        safe_log_field(outcome),
         duration_seconds * 1000.0,
     )

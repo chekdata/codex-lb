@@ -12,7 +12,6 @@ from fastapi.exception_handlers import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
-from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from starlette._utils import get_route_path
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -31,6 +30,8 @@ from app.core.exceptions import (
     ProxyAuthError,
     ProxyModelNotAllowed,
     ProxyRateLimitError,
+    ProxyReasoningEffortNotAllowed,
+    ProxyRequiredCapabilityTransportError,
     ProxyUpstreamError,
 )
 from app.core.middleware.multipart_content_encoding import (
@@ -44,11 +45,6 @@ from app.core.middleware.request_body_limit import (
 )
 from app.core.multipart import MultipartPayloadTooLarge
 from app.core.runtime_logging import log_error_response
-from app.db.session import (
-    DATABASE_POOL_RETRY_AFTER_SECONDS,
-    DATABASE_POOL_UNAVAILABLE_CODE,
-    DATABASE_POOL_UNAVAILABLE_MESSAGE,
-)
 from app.modules.proxy.images_observability import (
     IMAGE_ROUTE_MODEL_STATE,
     IMAGE_ROUTE_STARTED_AT_STATE,
@@ -62,7 +58,9 @@ logger = logging.getLogger(__name__)
 _OPENAI_EXCEPTION_TYPES: tuple[type[AppError], ...] = (
     ProxyAuthError,
     ProxyModelNotAllowed,
+    ProxyReasoningEffortNotAllowed,
     ProxyRateLimitError,
+    ProxyRequiredCapabilityTransportError,
     ProxyUpstreamError,
 )
 
@@ -240,10 +238,16 @@ def add_exception_handlers(app: FastAPI) -> None:
                     status=exc.status_code,
                     outcome="auth_error",
                 )
-            return JSONResponse(
-                status_code=exc.status_code,
-                content=openai_error(exc.code, exc.message, error_type=error_type),
-            )
+            elif isinstance(exc, ProxyRequiredCapabilityTransportError):
+                await _record_image_route_exception_observability(
+                    request,
+                    status=exc.status_code,
+                    outcome="invalid_request",
+                )
+            error = openai_error(exc.code, exc.message, error_type=error_type)
+            if exc.param is not None:
+                error["error"]["param"] = exc.param
+            return JSONResponse(status_code=exc.status_code, content=error)
 
     # --- Domain exceptions: Dashboard envelope ---
 
@@ -267,47 +271,6 @@ def add_exception_handlers(app: FastAPI) -> None:
                 content=dashboard_error(exc.code, exc.message),
                 headers=headers,
             )
-
-    @app.exception_handler(SQLAlchemyTimeoutError)
-    async def database_pool_timeout_handler(
-        request: Request,
-        exc: SQLAlchemyTimeoutError,
-    ) -> JSONResponse:
-        del exc
-        fmt = _error_format(request)
-        log_error_response(
-            logger,
-            request,
-            503,
-            DATABASE_POOL_UNAVAILABLE_CODE,
-            DATABASE_POOL_UNAVAILABLE_MESSAGE,
-            category="database_pool_unavailable_response",
-        )
-        headers = {"Retry-After": str(DATABASE_POOL_RETRY_AFTER_SECONDS)}
-        if fmt == "dashboard":
-            return JSONResponse(
-                status_code=503,
-                content=dashboard_error(
-                    DATABASE_POOL_UNAVAILABLE_CODE,
-                    DATABASE_POOL_UNAVAILABLE_MESSAGE,
-                ),
-                headers=headers,
-            )
-        if fmt == "openai":
-            return JSONResponse(
-                status_code=503,
-                content=openai_error(
-                    DATABASE_POOL_UNAVAILABLE_CODE,
-                    DATABASE_POOL_UNAVAILABLE_MESSAGE,
-                    error_type="server_error",
-                ),
-                headers=headers,
-            )
-        return JSONResponse(
-            status_code=503,
-            content={"detail": DATABASE_POOL_UNAVAILABLE_MESSAGE},
-            headers=headers,
-        )
 
     # --- Framework exceptions: format based on router marker ---
 

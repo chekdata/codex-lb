@@ -376,6 +376,10 @@ def _classify_upstream_close(*args: Any, **kwargs: Any) -> Any:
     return _service_global("_classify_upstream_close")(*args, **kwargs)
 
 
+def _is_account_neutral_transport_drop(*args: Any, **kwargs: Any) -> Any:
+    return _service_global("_is_account_neutral_transport_drop")(*args, **kwargs)
+
+
 def _websocket_auth_failure_permanent_code(*args: Any, **kwargs: Any) -> Any:
     return _service_global("_websocket_auth_failure_permanent_code")(*args, **kwargs)
 
@@ -446,6 +450,10 @@ def _pop_matching_websocket_request_states(*args: Any, **kwargs: Any) -> Any:
 
 def _prepare_websocket_request_state_for_account_switch(*args: Any, **kwargs: Any) -> Any:
     return _service_global("_prepare_websocket_request_state_for_account_switch")(*args, **kwargs)
+
+
+def _websocket_request_text_is_account_neutral_fresh_replay(*args: Any, **kwargs: Any) -> Any:
+    return _service_global("_websocket_request_text_is_account_neutral_fresh_replay")(*args, **kwargs)
 
 
 def _matching_websocket_request_states_for_previous_response_error(*args: Any, **kwargs: Any) -> Any:
