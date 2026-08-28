@@ -42,7 +42,7 @@
 
 ## 5. Delivery
 
-- [ ] 5.1 Commit with sidechat and upstream-recovery traceability, push, and
+- [x] 5.1 Commit with sidechat and upstream-recovery traceability, push, and
       open a focused PR.
 - [ ] 5.2 Satisfy current-head CI, review, and mergeability gates; merge to
       `origin/main`.
