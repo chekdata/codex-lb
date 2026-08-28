@@ -811,3 +811,126 @@ def test_public_missing_tool_output_input_error_preserves_client_status():
     assert error["code"] == "invalid_request_error"
     assert error["param"] == "input"
     assert "call_W3U0TC60cgB5OD7gVCyS0qIq" in masked.model_dump_json()
+
+
+def _v1_goal_restart_request(headers: dict[str, str]) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(name.encode(), value.encode()) for name, value in headers.items()],
+            "client": ("127.0.0.1", 50001),
+        }
+    )
+
+
+def _v1_goal_restart_payload(**updates: object) -> ResponsesRequest:
+    payload: dict[str, object] = {
+        "model": "gpt-5.6-sol",
+        "instructions": "Continue the existing task.",
+        "input": [
+            {
+                "role": "developer",
+                "content": '<codex_internal_context source="goal">\nContinue working toward the active thread goal.',
+            },
+            {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+        ],
+        "stream": True,
+    }
+    payload.update(updates)
+    return ResponsesRequest.model_validate(payload)
+
+
+def test_verified_v1_goal_restart_headers_rotate_only_the_echoed_http_turn_state():
+    old_turn_state = f"http_turn_{'a' * 32}"
+    request = _v1_goal_restart_request(
+        {
+            "user-agent": "codex_cli_rs/0.145.0",
+            "originator": "codex_cli_rs",
+            "thread-id": "verified-goal-thread",
+            "x-codex-session-id": "verified-goal-process",
+            "x-codex-turn-state": old_turn_state,
+            "x-request-trace": "keep-me",
+        }
+    )
+
+    forwarded_headers = proxy_api_module._verified_v1_goal_restart_headers(
+        request,
+        _v1_goal_restart_payload(),
+    )
+
+    assert forwarded_headers is not None
+    assert forwarded_headers["x-request-trace"] == "keep-me"
+    assert forwarded_headers["thread-id"] == "verified-goal-thread"
+    new_turn_state = forwarded_headers["x-codex-turn-state"]
+    assert new_turn_state != old_turn_state
+    assert new_turn_state.startswith("http_turn_")
+    assert len(new_turn_state) == len("http_turn_") + 32
+
+
+@pytest.mark.parametrize(
+    "rejected_case",
+    [
+        "missing-goal-marker",
+        "generic-client",
+        "openai-sdk-marker",
+        "missing-thread-id",
+        "foreign-turn-state",
+        "non-http-synthesized-turn-state",
+        "client-previous-response",
+        "conversation",
+        "file-input",
+        "account-scoped-metadata",
+        "non-streaming",
+    ],
+)
+def test_verified_v1_goal_restart_headers_reject_unproved_or_account_scoped_requests(rejected_case: str):
+    headers = {
+        "user-agent": "codex_cli_rs/0.145.0",
+        "originator": "codex_cli_rs",
+        "thread-id": "verified-goal-thread",
+        "x-codex-session-id": "verified-goal-process",
+        "x-codex-turn-state": f"http_turn_{'b' * 32}",
+    }
+    payload_updates: dict[str, object] = {}
+
+    if rejected_case == "missing-goal-marker":
+        payload_updates["input"] = "continue"
+    elif rejected_case == "generic-client":
+        headers["user-agent"] = "httpx/0.28"
+        headers.pop("originator")
+    elif rejected_case == "openai-sdk-marker":
+        headers["x-stainless-lang"] = "python"
+    elif rejected_case == "missing-thread-id":
+        headers.pop("thread-id")
+    elif rejected_case == "foreign-turn-state":
+        headers["x-codex-turn-state"] = "client-owned-turn-state"
+    elif rejected_case == "non-http-synthesized-turn-state":
+        headers["x-codex-turn-state"] = f"turn_{'c' * 32}"
+    elif rejected_case == "client-previous-response":
+        payload_updates["previous_response_id"] = "resp_client_previous"
+    elif rejected_case == "conversation":
+        payload_updates["conversation"] = "conv_account_scoped"
+    elif rejected_case == "file-input":
+        payload_updates["input"] = [
+            {
+                "role": "developer",
+                "content": '<codex_internal_context source="goal">\nContinue working toward the active thread goal.',
+            },
+            {"type": "input_file", "file_id": "file_account_scoped"},
+        ]
+    elif rejected_case == "account-scoped-metadata":
+        payload_updates["client_metadata"] = {"future_account_handle": "acct-a"}
+    elif rejected_case == "non-streaming":
+        payload_updates["stream"] = False
+    else:  # pragma: no cover - the parameter list is exhaustive
+        raise AssertionError(rejected_case)
+
+    assert (
+        proxy_api_module._verified_v1_goal_restart_headers(
+            _v1_goal_restart_request(headers),
+            _v1_goal_restart_payload(**payload_updates),
+        )
+        is None
+    )
