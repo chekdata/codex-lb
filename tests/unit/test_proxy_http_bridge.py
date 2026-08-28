@@ -17345,9 +17345,11 @@ async def test_get_or_create_http_bridge_session_preserves_explicit_forwarded_af
     assert captured["key"] == key
 
 
+@pytest.mark.parametrize("force_new_turn_state_session", [False, True])
 @pytest.mark.asyncio
 async def test_get_or_create_http_bridge_session_falls_back_to_session_header_when_turn_state_alias_is_missing(
     monkeypatch: pytest.MonkeyPatch,
+    force_new_turn_state_session: bool,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     requested_key = proxy_service._HTTPBridgeSessionKey("turn_state_header", "http_turn_generated", None)
@@ -17424,12 +17426,13 @@ async def test_get_or_create_http_bridge_session_falls_back_to_session_header_wh
         request_model="gpt-5.4",
         idle_ttl_seconds=120.0,
         max_sessions=8,
-        previous_response_id="resp_prev_1",
+        previous_response_id=None if force_new_turn_state_session else "resp_prev_1",
         session_header_fallback_key=fallback_key,
+        force_new_turn_state_session=force_new_turn_state_session,
     )
 
     assert resolved is created_session
-    assert captured["key"] == fallback_key
+    assert captured["key"] == (requested_key if force_new_turn_state_session else fallback_key)
 
 
 @pytest.mark.asyncio

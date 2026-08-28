@@ -893,6 +893,7 @@ class _HTTPBridgeStreamingMixin:
         enforce_openai_sdk_contract: bool = True,
         capacity_startup_wait_event: asyncio.Event | None = None,
         capacity_startup_ready_event: asyncio.Event | None = None,
+        verified_v1_goal_restart: bool = False,
     ) -> AsyncIterator[str]:
         _maybe_log_proxy_request_payload("stream_http", payload, headers)
         proxy_api_authorization = _header_value_case_insensitive(headers, "authorization")
@@ -918,6 +919,7 @@ class _HTTPBridgeStreamingMixin:
             enforce_openai_sdk_contract=enforce_openai_sdk_contract,
             capacity_startup_wait_event=capacity_startup_wait_event,
             capacity_startup_ready_event=capacity_startup_ready_event,
+            verified_v1_goal_restart=verified_v1_goal_restart,
         )
 
     async def _stream_http_bridge_or_retry(
@@ -943,6 +945,7 @@ class _HTTPBridgeStreamingMixin:
         enforce_openai_sdk_contract: bool = True,
         capacity_startup_wait_event: asyncio.Event | None = None,
         capacity_startup_ready_event: asyncio.Event | None = None,
+        verified_v1_goal_restart: bool = False,
     ) -> AsyncIterator[str]:
         dashboard_settings = await _service_get_settings_cache().get()
         runtime_config = _http_bridge_runtime_config(dashboard_settings, _service_get_settings())
@@ -1028,6 +1031,7 @@ class _HTTPBridgeStreamingMixin:
                 enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                 capacity_startup_wait_event=capacity_startup_wait_event,
                 capacity_startup_ready_event=capacity_startup_ready_event,
+                verified_v1_goal_restart=verified_v1_goal_restart,
                 deferred_account_backoff_tracker=deferred_account_backoff_tracker,
             ):
                 yield line
@@ -1091,6 +1095,7 @@ class _HTTPBridgeStreamingMixin:
         enforce_openai_sdk_contract: bool = True,
         capacity_startup_wait_event: asyncio.Event | None = None,
         capacity_startup_ready_event: asyncio.Event | None = None,
+        verified_v1_goal_restart: bool = False,
         deferred_account_backoff_tracker: _DeferredAccountBackoffTracker | None = None,
     ) -> AsyncIterator[str]:
         del suppress_text_done_events
@@ -2063,6 +2068,7 @@ class _HTTPBridgeStreamingMixin:
                     exclude_account_ids=fresh_replay_excluded_account_ids or None,
                     deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
                     defer_account_health_writes=request_state.api_key_reservation is not None,
+                    force_new_turn_state_session=verified_v1_goal_restart,
                 )
             except ProxyResponseError as exc:
                 if not owner_unavailable_allows_account_neutral_replay(exc):
@@ -2337,6 +2343,7 @@ class _HTTPBridgeStreamingMixin:
                             exclude_account_ids=request_state.excluded_account_ids or None,
                             deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
                             defer_account_health_writes=request_state.api_key_reservation is not None,
+                            force_new_turn_state_session=verified_v1_goal_restart,
                         )
                     except ProxyResponseError as capacity_exc:
                         if owner_unavailable_allows_account_neutral_replay(capacity_exc):
@@ -2994,6 +3001,7 @@ class _HTTPBridgeStreamingMixin:
                             exclude_account_ids=request_state.excluded_account_ids or None,
                             deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
                             defer_account_health_writes=request_state.api_key_reservation is not None,
+                            force_new_turn_state_session=verified_v1_goal_restart,
                         )
                     except ProxyResponseError as capacity_exc:
                         wait_plan = _http_bridge_capacity_wait_plan(capacity_exc, request_deadline=request_deadline)
@@ -3100,6 +3108,7 @@ class _HTTPBridgeStreamingMixin:
                             exclude_account_ids=request_state.excluded_account_ids or None,
                             deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
                             defer_account_health_writes=request_state.api_key_reservation is not None,
+                            force_new_turn_state_session=verified_v1_goal_restart,
                         )
                     except ProxyResponseError as capacity_exc:
                         wait_plan = _http_bridge_capacity_wait_plan(capacity_exc, request_deadline=request_deadline)
@@ -3402,6 +3411,7 @@ class _HTTPBridgeStreamingMixin:
                             exclude_account_ids=request_state.excluded_account_ids or None,
                             deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
                             defer_account_health_writes=request_state.api_key_reservation is not None,
+                            force_new_turn_state_session=verified_v1_goal_restart,
                         )
                     except ProxyResponseError as capacity_exc:
                         wait_plan = _http_bridge_capacity_wait_plan(capacity_exc, request_deadline=request_deadline)
@@ -4524,7 +4534,10 @@ class _HTTPBridgeStreamingMixin:
                     and request_state.error_http_status_override is not None
                     and request_state.error_http_status_override >= 400
                 ):
-                    if request_state.previous_response_not_found_rewritten:
+                    if request_state.previous_response_not_found_rewritten and not (
+                        request_state.proxy_injected_previous_response_id
+                        and _http_bridge_continuity_bound_without_safe_replay(request_state)
+                    ):
                         raise ProxyResponseError(
                             request_state.error_http_status_override,
                             openai_error(
@@ -4532,10 +4545,11 @@ class _HTTPBridgeStreamingMixin:
                                 "Upstream websocket closed before response.completed",
                             ),
                         )
-                    raise ProxyResponseError(
-                        request_state.error_http_status_override,
-                        _openai_error_envelope_from_response_failed_payload(block_payload),
-                    )
+                    if not request_state.previous_response_not_found_rewritten:
+                        raise ProxyResponseError(
+                            request_state.error_http_status_override,
+                            _openai_error_envelope_from_response_failed_payload(block_payload),
+                        )
                 yield event_block
                 yielded_any = True
         finally:

@@ -364,6 +364,7 @@ class _HTTPBridgeMixin(
         exclude_account_ids: Collection[str] | None = None,
         deferred_account_backoff_lifecycle: _DeferredAccountBackoffLifecycle | None = None,
         defer_account_health_writes: bool = False,
+        force_new_turn_state_session: bool = False,
     ) -> "_HTTPBridgeSession": ...
     @overload
     async def _get_or_create_http_bridge_session(
@@ -397,6 +398,7 @@ class _HTTPBridgeMixin(
         exclude_account_ids: Collection[str] | None = None,
         deferred_account_backoff_lifecycle: _DeferredAccountBackoffLifecycle | None = None,
         defer_account_health_writes: bool = False,
+        force_new_turn_state_session: bool = False,
     ) -> "_HTTPBridgeSession | _HTTPBridgeOwnerForward": ...
     async def _get_or_create_http_bridge_session(
         self,
@@ -429,6 +431,7 @@ class _HTTPBridgeMixin(
         exclude_account_ids: Collection[str] | None = None,
         deferred_account_backoff_lifecycle: _DeferredAccountBackoffLifecycle | None = None,
         defer_account_health_writes: bool = False,
+        force_new_turn_state_session: bool = False,
     ) -> "_HTTPBridgeSession | _HTTPBridgeOwnerForward":
         settings = _service_get_settings()
         request_scope_id = ensure_request_scope_id()
@@ -678,14 +681,16 @@ class _HTTPBridgeMixin(
                                 key=key.affinity_key,
                             ):
                                 key = _HTTPBridgeSessionKey("turn_state_header", incoming_turn_state, api_key_id)
-                        elif (
-                            fallback_key := _alias_fallback_key(incoming_session_key, initial_session_key, api_key_id)
-                        ) is not None:
-                            key = fallback_key
-                            used_session_header_fallback = True
                         else:
-                            key = _HTTPBridgeSessionKey("turn_state_header", incoming_turn_state, api_key_id)
-                            missing_turn_state_alias = True
+                            fallback_key = (
+                                _alias_fallback_key(incoming_session_key, initial_session_key, api_key_id)
+                                if not force_new_turn_state_session
+                                else None
+                            )
+                            key = fallback_key or _HTTPBridgeSessionKey(
+                                "turn_state_header", incoming_turn_state, api_key_id
+                            )
+                            missing_turn_state_alias = not (used_session_header_fallback := fallback_key is not None)
                 pruned_sessions = self._prune_http_bridge_sessions_locked()
                 if pruned_sessions:
                     if any(session.key == key for session in pruned_sessions):
@@ -1269,6 +1274,7 @@ class _HTTPBridgeMixin(
                             incoming_turn_state is not None
                             and incoming_turn_state.startswith("http_turn_")
                             and not allow_forward_to_owner
+                            and not force_new_turn_state_session
                         ):
                             _record_continuity_fail_closed(
                                 surface="http_bridge",
@@ -1560,8 +1566,7 @@ class _HTTPBridgeMixin(
                     # restart_takeover means recovering a row whose previous
                     # owner is genuinely gone. Every claim now advances the
                     # epoch, so epoch > 1 alone would also count ordinary
-                    # local successor claims (no pre-claim lookup, or a
-                    # forced replace of a live local session).
+                    # local successor claims (no pre-claim lookup, or a forced replace of a live local session).
                     claim_kwargs["record_restart_takeover"] = True
                 await self._claim_durable_http_bridge_session(created_session, **claim_kwargs)
                 async with self._http_bridge_lock:

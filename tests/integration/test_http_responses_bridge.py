@@ -729,6 +729,34 @@ class _PreviousResponseNotFoundUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
         )
 
 
+class _CompleteThenPreviousResponseNotFoundUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    async def send_text(self, text: str) -> None:
+        if not self.sent_text:
+            await super().send_text(text)
+            return
+        self.sent_text.append(text)
+        payload = json.loads(text)
+        previous_response_id = payload.get("previous_response_id")
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "error",
+                        "status": 400,
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "previous_response_not_found",
+                            "message": f"Previous response with id '{previous_response_id}' not found.",
+                            "param": "previous_response_id",
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+
+
 class _PreviousResponseNotFoundAfterOutputUpstreamWebSocket(_PreviousResponseNotFoundUpstreamWebSocket):
     async def send_text(self, text: str) -> None:
         await self._messages.put(
@@ -13801,7 +13829,155 @@ async def test_v1_responses_http_bridge_precreated_disconnect_returns_upstream_u
 
 
 @pytest.mark.asyncio
-async def test_v1_responses_http_bridge_rebinds_after_upstream_previous_response_not_found(
+async def test_v1_responses_verified_goal_restart_rotates_turn_state_and_preserves_stale_bridge(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_v1_goal_restart",
+        "http-bridge-v1-goal-restart@example.com",
+    )
+    account = await _get_account(account_id)
+    stale_upstream = _CompleteThenPreviousResponseNotFoundUpstreamWebSocket("resp_v1_goal_stale")
+    replacement_upstream = _FakeBridgeUpstreamWebSocket("resp_v1_goal_replacement")
+    connected_upstreams: list[_FakeBridgeUpstreamWebSocket] = []
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del headers, access_token, account_id_header, base_url, session
+        upstream = stale_upstream if not connected_upstreams else replacement_upstream
+        connected_upstreams.append(upstream)
+        return upstream
+
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_select_account_with_budget",
+        AsyncMock(return_value=AccountSelection(account=account, error_message=None, error_code=None)),
+    )
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_ensure_fresh_with_budget",
+        AsyncMock(return_value=account),
+    )
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    stale_turn_state = f"http_turn_{'a' * 32}"
+    request_headers = {
+        "user-agent": "codex_cli_rs/0.145.0",
+        "originator": "codex_cli_rs",
+        "x-codex-session-id": "v1-goal-restart-process",
+        "thread-id": "v1-goal-restart-thread",
+        "x-codex-turn-state": stale_turn_state,
+    }
+    first_events, first_headers = await _collect_sse_events_with_headers(
+        async_client,
+        "/v1/responses",
+        headers=request_headers,
+        json_body={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": "prime the durable continuation",
+            "stream": True,
+        },
+    )
+    _assert_created_text_delta_completed(first_events)
+    assert first_headers["x-codex-turn-state"] == stale_turn_state
+
+    service = get_proxy_service_for_app(app_instance)
+    async with service._http_bridge_lock:
+        stale_session = next(
+            session
+            for session in service._http_bridge_sessions.values()
+            if stale_turn_state in session.downstream_turn_state_aliases
+        )
+    stale_response_id = stale_session.last_completed_response_id
+    assert stale_response_id == first_events[-1]["response"]["id"]
+    stale_lookup_before = await service._durable_bridge.lookup_request_targets(
+        session_key_kind=stale_session.key.affinity_kind,
+        session_key_value=stale_session.key.affinity_key,
+        api_key_id=None,
+        turn_state=stale_turn_state,
+        session_header=request_headers["x-codex-session-id"],
+        previous_response_id=stale_response_id,
+    )
+    assert stale_lookup_before is not None
+
+    goal_events, goal_headers = await _collect_sse_events_with_headers(
+        async_client,
+        "/v1/responses",
+        headers=request_headers,
+        json_body={
+            "model": "gpt-5.1",
+            "instructions": ('<codex_internal_context source="goal">\nContinue working toward the active thread goal.'),
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+            ],
+            "stream": True,
+        },
+    )
+
+    _assert_created_text_delta_completed(goal_events)
+    replacement_turn_state = goal_headers["x-codex-turn-state"]
+    assert replacement_turn_state != stale_turn_state
+    assert replacement_turn_state.startswith("http_turn_")
+    assert len(replacement_turn_state) == len("http_turn_") + 32
+    assert len(connected_upstreams) == 2
+    assert len(stale_upstream.sent_text) == 1
+    assert len(replacement_upstream.sent_text) == 1
+    replacement_payload = json.loads(replacement_upstream.sent_text[0])
+    assert "previous_response_id" not in replacement_payload
+    assert stale_session.last_completed_response_id == stale_response_id
+    assert stale_session.closed is False
+
+    stale_lookup_after = await service._durable_bridge.lookup_request_targets(
+        session_key_kind=stale_session.key.affinity_kind,
+        session_key_value=stale_session.key.affinity_key,
+        api_key_id=None,
+        turn_state=stale_turn_state,
+        session_header=request_headers["x-codex-session-id"],
+        previous_response_id=stale_response_id,
+    )
+    assert stale_lookup_after is not None
+    assert stale_lookup_after.session_id == stale_lookup_before.session_id
+    assert stale_lookup_after.owner_epoch == stale_lookup_before.owner_epoch
+    assert stale_lookup_after.latest_response_id == stale_lookup_before.latest_response_id
+
+    follow_up_headers = {**request_headers, "x-codex-turn-state": replacement_turn_state}
+    goal_input = [
+        {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+    ]
+    follow_up_events, follow_up_response_headers = await _collect_sse_events_with_headers(
+        async_client,
+        "/v1/responses",
+        headers=follow_up_headers,
+        json_body={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": [
+                *goal_input,
+                {"role": "user", "content": [{"type": "input_text", "text": "continue on the replacement bridge"}]},
+            ],
+            "stream": True,
+        },
+    )
+    _assert_created_text_delta_completed(follow_up_events)
+    assert follow_up_response_headers["x-codex-turn-state"] == replacement_turn_state
+    assert len(connected_upstreams) == 2
+    assert len(replacement_upstream.sent_text) == 2
+    assert json.loads(replacement_upstream.sent_text[1])["previous_response_id"] == (goal_events[-1]["response"]["id"])
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_terminates_after_upstream_previous_response_not_found(
     async_client,
     app_instance,
     monkeypatch,
@@ -13914,6 +14090,105 @@ async def test_v1_responses_http_bridge_rebinds_after_upstream_previous_response
     assert second.status_code == 200
     assert second.json()["output"][0]["content"][0]["text"] == "OK"
     assert connect_count == 2
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_stream_terminates_proxy_injected_stale_anchor_once(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_previous_response_stream_terminal",
+        "http-bridge-previous-response-stream-terminal@example.com",
+    )
+    account = await _get_account(account_id)
+    stale_upstream = _CompleteThenPreviousResponseNotFoundUpstreamWebSocket("resp_stream_terminal_stale")
+    recovered_upstream = _FakeBridgeUpstreamWebSocket("resp_stream_terminal_recovered")
+    connect_count = 0
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del headers, access_token, account_id_header, base_url, session
+        nonlocal connect_count
+        connect_count += 1
+        return stale_upstream if connect_count == 1 else recovered_upstream
+
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_select_account_with_budget",
+        AsyncMock(return_value=AccountSelection(account=account, error_message=None, error_code=None)),
+    )
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_ensure_fresh_with_budget",
+        AsyncMock(return_value=account),
+    )
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    turn_state = f"http_turn_{'b' * 32}"
+    headers = {"x-codex-turn-state": turn_state}
+    historical_input = [
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "prime the stale anchor"}],
+        }
+    ]
+    first_events = await _collect_sse_events(
+        async_client,
+        "/v1/responses",
+        headers=headers,
+        json_body={
+            "model": "gpt-5.1",
+            "instructions": "Return exactly OK.",
+            "input": historical_input,
+            "stream": True,
+        },
+    )
+    _assert_created_text_delta_completed(first_events)
+    first_response_id = first_events[-1]["response"]["id"]
+
+    service = get_proxy_service_for_app(app_instance)
+    async with service._http_bridge_lock:
+        bridge_session = next(
+            session
+            for session in service._http_bridge_sessions.values()
+            if turn_state in session.downstream_turn_state_aliases
+        )
+    assert bridge_session.last_completed_response_id == first_response_id
+
+    second = await async_client.post(
+        "/v1/responses",
+        headers=headers,
+        json={
+            "model": "gpt-5.1",
+            "instructions": "Continue the existing task.",
+            "input": [
+                *historical_input,
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "delta only"}],
+                },
+            ],
+            "stream": True,
+        },
+    )
+
+    assert second.status_code == 502
+    assert second.json()["error"]["code"] == "stream_incomplete"
+    assert connect_count == 1
+    assert len(stale_upstream.sent_text) == 2
+    assert json.loads(stale_upstream.sent_text[1])["previous_response_id"] == first_response_id
+    assert len(recovered_upstream.sent_text) == 0
+    assert bridge_session.last_completed_response_id == first_response_id
 
 
 @pytest.mark.parametrize(
