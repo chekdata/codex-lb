@@ -5,7 +5,7 @@ import json
 import logging
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from ipaddress import ip_address
@@ -861,6 +861,23 @@ def _http_bridge_retry_circuit_attempt_selection_for_pending_requests(
                 attempts=tuple(unique_attempts),
             )
     return _HTTPBridgeRetryCircuitAttemptSelection(kind="ineligible" if attempt_seen else "absent")
+
+
+def _http_bridge_continuity_bound_without_safe_replay(request_state: _WebSocketRequestState) -> bool:
+    """Return whether retrying would require replaying an unsafe continuation."""
+    if request_state.previous_response_id is not None:
+        return not (request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text)
+    return request_state.hard_continuity_anchor and not (
+        request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text
+    )
+
+
+def _http_bridge_abandonment_strands_requests(request_states: Iterable[Any]) -> bool:
+    """Return whether every request covered by an abandonment is stranded."""
+    states = [state for state in request_states if state is not None]
+    if not states:
+        return False
+    return all(_http_bridge_continuity_bound_without_safe_replay(state) for state in states)
 
 
 def _http_bridge_session_has_admission_waiter(session: object | None) -> bool:

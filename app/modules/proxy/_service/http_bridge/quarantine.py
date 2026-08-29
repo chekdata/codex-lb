@@ -35,6 +35,9 @@ _HTTP_BRIDGE_QUARANTINE_MAX_ENTRIES = 1024
 
 _HTTP_BRIDGE_QUARANTINE_WEDGED_REATTACH_REASON = "reattach_missing_response_created"
 _HTTP_BRIDGE_QUARANTINE_REPEATED_EVENTLESS_REASON = "repeated_eventless_timeout"
+# A retry circuit opened on an eventless poison-class failure. The anchor that
+# caused the opening must not be re-injected into the next half-open probe.
+_HTTP_BRIDGE_QUARANTINE_POISONED_ANCHOR_REASON = "retry_circuit_poisoned_anchor"
 
 
 @dataclass(slots=True)
@@ -112,18 +115,29 @@ def _http_bridge_quarantine_generation(service: Any, key: _HTTPBridgeSessionKey)
     return entry.generation
 
 
-def _quarantine_http_bridge_session(service: Any, session: _HTTPBridgeSession, *, reason: str) -> None:
+def _quarantine_http_bridge_session(
+    service: Any,
+    session: _HTTPBridgeSession,
+    *,
+    reason: str,
+    minimum_seconds: float | None = None,
+) -> None:
     """Quarantine a bridge session that has proven silent/wedged.
 
     Session-scoped only: no account-health writes happen here, and the entry
     is bounded by TTL, a registry size cap, and the healthy-completion clear.
+    ``minimum_seconds`` lets the retry circuit keep a poison quarantine alive
+    through its cooldown and half-open probe lease.
     """
     now = time.monotonic()
     registry = _http_bridge_quarantine_registry(service)
     entry = registry.setdefault(session.key, _HTTPBridgeQuarantineEntry())
     already_quarantined = entry.quarantined_until > now
     entry.generation += 1
-    entry.quarantined_until = max(entry.quarantined_until, now + _HTTP_BRIDGE_QUARANTINE_TTL_SECONDS)
+    ttl_seconds = _HTTP_BRIDGE_QUARANTINE_TTL_SECONDS
+    if minimum_seconds is not None:
+        ttl_seconds = max(ttl_seconds, max(0.0, minimum_seconds))
+    entry.quarantined_until = max(entry.quarantined_until, now + ttl_seconds)
     entry.last_touched_monotonic = now
     entry.reason = reason
     _prune_http_bridge_quarantine_registry(registry, now)
@@ -135,7 +149,7 @@ def _quarantine_http_bridge_session(service: Any, session: _HTTPBridgeSession, *
         session.key,
         account_id=session.account.id,
         model=session.request_model,
-        detail=f"reason={reason}, ttl_seconds={_HTTP_BRIDGE_QUARANTINE_TTL_SECONDS:.0f}",
+        detail=f"reason={reason}, ttl_seconds={ttl_seconds:.0f}",
         cache_key_family=session.key.affinity_kind,
         model_class=_extract_model_class(session.request_model) if session.request_model else None,
     )

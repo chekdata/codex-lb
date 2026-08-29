@@ -61,6 +61,8 @@ from app.modules.proxy._service.compact import (
 from app.modules.proxy._service.http_bridge.helpers import (
     _HTTP_BRIDGE_MISSING_RESPONSE_CREATED_TIMEOUT_DETAIL,
     _await_task_deferring_cancellation,
+    _http_bridge_abandonment_strands_requests,
+    _http_bridge_continuity_bound_without_safe_replay,
     _http_bridge_durable_lease_ttl_seconds,
     _http_bridge_eventless_precreated_deadline,
     _http_bridge_request_budget_seconds,
@@ -76,6 +78,7 @@ from app.modules.proxy._service.http_bridge.quarantine import (
     _record_http_bridge_quarantine_wedged_pending,
 )
 from app.modules.proxy._service.http_bridge.retry_circuit import (
+    _HTTP_BRIDGE_RETRY_CIRCUIT_FAILURE_THRESHOLD,
     _http_bridge_anchor_poison_detail,
 )
 from app.modules.proxy._service.http_bridge.service_stubs import (
@@ -968,6 +971,7 @@ async def _abandon_durable_http_bridge_continuity(
     session: "_HTTPBridgeSession",
     *,
     detail: str = "repeated_zero_event_idle_timeout",
+    settle_circuit: bool = False,
 ) -> bool:
     """Clear durable continuity before retiring a repeatedly poisoned bridge.
 
@@ -1008,6 +1012,13 @@ async def _abandon_durable_http_bridge_continuity(
         cache_key_family=session.key.affinity_kind,
         model_class=_extract_model_class(session.request_model) if session.request_model else None,
     )
+    # Retirement and close funnels may reach this helper while a verified
+    # stale-anchor replay is still in flight. Those callers opt in only when
+    # every covered request is stranded; a replay that still holds a safe
+    # anchor-free body needs the circuit generation fence until dispatch.
+    if not settle_circuit:
+        return True
+    await service._clear_http_bridge_retry_circuit(session, settle_unfenced=True)
     return True
 
 
@@ -1194,7 +1205,12 @@ class _HTTPBridgeUpstreamEventsMixin:
                     ):
                         poison_detail = poison_candidate_detail
                 if poison_detail is not None:
-                    durable_cleared = await _abandon_durable_http_bridge_continuity(self, session, detail=poison_detail)
+                    durable_cleared = await _abandon_durable_http_bridge_continuity(
+                        self,
+                        session,
+                        detail=poison_detail,
+                        settle_circuit=_http_bridge_abandonment_strands_requests(pending_request_states),
+                    )
                     if durable_cleared:
                         await self._retire_stale_pending_http_bridge_session(
                             session,
@@ -2021,7 +2037,9 @@ class _HTTPBridgeUpstreamEventsMixin:
                 if is_missing_tool_output_event
                 else "stream_incomplete"
             )
+            grouped_retry_detail = "stream_incomplete" if is_previous_response_not_found_event else grouped_error_reason
             grouped_terminal_events = []
+            grouped_terminal_strike_failures: list[int] = []
             for grouped_request_state in grouped_previous_response_request_states:
                 grouped_request_state.error_http_status_override = 502
                 (
@@ -2045,6 +2063,15 @@ class _HTTPBridgeUpstreamEventsMixin:
                         grouped_operation_state,
                     )
                 )
+                if grouped_request_state.response_event_count == 0:
+                    grouped_failure_count = await self._record_http_bridge_retry_circuit_failure(
+                        session,
+                        detail=grouped_retry_detail,
+                        attempt=grouped_request_state.response_create_attempt,
+                        terminal_pre_response_frame=True,
+                    )
+                    if grouped_failure_count is not None:
+                        grouped_terminal_strike_failures.append(grouped_failure_count)
 
             append_terminal_batch = getattr(
                 getattr(self, "_http_bridge_operation_event_batcher", None),
@@ -2192,6 +2219,16 @@ class _HTTPBridgeUpstreamEventsMixin:
                 raise grouped_cancellation
             if grouped_error is not None:
                 raise grouped_error
+            if any(
+                failures >= _HTTP_BRIDGE_RETRY_CIRCUIT_FAILURE_THRESHOLD
+                for failures in grouped_terminal_strike_failures
+            ):
+                await _abandon_durable_http_bridge_continuity(
+                    self,
+                    session,
+                    detail="repeated_zero_event_stream_incomplete",
+                    settle_circuit=True,
+                )
             return
 
         if len(grouped_previous_response_request_states) == 1 and terminal_request_state is None:
@@ -2949,6 +2986,39 @@ class _HTTPBridgeUpstreamEventsMixin:
                     if retried:
                         return
 
+        terminal_strike_failures: int | None = None
+        terminal_poison_detail: str | None = None
+        if settlement_event_type in {"response.failed", "response.incomplete", "error"}:
+            terminal_error = (
+                settlement_event.error
+                if settlement_event_type == "error" and settlement_event is not None
+                else settlement_event.response.error
+                if settlement_event is not None and settlement_event.response is not None
+                else None
+            )
+            terminal_error_code = _normalize_error_code(
+                terminal_error.code if terminal_error else None,
+                terminal_error.type if terminal_error else None,
+            )
+            terminal_retry_detail = terminal_error_code
+            if is_previous_response_not_found_event and terminal_retry_detail not in {
+                "stream_incomplete",
+                "stream_idle_timeout",
+            }:
+                terminal_retry_detail = "stream_incomplete"
+            if (
+                terminal_request_state is not None
+                and terminal_request_state.response_event_count == 0
+                and _http_bridge_continuity_bound_without_safe_replay(terminal_request_state)
+            ):
+                terminal_strike_failures = await self._record_http_bridge_retry_circuit_failure(
+                    session,
+                    detail=terminal_retry_detail or "stream_incomplete",
+                    attempt=terminal_request_state.response_create_attempt,
+                    terminal_pre_response_frame=True,
+                )
+                terminal_poison_detail = _http_bridge_anchor_poison_detail(terminal_retry_detail)
+
         matched_event_queue = (
             completed_event_queue
             if completed_event_queue_claimed and matched_request_state is terminal_request_state
@@ -3046,6 +3116,21 @@ class _HTTPBridgeUpstreamEventsMixin:
                     # returns. A concurrent timeout may still be finishing
                     # awaited recovery work before it rechecks this scope.
                     completed_delivery_scope.terminal_enqueued = True
+
+        if (
+            terminal_poison_detail is not None
+            and terminal_strike_failures is not None
+            and terminal_strike_failures >= _HTTP_BRIDGE_RETRY_CIRCUIT_FAILURE_THRESHOLD
+        ):
+            # Terminal frames settle without entering the retirement funnel.
+            # Clear the durable anchor after publishing the failure so a client
+            # resend is covered by the quarantine already armed by the strike.
+            await _abandon_durable_http_bridge_continuity(
+                self,
+                session,
+                detail=terminal_poison_detail,
+                settle_circuit=True,
+            )
 
         if settlement_event_type in {"response.failed", "response.incomplete", "error"}:
             error_code = None
