@@ -206,6 +206,11 @@ def _clear_http_bridge_quarantine(
     """A completed response disproves the current and recovery-origin wedges."""
     registry = _http_bridge_quarantine_registry(service)
     session.quarantined = False
+    # A completed response establishes a new healthy continuity anchor. Any
+    # poison-settlement result from the previous lifecycle must not suppress
+    # future anchor handling on this session.
+    session.anchor_poison_cleared = False
+    session.anchor_poison_clear_failed = False
     keys = (session.key,) if additional_key is None or additional_key == session.key else (session.key, additional_key)
     for key in keys:
         entry = registry.pop(key, None)

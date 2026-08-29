@@ -1254,6 +1254,11 @@ class _HTTPBridgeSession:
     # timeouts). A quarantined session must never be selected for reuse or
     # re-attach; later requests take the fresh session/no-anchor path.
     quarantined: bool = False
+    # Durable anchor-poison settlement is owned by the retry circuit. These
+    # flags bridge the asynchronous fenced clear result back to reader and
+    # retirement paths without making either path count a second threshold.
+    anchor_poison_cleared: bool = False
+    anchor_poison_clear_failed: bool = False
     # Set while a reader handoff is replacing the socket. Idle pruning must
     # retain the registered session during this short transition even though
     # ``closed`` is fail-closed for normal request reuse.

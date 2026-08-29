@@ -3963,12 +3963,23 @@ current and the failure is ordinary transient upstream silence.
 
 ### Requirement: Repeated zero-event idle failures poison dead anchors
 
-For hard HTTP bridge keys, repeated zero-event idle failures MUST use the
-existing durable retry-circuit counter to identify an anchor that should no
-longer remain addressable. When consecutive failures for the same hard bridge
-key reach the configured poison threshold, the proxy MUST abandon durable
-continuity for that session and retire the bridge even when admission waiters
-exist. The default threshold MUST be no greater than seven failures.
+For hard HTTP bridge keys, every request-affecting eventless failure with no
+safe replay MUST use the durable retry-circuit counter, regardless of whether
+the reader, terminal-frame, stale-gate, or grouped-terminal path observes it
+first. One physical response-create attempt MUST contribute at most one strike.
+When consecutive failures for the same hard bridge key reach the retry-circuit
+open threshold (two by default), the proxy MUST persist the open generation,
+fenced-clear the durable continuity anchor, and quarantine the key before any
+cooldown probe can reuse it. The independent seven-failure reader threshold
+MUST NOT participate in anchor poisoning.
+
+If the fenced anchor clear fails, is unavailable, or is rejected by a newer
+owner, the durable poison marker MUST remain open. Cooldown expiry or process
+restart MUST NOT permit the old anchor to be injected again. A full-context
+request MAY proceed as an explicitly unanchored replay; a delta-only request
+MUST fail closed until the anchor is cleared or a completed response proves a
+new healthy continuity state. A successful ``response.completed`` MUST clear
+the poison marker and quarantine.
 
 #### Scenario: Admission waiters cannot defer anchor poisoning forever
 
@@ -3981,6 +3992,40 @@ exist. The default threshold MUST be no greater than seven failures.
 - **AND** retires the session despite the admission waiter
 - **AND** the next attach starts from fresh durable state rather than the
   poisoned previous-response anchor
+
+#### Scenario: Reader and terminal failures share one poison threshold
+
+- **GIVEN** a hard bridge key has one eventless reader failure
+- **WHEN** the next request receives an eventless terminal
+  `previous_response_not_found` failure before `response.created`
+- **THEN** the second failure opens the same durable retry circuit
+- **AND** the fenced continuity clear is attempted exactly once for that
+  circuit generation
+- **AND** the reader-only seven-failure threshold is not required
+
+#### Scenario: Terminal and reader failures share one poison threshold
+
+- **GIVEN** a hard bridge key has one eventless terminal failure
+- **WHEN** the next request fails eventlessly in the reader path
+- **THEN** the second failure opens the same durable retry circuit
+- **AND** the durable anchor is not re-injected after cooldown
+
+#### Scenario: Poison clear failure remains fail-closed after cooldown
+
+- **GIVEN** the fenced durable anchor clear fails or is rejected by a newer
+  owner when the circuit opens
+- **WHEN** the cooldown expires or a new replica handles the next request
+- **THEN** the durable poison marker remains observable
+- **AND** a full-context request is sent without a proxy-injected anchor
+- **AND** a delta-only request fails closed instead of replaying the old anchor
+
+#### Scenario: Duplicate callbacks settle one physical attempt once
+
+- **GIVEN** reader and terminal callbacks race for the same response-create
+  attempt
+- **WHEN** both callbacks classify the outcome as eventless
+- **THEN** the circuit records one strike
+- **AND** durable anchor clear and poison telemetry are not duplicated
 
 #### Scenario: Lease liveness comparison is timezone-safe
 - **GIVEN** a durable bridge session whose `lease_expires_at` was read from a `timestamptz` column (offset-aware) on PostgreSQL
