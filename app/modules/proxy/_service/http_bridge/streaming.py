@@ -1353,6 +1353,7 @@ class _HTTPBridgeStreamingMixin:
         durable_full_resend_fresh_bridge_proof: _VerifiedDurableFullResend | None = None
         force_local_recovery_creation = False
         payload_looks_like_full_resend = _http_bridge_payload_looks_like_full_resend(payload)
+        anchor_poison_circuit_unresolved = False
         # Set when the quarantine check below suppresses the durable-anchor
         # injection for a full-resend payload; the session hydration and the
         # session-level anchor injection further down must honor it so the
@@ -1514,6 +1515,27 @@ class _HTTPBridgeStreamingMixin:
                 durable_lookup.canonical_key,
                 bridge_session_key.api_key_id,
             )
+            anchor_poison_circuit_unresolved = await self._http_bridge_retry_circuit_anchor_poisoned_for_key(
+                bridge_session_key
+            )
+            if anchor_poison_circuit_unresolved and not payload_looks_like_full_resend:
+                _record_continuity_fail_closed(
+                    surface="http_bridge",
+                    reason="poisoned_anchor_unresolved",
+                    previous_response_id=payload.previous_response_id,
+                    session_id=bridge_session_key.affinity_key,
+                    upstream_error_code="retry_circuit_poisoned_anchor",
+                )
+                raise ProxyResponseError(
+                    503,
+                    openai_error(
+                        "upstream_request_timeout",
+                        "The previous response anchor is temporarily unavailable while bridge recovery completes.",
+                    ),
+                    retryable_same_contract=True,
+                    failure_phase="upstream",
+                    failure_detail="retry_circuit_poisoned_anchor",
+                )
             live_local_session_exists = await self._http_bridge_has_live_local_session(
                 key=bridge_session_key,
                 incoming_turn_state=incoming_turn_state_header,
@@ -1530,7 +1552,9 @@ class _HTTPBridgeStreamingMixin:
                 and durable_lookup.latest_response_id is not None
                 and (not payload_looks_like_full_resend or durable_anchor_trimmable)
             )
-            if payload_looks_like_full_resend and _http_bridge_session_key_quarantined(self, bridge_session_key):
+            if payload_looks_like_full_resend and (
+                _http_bridge_session_key_quarantined(self, bridge_session_key) or anchor_poison_circuit_unresolved
+            ):
                 # The previous attach on this key proved silent/wedged
                 # (#1534). The client's own payload already carries the full
                 # conversation, so send it unanchored on the fresh path

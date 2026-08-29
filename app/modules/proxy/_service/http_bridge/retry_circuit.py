@@ -9,6 +9,9 @@ from typing import Any
 import anyio
 
 from app.core.metrics.prometheus import PROMETHEUS_AVAILABLE, http_bridge_retry_circuit_total
+from app.modules.proxy._service.http_bridge.anchor_poison import (
+    _abandon_durable_http_bridge_continuity,
+)
 from app.modules.proxy._service.http_bridge.quarantine import (
     _HTTP_BRIDGE_QUARANTINE_POISONED_ANCHOR_REASON,
     _quarantine_http_bridge_session,
@@ -80,6 +83,8 @@ class _HTTPBridgeRetryCircuitState:
     last_failure_monotonic: float = 0.0
     last_durable_load_monotonic: float = 0.0
     half_open_until: float = 0.0
+    anchor_poison_clear_in_flight: bool = False
+    anchor_poison_clear_retry_after: float = 0.0
 
 
 def _initialize_http_bridge_retry_circuit(service: Any, reset_transient_cache: Any = None) -> None:
@@ -157,6 +162,38 @@ class _HTTPBridgeRetryCircuitMixin:
                 local_consecutive_failures,
                 last_failure_monotonic,
                 local_cooldown_until,
+            )
+
+    async def _http_bridge_retry_circuit_anchor_poisoned_for_key(
+        self: Any,
+        key: _HTTPBridgeSessionKey,
+    ) -> bool:
+        """Return whether a durable poison-class circuit still needs clearing.
+
+        ``last_detail`` plus the threshold is the durable marker. A successful
+        fenced anchor settlement clears the circuit row, while a failed clear
+        leaves this marker in place so a restarted replica cannot re-inject the
+        old anchor after the in-memory quarantine expires.
+        """
+        try:
+            persisted = await self._durable_bridge.lookup_retry_circuit(
+                session_key_kind=key.affinity_kind,
+                session_key_value=key.affinity_key,
+                api_key_id=key.api_key_id,
+            )
+        except Exception:
+            return False
+        if persisted is not None:
+            return bool(
+                persisted.consecutive_failures >= _HTTP_BRIDGE_RETRY_CIRCUIT_FAILURE_THRESHOLD
+                and _http_bridge_anchor_poison_detail(persisted.last_detail) is not None
+            )
+        async with self._http_bridge_retry_circuit_lock:
+            state = self._http_bridge_retry_circuits.get(key)
+            return bool(
+                state is not None
+                and state.consecutive_failures >= _HTTP_BRIDGE_RETRY_CIRCUIT_FAILURE_THRESHOLD
+                and _http_bridge_anchor_poison_detail(state.last_detail) is not None
             )
 
     async def _http_bridge_retry_circuit_generation_is_not_newer(
@@ -647,6 +684,7 @@ class _HTTPBridgeRetryCircuitMixin:
         poison_class_failure = _http_bridge_anchor_poison_detail(detail) is not None
         quarantine_poisoned_anchor = False
         quarantine_cooldown_remaining = 0.0
+        anchor_clear_required = False
         async with self._http_bridge_retry_circuit_lock:
             if scoped_attempt is not None and scoped_attempt.retry_circuit_failure_recorded:
                 duplicate_attempt = scoped_attempt
@@ -678,6 +716,13 @@ class _HTTPBridgeRetryCircuitMixin:
                     if poison_class_failure:
                         quarantine_poisoned_anchor = True
                         quarantine_cooldown_remaining = max(0.0, state.cooldown_until - now)
+                        if (
+                            not getattr(session, "anchor_poison_cleared", False)
+                            and not state.anchor_poison_clear_in_flight
+                            and now >= state.anchor_poison_clear_retry_after
+                        ):
+                            state.anchor_poison_clear_in_flight = True
+                            anchor_clear_required = True
                     if PROMETHEUS_AVAILABLE and http_bridge_retry_circuit_total is not None:
                         http_bridge_retry_circuit_total.labels(outcome="opened").inc()
                     logger.warning(
@@ -705,6 +750,38 @@ class _HTTPBridgeRetryCircuitMixin:
             )
         try:
             await self._persist_http_bridge_retry_circuit(session, state)
+            if poison_class_failure and not anchor_clear_required:
+                # A durable conflict can merge another replica's strike into
+                # this state while persistence is in flight. Re-evaluate the
+                # threshold after the merge so the clear cannot be skipped.
+                async with self._http_bridge_retry_circuit_lock:
+                    if (
+                        self._http_bridge_retry_circuits.get(session.key) is state
+                        and state.consecutive_failures >= threshold
+                        and not getattr(session, "anchor_poison_cleared", False)
+                        and not state.anchor_poison_clear_in_flight
+                        and time.monotonic() >= state.anchor_poison_clear_retry_after
+                    ):
+                        state.anchor_poison_clear_in_flight = True
+                        anchor_clear_required = True
+            if anchor_clear_required:
+                poison_detail = _http_bridge_anchor_poison_detail(detail)
+                durable_anchor_cleared = False
+                if poison_detail is not None:
+                    durable_anchor_cleared = await _abandon_durable_http_bridge_continuity(
+                        self,
+                        session,
+                        detail=poison_detail,
+                        settle_circuit=True,
+                    )
+                async with self._http_bridge_retry_circuit_lock:
+                    if self._http_bridge_retry_circuits.get(session.key) is state:
+                        state.anchor_poison_clear_in_flight = False
+                        if not durable_anchor_cleared:
+                            state.anchor_poison_clear_retry_after = max(
+                                state.anchor_poison_clear_retry_after,
+                                state.cooldown_until,
+                            )
             merged_quarantine_cooldown_remaining = 0.0
             async with self._http_bridge_retry_circuit_lock:
                 if self._http_bridge_retry_circuits.get(session.key) is state:
