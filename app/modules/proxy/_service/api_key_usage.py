@@ -726,12 +726,7 @@ class _ApiKeyUsageMixin:
                     )
                     return False
                 logger.warning(
-                    "Failed to release stream API key reservation key_id=%s request_id=%s "
-                    "retry_attempt=%d retry_delay_seconds=%.2f",
-                    "<redacted>",
-                    request_id,
-                    retry_attempt,
-                    retry_delay_seconds,
+                    "Failed to release stream API key reservation; retrying",
                     exc_info=True,
                 )
             finally:

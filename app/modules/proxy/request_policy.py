@@ -769,20 +769,11 @@ def restore_source_reasoning_effort(
     declared = {level.effort for level in source_model_reasoning_levels(source, payload.model)}
     if restored_effort not in declared:
         return
-    current_effort = payload.reasoning.effort
     # Normalized on assignment rather than trusting the caller: the sole
     # producer already reports the normalized form, but that invariant is
     # non-local and a casing variant must never reach the wire.
     payload.reasoning.effort = restored_effort
-    logger.info(  # lgtm [py/clear-text-logging-sensitive-data]
-        "reasoning_effort_restored_for_source request_id=%s model=%s source_id=%s "
-        "normalized_effort=%s restored_effort=%s",
-        get_request_id(),
-        safe_log_field(payload.model),
-        safe_log_field(source.id),
-        safe_log_field(current_effort),
-        safe_log_field(restored_effort),
-    )
+    logger.info("reasoning_effort_restored_for_source")
 
 
 def _resolve_reasoning_effort_fallback(
