@@ -58,6 +58,7 @@ DASHBOARD_AUTH_GATED: dict[tuple[str, str], PermissionRequirement] = {
 #: Routes whose permission requirement is part of the security contract.
 EXPECTED_REQUIREMENTS: dict[tuple[str, str], PermissionRequirement] = {
     ("POST", "/api/accounts/{account_id}/export/auth"): PermissionRequirement(Permission.ACCOUNTS_EXPORT),
+    ("POST", "/api/accounts/{account_id}/export/opencode-auth"): PermissionRequirement(Permission.ACCOUNTS_EXPORT),
     ("GET", "/api/audit-logs"): PermissionRequirement(Permission.AUDIT_READ),
     ("GET", "/api/conversation-archive/records"): PermissionRequirement(Permission.CONVERSATIONS_READ),
     ("GET", "/api/conversations"): PermissionRequirement(Permission.CONVERSATIONS_READ),
@@ -136,10 +137,10 @@ EXPECTED_REQUIREMENTS: dict[tuple[str, str], PermissionRequirement] = {
 #: security field (handler-level, covered by ``test_step_up_auth.py``).
 STEP_UP_GATED: frozenset[tuple[str, str]] = frozenset(
     {
-        # ``POST /api/accounts/{id}/export`` and ``.../export/opencode-auth`` are the
-        # retired predecessors that ``unified-auth-export`` forbids serving; only the
-        # single export route below exists.
+        # The canonical export route and CHEK's legacy OpenCode-compatible export
+        # both require a fresh step-up.
         ("POST", "/api/accounts/{account_id}/export/auth"),
+        ("POST", "/api/accounts/{account_id}/export/opencode-auth"),
         ("POST", "/api/firewall/ips"),
         ("DELETE", "/api/firewall/ips/{ip_address}"),
         ("POST", "/api/settings/upstream-proxy/endpoints"),
