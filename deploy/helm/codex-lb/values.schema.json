@@ -24,11 +24,17 @@
         },
         "pullPolicy": {
           "type": "string",
-          "enum": ["Always", "IfNotPresent", "Never"],
+          "enum": [
+            "Always",
+            "IfNotPresent",
+            "Never"
+          ],
           "description": "Container image pull policy"
         }
       },
-      "required": ["repository"]
+      "required": [
+        "repository"
+      ]
     },
     "test": {
       "type": "object",
@@ -54,7 +60,11 @@
             },
             "pullPolicy": {
               "type": "string",
-              "enum": ["Always", "IfNotPresent", "Never"],
+              "enum": [
+                "Always",
+                "IfNotPresent",
+                "Never"
+              ],
               "description": "Helm test pod image pull policy"
             }
           }
@@ -70,8 +80,12 @@
         "secretKeys": {
           "type": "object",
           "properties": {
-            "databaseUrl": { "type": "string" },
-            "encryptionKey": { "type": "string" }
+            "databaseUrl": {
+              "type": "string"
+            },
+            "encryptionKey": {
+              "type": "string"
+            }
           }
         }
       }
@@ -79,28 +93,42 @@
     "postgresql": {
       "type": "object",
       "properties": {
-        "enabled": { "type": "boolean" }
+        "enabled": {
+          "type": "boolean"
+        }
       }
     },
     "ingress": {
       "type": "object",
       "properties": {
-        "enabled": { "type": "boolean" }
+        "enabled": {
+          "type": "boolean"
+        }
       }
     },
     "gatewayApi": {
       "type": "object",
       "properties": {
-        "enabled": { "type": "boolean" },
+        "enabled": {
+          "type": "boolean"
+        },
         "gateway": {
           "type": "object",
           "properties": {
-            "create": { "type": "boolean" },
-            "gatewayClassName": { "type": "string" },
-            "annotations": { "type": "object" },
+            "create": {
+              "type": "boolean"
+            },
+            "gatewayClassName": {
+              "type": "string"
+            },
+            "annotations": {
+              "type": "object"
+            },
             "listeners": {
               "type": "array",
-              "items": { "type": "object" }
+              "items": {
+                "type": "object"
+              }
             }
           }
         },
@@ -111,11 +139,15 @@
             "properties": {
               "matches": {
                 "type": "array",
-                "items": { "type": "object" }
+                "items": {
+                  "type": "object"
+                }
               },
               "filters": {
                 "type": "array",
-                "items": { "type": "object" }
+                "items": {
+                  "type": "object"
+                }
               }
             },
             "additionalProperties": false
@@ -126,63 +158,101 @@
     "metrics": {
       "type": "object",
       "properties": {
-        "enabled": { "type": "boolean" },
-        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+        "enabled": {
+          "type": "boolean"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
       }
     },
     "networkPolicy": {
       "type": "object",
       "properties": {
-        "enabled": { "type": "boolean" }
+        "enabled": {
+          "type": "boolean"
+        }
       }
     },
     "migration": {
       "type": "object",
       "properties": {
-        "enabled": { "type": "boolean" },
-        "backoffLimit": { "type": "integer", "minimum": 0 },
-        "activeDeadlineSeconds": { "type": "integer", "minimum": 1 }
+        "enabled": {
+          "type": "boolean"
+        },
+        "backoffLimit": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "activeDeadlineSeconds": {
+          "type": "integer",
+          "minimum": 1
+        }
       }
     },
     "pdb": {
       "type": "object",
       "properties": {
-        "create": { "type": "boolean" }
+        "create": {
+          "type": "boolean"
+        }
       }
     },
     "autoscaling": {
       "type": "object",
       "properties": {
-        "enabled": { "type": "boolean" },
-        "minReplicas": { "type": "integer", "minimum": 1 },
-        "maxReplicas": { "type": "integer", "minimum": 1 }
+        "enabled": {
+          "type": "boolean"
+        },
+        "minReplicas": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maxReplicas": {
+          "type": "integer",
+          "minimum": 1
+        }
       }
     },
     "tracing": {
       "type": "object",
       "properties": {
-        "enabled": { "type": "boolean" }
+        "enabled": {
+          "type": "boolean"
+        }
       }
     },
     "externalSecrets": {
       "type": "object",
       "properties": {
-        "enabled": { "type": "boolean" },
+        "enabled": {
+          "type": "boolean"
+        },
         "remoteRefs": {
           "type": "object",
           "properties": {
             "databaseUrl": {
               "type": "object",
               "properties": {
-                "key": { "type": "string" },
-                "property": { "type": "string" }
+                "key": {
+                  "type": "string"
+                },
+                "property": {
+                  "type": "string"
+                }
               }
             },
             "encryptionKey": {
               "type": "object",
               "properties": {
-                "key": { "type": "string" },
-                "property": { "type": "string" }
+                "key": {
+                  "type": "string"
+                },
+                "property": {
+                  "type": "string"
+                }
               }
             }
           }
@@ -192,11 +262,15 @@
     "rollout": {
       "type": "object",
       "properties": {
-        "manualToken": { "type": "string" },
+        "manualToken": {
+          "type": "string"
+        },
         "reloader": {
           "type": "object",
           "properties": {
-            "enabled": { "type": "boolean" }
+            "enabled": {
+              "type": "boolean"
+            }
           }
         }
       }
@@ -207,12 +281,21 @@
     "config": {
       "type": "object",
       "properties": {
-        "databasePostgresSchema": {
-          "type": "string"
+        "logFormat": {
+          "type": "string",
+          "enum": [
+            "text",
+            "json"
+          ]
         },
         "shutdownDrainTimeoutSeconds": {
           "type": "integer",
-          "minimum": 1
+          "minimum": 1,
+          "maximum": 300
+        },
+        "databasePostgresSchema": {
+          "type": "string",
+          "maxLength": 63
         }
       }
     },
@@ -225,8 +308,12 @@
     "serviceAccount": {
       "type": "object",
       "properties": {
-        "create": {"type": "boolean"},
-        "automount": {"type": "boolean"}
+        "create": {
+          "type": "boolean"
+        },
+        "automount": {
+          "type": "boolean"
+        }
       }
     },
     "resources": {

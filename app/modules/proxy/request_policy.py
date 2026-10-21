@@ -9,7 +9,7 @@ from pydantic import ValidationError
 from app.core.errors import OpenAIErrorEnvelope, openai_error
 from app.core.exceptions import ProxyModelNotAllowed, ProxyReasoningEffortNotAllowed
 from app.core.openai.exceptions import ClientPayloadError
-from app.core.openai.model_registry import ModelRegistry, get_model_registry
+from app.core.openai.model_registry import ModelRegistry, canonical_service_tier_value, get_model_registry
 from app.core.openai.requests import (
     ResponsesCompactRequest,
     ResponsesReasoning,
@@ -23,7 +23,6 @@ from app.core.openai.strict_schema import (
     validate_strict_json_schema,
 )
 from app.core.openai.v1_requests import V1ResponsesRequest
-from app.core.runtime_logging import safe_log_field
 from app.core.types import JsonValue
 from app.core.utils.json_guards import is_json_list, is_json_mapping
 from app.core.utils.request_id import get_request_id
@@ -144,8 +143,8 @@ def validate_reasoning_effort_access(api_key: ApiKeyData | None, effort: str | N
     logger.info(
         "api_key_reasoning_effort_not_allowed request_id=%s key_id=%s reasoning_effort=%s",
         get_request_id(),
-        "<redacted>",
-        safe_log_field(normalized_effort),
+        api_key.id,
+        normalized_effort,
     )
     raise ProxyReasoningEffortNotAllowed(
         f"This API key does not have access to reasoning effort '{normalized_effort}'",
@@ -282,11 +281,12 @@ def apply_api_key_enforcement(
     client_reasoning_effort = payload._codex_lb_client_reasoning_effort or _client_reasoning_effort(payload)
     payload._codex_lb_client_reasoning_effort = client_reasoning_effort
     provider_reasoning_effort = _client_reasoning_effort_from_provider_aliases(payload)
-    normalize_upstream_model_alias(payload, prohibit_fast_mode=prohibit_fast_mode)
+    normalize_upstream_model_alias(payload)
 
     if api_key is None:
         _materialize_provider_reasoning_effort(payload, provider_reasoning_effort)
         pre_normalization_effort = normalize_unsupported_reasoning_effort(payload, registry=registry)
+        apply_prohibit_fast_mode(payload, prohibit_fast_mode=prohibit_fast_mode)
         return ApiKeyEnforcementResult(False, pre_normalization_effort)
 
     if api_key.enforced_model:
@@ -296,15 +296,15 @@ def apply_api_key_enforcement(
             logger.info(
                 "api_key_model_enforced request_id=%s key_id=%s requested_model=%s enforced_model=%s",
                 get_request_id(),
-                "<redacted>",
-                safe_log_field(requested_model),
-                safe_log_field(api_key.enforced_model),
+                api_key.id,
+                requested_model,
+                api_key.enforced_model,
             )
         payload.model = api_key.enforced_model
         if enforced_model_reasoning_effort is not None:
             client_reasoning_effort = enforced_model_reasoning_effort
             payload._codex_lb_client_reasoning_effort = client_reasoning_effort
-        normalize_upstream_model_alias(payload, prohibit_fast_mode=prohibit_fast_mode)
+        normalize_upstream_model_alias(payload)
         if (
             responses_input_uses_lite_tools(payload.input)
             and _model_responses_lite_capability(
@@ -328,9 +328,9 @@ def apply_api_key_enforcement(
             logger.info(
                 "api_key_reasoning_enforced request_id=%s key_id=%s requested_effort=%s enforced_effort=%s",
                 get_request_id(),
-                "<redacted>",
-                safe_log_field(requested_effort),
-                safe_log_field(api_key.enforced_reasoning_effort),
+                api_key.id,
+                requested_effort,
+                api_key.enforced_reasoning_effort,
             )
 
     _materialize_provider_reasoning_effort(payload, provider_reasoning_effort)
@@ -367,12 +367,37 @@ def apply_api_key_enforcement(
                 "requested_service_tier=%s enforced_service_tier=%s "
                 "outbound_service_tier=%s",
                 get_request_id(),
-                "<redacted>",
-                safe_log_field(requested_service_tier),
-                safe_log_field(api_key.enforced_service_tier),
-                safe_log_field(effective_service_tier),
+                api_key.id,
+                requested_service_tier,
+                api_key.enforced_service_tier,
+                effective_service_tier,
             )
+    apply_prohibit_fast_mode(payload, prohibit_fast_mode=prohibit_fast_mode)
     return ApiKeyEnforcementResult(service_tier_was_enforced, pre_normalization_effort)
+
+
+def apply_prohibit_fast_mode(
+    payload: ResponsesRequest | ResponsesCompactRequest | dict[str, JsonValue],
+    *,
+    prohibit_fast_mode: bool,
+    request_id: str | None = None,
+) -> bool:
+    """Remove a resolved priority tier when the global policy prohibits it."""
+    raw_service_tier = payload.get("service_tier") if isinstance(payload, dict) else payload.service_tier
+    service_tier = raw_service_tier if isinstance(raw_service_tier, str) else None
+    if not prohibit_fast_mode or service_tier is None or canonical_service_tier_value(service_tier) != "priority":
+        return False
+
+    logger.info(
+        "fast_mode_service_tier_prohibited request_id=%s stripped_service_tier=%s",
+        request_id or get_request_id(),
+        service_tier,
+    )
+    if isinstance(payload, dict):
+        payload.pop("service_tier", None)
+    else:
+        payload.service_tier = None
+    return True
 
 
 def apply_enforced_service_tier_model_fallback(
@@ -400,8 +425,8 @@ def apply_enforced_service_tier_model_fallback(
     logger.info(
         "api_key_enforced_service_tier_model_fallback request_id=%s model=%s enforced_service_tier=%s",
         get_request_id(),
-        safe_log_field(payload.model),
-        safe_log_field(service_tier),
+        payload.model,
+        service_tier,
     )
     payload.service_tier = None
     return True
@@ -552,23 +577,19 @@ def model_alias_requests_fast_mode(model: str | None) -> bool:
     return alias is not None and alias[3]
 
 
-def normalize_upstream_model_alias(
-    payload: ResponsesRequest | ResponsesCompactRequest,
-    *,
-    prohibit_fast_mode: bool = False,
-) -> None:
+def normalize_upstream_model_alias(payload: ResponsesRequest | ResponsesCompactRequest) -> None:
     requested_model = payload.model
     alias = _resolve_model_alias_parts(requested_model)
     if alias is None:
         return
 
-    canonical_model, alias_effort, alias_service_tier, alias_requests_fast_mode = alias
+    canonical_model, alias_effort, alias_service_tier, _alias_requests_fast_mode = alias
     if payload.model != canonical_model:
         logger.info(
             "model_alias_normalized request_id=%s requested_model=%s normalized_model=%s",
             get_request_id(),
-            safe_log_field(payload.model),
-            safe_log_field(canonical_model),
+            payload.model,
+            canonical_model,
         )
         payload.model = canonical_model
 
@@ -583,29 +604,21 @@ def normalize_upstream_model_alias(
                 "model_alias_reasoning_normalized request_id=%s requested_model=%s "
                 "normalized_model=%s requested_effort=%s normalized_effort=%s",
                 get_request_id(),
-                safe_log_field(requested_model),
-                safe_log_field(canonical_model),
-                safe_log_field(requested_effort),
-                safe_log_field(alias_effort),
+                requested_model,
+                canonical_model,
+                requested_effort,
+                alias_effort,
             )
 
     if alias_service_tier is not None and getattr(payload, "service_tier", None) is None:
-        if prohibit_fast_mode and alias_requests_fast_mode:
-            logger.info(
-                "model_alias_fast_mode_prohibited request_id=%s requested_model=%s normalized_model=%s",
-                get_request_id(),
-                safe_log_field(requested_model),
-                safe_log_field(canonical_model),
-            )
-            return
         setattr(payload, "service_tier", alias_service_tier)
         logger.info(
             "model_alias_service_tier_normalized request_id=%s requested_model=%s "
             "normalized_model=%s normalized_service_tier=%s",
             get_request_id(),
-            safe_log_field(requested_model),
-            safe_log_field(canonical_model),
-            safe_log_field(alias_service_tier),
+            requested_model,
+            canonical_model,
+            alias_service_tier,
         )
 
 
@@ -702,9 +715,9 @@ def normalize_unsupported_reasoning_effort(
         logger.info(
             "reasoning_effort_wire_aliased request_id=%s model=%s requested_effort=%s aliased_effort=%s",
             get_request_id(),
-            safe_log_field(payload.model),
-            safe_log_field(requested_effort),
-            safe_log_field(wire_alias),
+            payload.model,
+            requested_effort,
+            wire_alias,
         )
         # Deliberately not reported as restorable: the ultra -> max alias must
         # hold on every surface, source-routed payloads included.
@@ -719,8 +732,11 @@ def normalize_unsupported_reasoning_effort(
     )
     payload.reasoning.effort = fallback
     logger.info(
-        "reasoning_effort_normalized request_id=%s",
+        "reasoning_effort_normalized request_id=%s model=%s requested_effort=%s normalized_effort=%s",
         get_request_id(),
+        payload.model,
+        requested_effort,
+        fallback,
     )
     return normalized_effort
 
@@ -752,11 +768,20 @@ def restore_source_reasoning_effort(
     declared = {level.effort for level in source_model_reasoning_levels(source, payload.model)}
     if restored_effort not in declared:
         return
+    current_effort = payload.reasoning.effort
     # Normalized on assignment rather than trusting the caller: the sole
     # producer already reports the normalized form, but that invariant is
     # non-local and a casing variant must never reach the wire.
     payload.reasoning.effort = restored_effort
-    logger.info("reasoning_effort_restored_for_source request_id=%s", get_request_id())
+    logger.info(
+        "reasoning_effort_restored_for_source request_id=%s model=%s source_id=%s "
+        "normalized_effort=%s restored_effort=%s",
+        get_request_id(),
+        payload.model,
+        source.id,
+        current_effort,
+        restored_effort,
+    )
 
 
 def _resolve_reasoning_effort_fallback(
@@ -882,20 +907,25 @@ def _validate_terminal_compaction_trigger_input_items(input_value: list[JsonValu
     return trigger_seen
 
 
-def responses_source_route_excluded(payload: ResponsesRequest) -> bool:
+def responses_source_route_excluded(
+    payload: ResponsesRequest,
+    *,
+    exclude_compaction: bool = True,
+) -> bool:
     """True when a Responses request must stay on subscription accounts.
 
-    A terminal compaction trigger is served by the upstream compact flow on the
-    turn's owner account, and an ``input_file``/``input_image`` file reference
-    is pinned to the subscription account that received the upload — neither
-    can be dispatched to an OpenAI-compatible model source. The HTTP
-    ``/responses`` route and the WebSocket source-ownership guards share this
-    predicate so their notion of source-route eligibility cannot drift.
+    A terminal compaction trigger is served by the upstream compact flow on
+    the turn's owner account (Codex path only — callers set
+    ``exclude_compaction=False`` on ``/v1/responses``, which has no Codex
+    compaction path). An ``input_file``/``input_image`` file reference is
+    pinned to the subscription account that received the upload. Previous
+    response ownership is resolved separately from recorded continuity
+    evidence because response identifier syntax is provider-opaque.
 
     Raises ``ClientPayloadError`` for a malformed compaction trigger, exactly
     like ``strip_terminal_compaction_trigger_input``.
     """
-    if strip_terminal_compaction_trigger_input(payload) is not None:
+    if exclude_compaction and strip_terminal_compaction_trigger_input(payload) is not None:
         return True
     return bool(extract_input_file_ids(payload.input))
 

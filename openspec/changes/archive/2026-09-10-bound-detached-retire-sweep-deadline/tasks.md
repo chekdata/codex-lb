@@ -1,5 +1,3 @@
-> Imported upstream completion record. CHEK backport validation is recorded in `openspec/specs/responses-api-compat/context.md`; upstream checkmarks do not assert a local CI result.
-
 ## 1. Regression and implementation
 
 - [x] 1.1 Reproduce aggregate waiting through the accepted sweep seam with virtual time.

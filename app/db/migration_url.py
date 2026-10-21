@@ -52,10 +52,11 @@ def postgres_migration_search_path(schema: str | None) -> str | None:
 
 def postgres_qualified_name(identifier: str, schema: str | None) -> str:
     normalized = normalize_postgres_schema(schema)
-    quoted_identifier = quote_postgres_identifier(identifier)
     if normalized is None:
-        return quoted_identifier
-    return f"{quote_postgres_identifier(normalized)}.{quoted_identifier}"
+        # Preserve the unqualified legacy SQL shape; PostgreSQL resolves it
+        # through the connection search_path.
+        return identifier
+    return f"{quote_postgres_identifier(normalized)}.{quote_postgres_identifier(identifier)}"
 
 
 def ensure_postgres_schema_exists(connection: Connection, schema: str | None) -> None:
