@@ -13,3 +13,9 @@
 
 - [x] 3.1 Run the focused unit test, lint, type, and architecture checks.
 - [x] 3.2 Run strict change-local OpenSpec validation.
+
+## CHEK completion
+
+- [x] Reproduce and verify the backport against CHEK ownership and cancellation behavior; 713 affected tests passed.
+- [x] Verify PR #52 and main CI, then production through ops-bootstrap #3074: exact source/image identity, Ready pod with zero restarts, AnyIO 4.15.1, database/ring readiness and public health.
+- [x] Verify main specs already incorporate this change and the later aggregate-deadline strengthening.

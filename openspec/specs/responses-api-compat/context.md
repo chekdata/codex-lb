@@ -287,3 +287,30 @@ and urllib3 to 2.8.0; retain the blocking scanner and rerun integration gates.
 Sources: https://github.com/aio-libs/aiohttp/releases/tag/v3.14.4,
 https://github.com/advisories/GHSA-6q48-6c7w-9gw2, and
 https://github.com/urllib3/urllib3/releases/tag/2.8.0.
+
+### Production verification (2026-10-21)
+
+PR [#52](https://github.com/chekdata/codex-lb/pull/52) received independent
+approval for 66ac21c217a3f87b4d7b92384d6b6af8fe585286 and merged as
+f301c4574e905abcba1bc17cee76e16359858580. Full PR and main CI passed,
+including PostgreSQL, browser and Docker/Trivy checks.
+
+[Internal Image run 39565856601](https://github.com/chekdata/codex-lb/actions/runs/39565856601)
+completed on attempt 2 after a stalled native AMD64 Vite build was cancelled.
+Its receipt records both linux/amd64 and linux/arm64 at
+sha256:ca25904fec2bbea0222700a8cfb4f4344bbae8c05717e6e154217c34405a037d.
+The normal mirror independently verified GHCR and VECR identity.
+
+[ops-bootstrap #3074](https://github.com/chekdata/ops-bootstrap/pull/3074)
+merged as 077065acc1a04d9408271ed496fc7db51a0e19d9 and changed only source
+SHA, image tag and digest. The production rollout verifier passed locally and
+[in CI](https://github.com/chekdata/ops-bootstrap/actions/runs/39575378980):
+Argo Synced/Healthy at f301c457, one current/updated/ready StatefulSet replica,
+exact workload imageID and zero restarts. Runtime reports AnyIO 4.15.1;
+database and bridge-ring readiness are healthy. Public /health/ready returns
+200 and the dashboard entry returns the expected Feilian login redirect.
+
+This targeted internal patch retains version metadata 1.24.1-beta.1.
+Rollback identities are source c57ab32b8abf039d925acd18a3ca6d58f10ac2ac and
+image sha256:1f4fdb0c0d3988d2b9c540644be43babbbbed063f08260c9d996e6c6317089fb.
+Schema and Helm content were unchanged between those source commits.
