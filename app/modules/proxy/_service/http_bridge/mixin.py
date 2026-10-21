@@ -454,8 +454,6 @@ class _HTTPBridgeMixin(
         )
         if model_transition_rebind:
             durable_lookup = None
-        # Account selection consumes this one-shot capability; canonical creation
-        # also forces takeover so a prior-ring durable owner cannot reject it.
         force_goal_restart_account_reselection = affinity.abandon_unavailable_legacy_owner
         if await _http_bridge_should_wait_for_registration(self, key, settings):
             skip_registration_gate = False
@@ -1550,10 +1548,8 @@ class _HTTPBridgeMixin(
                 }
                 restart_takeover = durable_lookup is not None and _http_bridge_allow_durable_takeover(durable_lookup)
                 if restart_takeover:
-                    # restart_takeover means recovering a row whose previous
-                    # owner is genuinely gone. Every claim now advances the
-                    # epoch, so epoch > 1 alone would also count ordinary
-                    # local successor claims (no pre-claim lookup, or a forced replace of a live local session).
+                    # A restart takeover recovers a genuinely abandoned owner;
+                    # local successor claims do not imply a restart.
                     claim_kwargs["record_restart_takeover"] = True
                 await self._claim_durable_http_bridge_session(created_session, **claim_kwargs)
                 async with self._http_bridge_lock:

@@ -42,6 +42,7 @@ SETTING_TIERS: Final[dict[str, Tier]] = {
     "database_sqlite_pre_migrate_backup_enabled": "T0",
     "database_sqlite_pre_migrate_backup_max_files": "T0",
     "database_sqlite_startup_check_mode": "T0",
+    "database_postgres_schema": "T0",
     "database_alembic_auto_remap_enabled": "T0",
     "database_migration_lock_timeout_seconds": "T0",
     "upstream_base_url": "T1",

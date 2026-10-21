@@ -938,6 +938,7 @@ class _HTTPBridgeStreamingMixin:
         http_bridge_active: bool | None = None,
         capacity_startup_wait_event: asyncio.Event | None = None,
         capacity_startup_ready_event: asyncio.Event | None = None,
+        verified_v1_goal_restart: bool = False,
     ) -> AsyncIterator[str]:
         _maybe_log_proxy_request_payload("stream_http", payload, headers)
         proxy_api_authorization = _header_value_case_insensitive(headers, "authorization")
@@ -964,6 +965,7 @@ class _HTTPBridgeStreamingMixin:
             http_bridge_active=http_bridge_active,
             capacity_startup_wait_event=capacity_startup_wait_event,
             capacity_startup_ready_event=capacity_startup_ready_event,
+            verified_v1_goal_restart=verified_v1_goal_restart,
         )
 
     async def _stream_http_bridge_or_retry(
@@ -990,6 +992,7 @@ class _HTTPBridgeStreamingMixin:
         http_bridge_active: bool | None = None,
         capacity_startup_wait_event: asyncio.Event | None = None,
         capacity_startup_ready_event: asyncio.Event | None = None,
+        verified_v1_goal_restart: bool = False,
     ) -> AsyncIterator[str]:
         dashboard_settings = await _service_get_settings_cache().get()
         runtime_config = _http_bridge_runtime_config(dashboard_settings, _service_get_settings())
@@ -1125,6 +1128,7 @@ class _HTTPBridgeStreamingMixin:
                     enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                     capacity_startup_wait_event=capacity_startup_wait_event,
                     capacity_startup_ready_event=capacity_startup_ready_event,
+                    verified_v1_goal_restart=verified_v1_goal_restart,
                     deferred_account_backoff_tracker=deferred_account_backoff_tracker,
                     bridge_payload=bridge_payload,
                 ):
@@ -1303,6 +1307,7 @@ class _HTTPBridgeStreamingMixin:
         enforce_openai_sdk_contract: bool = True,
         capacity_startup_wait_event: asyncio.Event | None = None,
         capacity_startup_ready_event: asyncio.Event | None = None,
+        verified_v1_goal_restart: bool = False,
         deferred_account_backoff_tracker: _DeferredAccountBackoffTracker | None = None,
         bridge_payload: JsonObject | None = None,
         _denied_anchor_request_id: str | None = None,
@@ -2528,6 +2533,7 @@ class _HTTPBridgeStreamingMixin:
                     exclude_account_ids=fresh_replay_excluded_account_ids or None,
                     deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
                     defer_account_health_writes=request_state.api_key_reservation is not None,
+                    force_new_turn_state_session=verified_v1_goal_restart,
                 )
             except ProxyResponseError as exc:
                 # Session creation failed before the turn was submitted
@@ -2825,6 +2831,7 @@ class _HTTPBridgeStreamingMixin:
                             exclude_account_ids=request_state.excluded_account_ids or None,
                             deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
                             defer_account_health_writes=request_state.api_key_reservation is not None,
+                            force_new_turn_state_session=verified_v1_goal_restart,
                         )
                     except ProxyResponseError as capacity_exc:
                         if owner_unavailable_allows_account_neutral_replay(capacity_exc):
@@ -3591,6 +3598,7 @@ class _HTTPBridgeStreamingMixin:
                             exclude_account_ids=request_state.excluded_account_ids or None,
                             deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
                             defer_account_health_writes=request_state.api_key_reservation is not None,
+                            force_new_turn_state_session=verified_v1_goal_restart,
                         )
                     except ProxyResponseError as capacity_exc:
                         wait_plan = _http_bridge_capacity_wait_plan(
@@ -3702,6 +3710,7 @@ class _HTTPBridgeStreamingMixin:
                             exclude_account_ids=request_state.excluded_account_ids or None,
                             deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
                             defer_account_health_writes=request_state.api_key_reservation is not None,
+                            force_new_turn_state_session=verified_v1_goal_restart,
                         )
                     except ProxyResponseError as capacity_exc:
                         wait_plan = _http_bridge_capacity_wait_plan(
@@ -4069,6 +4078,7 @@ class _HTTPBridgeStreamingMixin:
                             exclude_account_ids=request_state.excluded_account_ids or None,
                             deferred_account_backoff_lifecycle=request_state.deferred_account_backoff_lifecycle,
                             defer_account_health_writes=request_state.api_key_reservation is not None,
+                            force_new_turn_state_session=verified_v1_goal_restart,
                         )
                     except ProxyResponseError as capacity_exc:
                         wait_plan = _http_bridge_capacity_wait_plan(

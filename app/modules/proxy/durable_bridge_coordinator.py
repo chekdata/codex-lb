@@ -373,28 +373,6 @@ class DurableBridgeSessionCoordinator:
                 expected_cooldown_until_epoch=expected_cooldown_until_epoch,
             )
 
-    async def claim_retry_circuit_generation(
-        self,
-        *,
-        session_key_kind: str,
-        session_key_value: str,
-        api_key_id: str | None,
-        expected_updated_at_epoch: float | None,
-        expected_admission_generation: int,
-        expected_consecutive_failures: int,
-        expected_cooldown_until_epoch: float,
-    ) -> DurableBridgeRetryCircuitSnapshot | None:
-        async with self._session() as session:
-            return await DurableBridgeRepository(session).claim_retry_circuit_generation(
-                session_key_kind=session_key_kind,
-                session_key_value=session_key_value,
-                api_key_scope=durable_bridge_api_key_scope(api_key_id),
-                expected_updated_at_epoch=expected_updated_at_epoch,
-                expected_admission_generation=expected_admission_generation,
-                expected_consecutive_failures=expected_consecutive_failures,
-                expected_cooldown_until_epoch=expected_cooldown_until_epoch,
-            )
-
     async def purge_retry_circuit(
         self,
         *,

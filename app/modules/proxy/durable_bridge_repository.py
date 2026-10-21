@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config.settings import get_settings
 from app.core.utils.time import naive_utc_to_epoch, to_utc_naive, utcnow
+from app.db.migration_url import normalize_postgres_schema
 from app.db.models import (
     HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2,
     HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1,
@@ -35,7 +36,6 @@ from app.db.models import (
     HttpBridgeSessionRecord,
     HttpBridgeSessionState,
 )
-from app.db.migration_url import normalize_postgres_schema
 from app.db.session import sqlite_writer_section
 from app.modules.proxy.account_eligibility import HARD_OWNER_UNAVAILABLE_STATUSES
 from app.modules.proxy.continuity import (
@@ -4327,14 +4327,14 @@ async def missing_durable_bridge_tables(session: AsyncSession) -> tuple[str, ...
         result = await session.execute(
             text(
                 "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = :table_schema "
+                "WHERE table_schema = :schema "
                 "AND table_name IN ("
                 "'http_bridge_sessions', 'http_bridge_session_aliases', 'http_bridge_retry_circuits', "
                 "'http_bridge_recovery_attempts', 'http_bridge_operations', 'http_bridge_operation_events', "
                 "'http_bridge_operation_event_chunks'"
                 ")"
             ),
-            {"table_schema": configured_schema},
+            {"schema": configured_schema},
         )
     present = {str(row[0]) for row in result.fetchall()}
     return tuple(sorted(expected - present))

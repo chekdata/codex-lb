@@ -754,6 +754,42 @@ def _has_explicit_openai_sdk_marker(request: Request) -> bool:
     return "openai" in user_agent
 
 
+def _verified_v1_goal_restart_headers(
+    request: Request,
+    payload: ResponsesRequest,
+) -> dict[str, str] | None:
+    """Rotate a proved native Goal restart away from its echoed HTTP turn.
+
+    A native Codex client may resend a goal continuation after the bridge
+    owner became unavailable.  Only the narrow, account-neutral replay shape
+    is allowed to abandon the old synthesized HTTP turn; ordinary client
+    continuations keep the existing affinity and therefore remain fail-closed.
+    """
+    if payload.stream is not True:
+        return None
+    if not _is_native_codex_request(request.headers) or _has_explicit_openai_sdk_marker(request):
+        return None
+    if proxy_affinity_module._codex_backend_identity(request.headers).thread_id is None:
+        return None
+    turn_state = proxy_affinity_module._sticky_key_from_turn_state_header(request.headers)
+    if (
+        turn_state is None
+        or not turn_state.startswith("http_turn_")
+        or not proxy_affinity_module._is_synthesized_turn_state(turn_state)
+    ):
+        return None
+    if not proxy_affinity_module._request_allows_unavailable_legacy_owner_abandonment(payload):
+        return None
+
+    forwarded_headers = dict(request.headers)
+    forwarded_headers["x-codex-turn-state"] = proxy_affinity_module.ensure_http_downstream_turn_state({})
+    logger.info(
+        "v1_goal_restart_turn_state_rotated request_id=%s",
+        ensure_request_id(),
+    )
+    return forwarded_headers
+
+
 def _is_openai_sdk_request(
     request: Request,
     payload: V1ResponsesRequest | Mapping[str, JsonValue] | None = None,
@@ -1443,6 +1479,7 @@ async def v1_responses(
             context=context,
         )
     if responses_payload.stream:
+        goal_restart_headers = _verified_v1_goal_restart_headers(request, responses_payload)
         response = await _stream_responses(
             request,
             responses_payload,
@@ -1453,6 +1490,8 @@ async def v1_responses(
             prefer_http_bridge=True,
             api_key_policy_already_applied=True,
             prohibit_fast_mode=prohibit_fast_mode,
+            forwarded_headers=goal_restart_headers,
+            verified_v1_goal_restart=goal_restart_headers is not None,
         )
     else:
         response = await _collect_responses(
@@ -6317,6 +6356,7 @@ async def _stream_responses(
     native_codex_heartbeat: bool = False,
     api_key_policy_already_applied: bool = False,
     prohibit_fast_mode: bool = False,
+    verified_v1_goal_restart: bool = False,
 ) -> Response:
     # Owner-forwarded payloads have already passed API-key enforcement,
     # account-catalog fallback, reservation, and signing on the origin
@@ -6563,6 +6603,7 @@ async def _stream_responses(
                 http_bridge_active=bridge_active,
                 capacity_startup_wait_event=capacity_wait_event,
                 capacity_startup_ready_event=capacity_ready_event,
+                verified_v1_goal_restart=verified_v1_goal_restart,
             )
         return context.service.stream_responses(
             payload,
