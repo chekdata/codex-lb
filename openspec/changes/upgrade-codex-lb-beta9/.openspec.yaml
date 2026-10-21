@@ -1,0 +1,4 @@
+change:
+  id: upgrade-codex-lb-beta9
+  title: Upgrade codex-lb to upstream v1.25.0-beta.9 with CHEK customizations
+  source: v1.25.0-beta.9@69f128afcbc616d9f8e924ca6583f7031d75cf82
