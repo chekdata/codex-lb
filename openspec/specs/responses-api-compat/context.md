@@ -280,3 +280,10 @@ integration results must come from the PR CI before production promotion.
 
 OpenSpec spec validation: 57 passed, 0 failed. Strict imported change validation
 required shortening upstream requirement prose; the behavior and scenarios are unchanged.
+
+The production-image CI scan also found six fixed high/critical advisories in
+the pre-existing dependency lock. Raise aiohttp to 3.14.4, certifi to 2026.10.19,
+and urllib3 to 2.8.0; retain the blocking scanner and rerun integration gates.
+Sources: https://github.com/aio-libs/aiohttp/releases/tag/v3.14.4,
+https://github.com/advisories/GHSA-6q48-6c7w-9gw2, and
+https://github.com/urllib3/urllib3/releases/tag/2.8.0.
