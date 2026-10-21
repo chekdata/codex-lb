@@ -114,10 +114,58 @@ def pull_request_commit_author_logins(event_path: str | None, token: str | None)
         return set()
     commit_count = pull_request.get("commits")
     if isinstance(commit_count, int) and commit_count > 250:
-        raise SystemExit(
-            "Pull request has more than 250 commits; GitHub's PR commits endpoint is capped, "
-            "so all-contributors coverage cannot be validated safely."
+        base = pull_request.get("base")
+        head = pull_request.get("head")
+        base_sha = base.get("sha") if isinstance(base, dict) else None
+        head_sha = head.get("sha") if isinstance(head, dict) else None
+        repository = base.get("repo") if isinstance(base, dict) else None
+        full_name = repository.get("full_name") if isinstance(repository, dict) else None
+        if not all(isinstance(value, str) and value for value in (base_sha, head_sha, full_name)):
+            raise SystemExit(
+                "Pull request has more than 250 commits and is missing canonical base/head metadata; "
+                "cannot validate all-contributors coverage safely."
+            )
+        print(
+            "Pull request has more than 250 commits; using the paginated repository commit history "
+            "from the head back to the base because GitHub's PR commits endpoint is capped.",
+            file=sys.stderr,
         )
+        url: str | None = f"https://api.github.com/repos/{full_name}/commits?sha={head_sha}&per_page=100"
+        logins: set[str] = set()
+        reached_base = False
+        while url:
+            try:
+                page, link = _request_json(url, token)
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                raise SystemExit(f"GitHub repository commits request failed: HTTP {exc.code}: {detail}") from exc
+            except GitHubApiError as exc:
+                raise SystemExit(
+                    "GitHub repository commits request failed after retries; "
+                    f"cannot validate all-contributors coverage from partial evidence: {exc}"
+                ) from exc
+            for commit in page:
+                sha = commit.get("sha")
+                if sha == base_sha:
+                    reached_base = True
+                    break
+                author = commit.get("author")
+                if not isinstance(author, dict):
+                    continue
+                author = cast(dict[str, object], author)
+                login = author.get("login")
+                author_type = author.get("type")
+                if isinstance(login, str) and author_type != "Bot" and not login.endswith("[bot]"):
+                    logins.add(login.lower())
+            if reached_base:
+                break
+            url = _next_link(link)
+        if not reached_base:
+            raise SystemExit(
+                "GitHub repository commit history did not reach the pull request base; "
+                "cannot validate all-contributors coverage safely."
+            )
+        return logins
     commits_url = pull_request.get("commits_url")
     if not isinstance(commits_url, str) or not commits_url:
         return set()

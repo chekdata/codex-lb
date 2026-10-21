@@ -163,6 +163,12 @@ class AccountOpenCodeAuthExportAccount(DashboardModel):
     email: str
 
 
+class AccountOpenCodeAuthExportResponse(DashboardModel):
+    filename: str
+    account: AccountOpenCodeAuthExportAccount
+    auth_json: OpenCodeAuthJson
+
+
 class AccountUpdateRequest(DashboardModel):
     security_work_authorized: bool | None = None
 

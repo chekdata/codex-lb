@@ -66,7 +66,7 @@ def test_pull_request_commit_authors_include_normal_email_contributors(tmp_path,
     assert requested_urls == ["https://api.github.test/repos/example/codex-lb/pulls/1/commits?per_page=100"]
 
 
-def test_pull_request_commit_authors_fail_when_github_endpoint_is_capped(tmp_path):
+def test_pull_request_commit_authors_use_paginated_repository_history_when_pr_is_capped(tmp_path, monkeypatch):
     checker = _load_checker_module()
     event_path = tmp_path / "event.json"
     event_path.write_text(
@@ -74,19 +74,34 @@ def test_pull_request_commit_authors_fail_when_github_endpoint_is_capped(tmp_pat
             {
                 "pull_request": {
                     "commits": 251,
-                    "commits_url": "https://api.github.test/repos/example/codex-lb/pulls/1/commits",
+                    "base": {
+                        "sha": "base-sha",
+                        "repo": {"full_name": "example/codex-lb"},
+                    },
+                    "head": {"sha": "head-sha"},
                 }
             }
         ),
         encoding="utf-8",
     )
 
-    try:
-        checker.pull_request_commit_author_logins(str(event_path), "token")
-    except SystemExit as exc:
-        assert "more than 250 commits" in str(exc)
-    else:
-        raise AssertionError("expected capped PR commit list to fail closed")
+    requested_urls: list[str] = []
+
+    def fake_request_json(url, token):
+        requested_urls.append(url)
+        assert token == "token"
+        return (
+            [
+                {"sha": "head-sha", "author": {"login": "head-author", "type": "User"}},
+                {"sha": "base-sha", "author": {"login": "base-author", "type": "User"}},
+            ],
+            None,
+        )
+
+    monkeypatch.setattr(checker, "_request_json", fake_request_json)
+
+    assert checker.pull_request_commit_author_logins(str(event_path), "token") == {"head-author"}
+    assert requested_urls == ["https://api.github.com/repos/example/codex-lb/commits?sha=head-sha&per_page=100"]
 
 
 def test_pull_request_commit_authors_fail_closed_when_retries_exhaust(tmp_path, monkeypatch):

@@ -51,6 +51,7 @@ from app.modules.accounts.schemas import (
     AccountAuthExportTokens,
     AccountImportResponse,
     AccountOpenCodeAuthExportAccount,
+    AccountOpenCodeAuthExportResponse,
     AccountProbeResponse,
     AccountRequestUsage,
     AccountSummary,
@@ -489,6 +490,32 @@ class AccountsService:
             tokens=tokens,
             codex_auth_json=codex_auth_json,
             opencode_auth_json=opencode_auth_json,
+        )
+
+    async def export_opencode_auth(self, account_id: str) -> AccountOpenCodeAuthExportResponse | None:
+        """Export the legacy OpenCode OAuth shape used by existing operators."""
+        account = await self._get_visible_account(account_id)
+        if account is None:
+            return None
+
+        access_token = self._encryptor.decrypt(account.access_token_encrypted)
+        refresh_token = self._encryptor.decrypt(account.refresh_token_encrypted)
+        expires = token_expiry_epoch_ms(access_token) or 0
+        return AccountOpenCodeAuthExportResponse(
+            filename=_opencode_auth_export_filename(account),
+            account=AccountOpenCodeAuthExportAccount(
+                account_id=account.id,
+                chatgpt_account_id=account.chatgpt_account_id,
+                email=account.email,
+            ),
+            auth_json=OpenCodeAuthJson(
+                openai=OpenCodeOAuthAuth(
+                    refresh=refresh_token,
+                    access=access_token,
+                    expires=expires,
+                    account_id=account.chatgpt_account_id,
+                ),
+            ),
         )
 
     async def import_account(self, raw: bytes) -> AccountImportResponse:

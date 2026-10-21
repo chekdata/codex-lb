@@ -7,7 +7,7 @@ Regenerate with `uv run python scripts/generate_settings_reference.py`;
 `tests/unit/test_settings_reference.py` fails when this page drifts from
 `app/core/config/settings.py`.
 
-codex-lb currently exposes 96 settings. Every setting is an environment
+codex-lb currently exposes 97 settings. Every setting is an environment
 variable, normally with the `CODEX_LB_` prefix (process environment or `.env` /
 `.env.local` next to the process); aliased settings list every accepted name.
 All defaults work with zero configuration —
@@ -92,6 +92,7 @@ anything else belongs in `app/core/config/settings.py`.
 | `CODEX_LB_DATABASE_MIGRATION_LOCK_TIMEOUT_SECONDS` | T0 | `float` | `300.0` |
 | `CODEX_LB_DATABASE_MIGRATIONS_FAIL_FAST` | T0 | `bool` | `True` |
 | `CODEX_LB_DATABASE_POOL_SIZE` | T1 | `int` | `25` |
+| `CODEX_LB_DATABASE_POSTGRES_SCHEMA` | T0 | `str \| None` | `None` |
 | `CODEX_LB_DATABASE_SQLITE_PRE_MIGRATE_BACKUP_ENABLED` | T0 | `bool` | `True` |
 | `CODEX_LB_DATABASE_SQLITE_PRE_MIGRATE_BACKUP_MAX_FILES` | T0 | `int` | `5` |
 | `CODEX_LB_DATABASE_SQLITE_STARTUP_CHECK_MODE` | T0 | `'quick' \| 'full' \| 'off'` | `'quick'` |

@@ -33,6 +33,7 @@ from app.modules.accounts.schemas import (
     AccountImportResponse,
     AccountLimitWarmupUpdateRequest,
     AccountLimitWarmupUpdateResponse,
+    AccountOpenCodeAuthExportResponse,
     AccountPauseResponse,
     AccountProbeRequest,
     AccountProbeResponse,
@@ -193,6 +194,31 @@ async def export_account_auth(
     context: AccountsContext = Depends(get_accounts_context),
 ) -> AccountAuthExportResponse:
     result = await context.service.export_auth(account_id)
+    if not result:
+        raise DashboardNotFoundError("Account not found", code="account_not_found")
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    AuditService.log_async(
+        "account_auth_exported",
+        actor_ip=request.client.host if request.client else None,
+        actor=AuditActor.from_principal(principal),
+        target=AuditTarget("account", account_id),
+        details={"account_id": account_id},
+    )
+    return result
+
+
+@router.post("/{account_id}/export/opencode-auth", response_model=AccountOpenCodeAuthExportResponse, deprecated=True)
+async def export_account_opencode_auth(
+    request: Request,
+    response: Response,
+    account_id: str,
+    principal: DashboardPrincipal = Depends(require_dashboard_permission(Permission.ACCOUNTS_EXPORT)),
+    context: AccountsContext = Depends(get_accounts_context),
+) -> AccountOpenCodeAuthExportResponse:
+    """Keep the legacy OpenCode export route for existing CHEK operators."""
+    result = await context.service.export_opencode_auth(account_id)
     if not result:
         raise DashboardNotFoundError("Account not found", code="account_not_found")
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
