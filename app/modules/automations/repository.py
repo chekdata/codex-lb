@@ -1874,7 +1874,7 @@ def _serialize_schedule_days(days: Sequence[str]) -> str:
 
 def _scheduled_slot_key(job_id: str, *, account_id: str, due_slot: datetime) -> str:
     seed = f"{job_id}:{due_slot.isoformat()}:{account_id}"
-    digest = sha1(seed.encode("utf-8")).hexdigest()[:20]
+    digest = sha1(seed.encode("utf-8"), usedforsecurity=False).hexdigest()[:20]
     return f"scheduled:{job_id}:{digest}"
 
 

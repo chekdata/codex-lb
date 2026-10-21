@@ -106,6 +106,7 @@ from app.core.resilience.network_recovery import (
     process_network_error_code,
 )
 from app.core.resilience.toggles import current_resilience_toggles
+from app.core.runtime_logging import safe_log_field
 from app.core.types import JsonObject, JsonValue
 from app.core.upstream_proxy import ResolvedUpstreamRoute
 from app.core.usage.live_hub import publish_live_usage
@@ -1270,26 +1271,24 @@ def _maybe_log_upstream_request_start(
 
     if privacy_policy.redacts_sensitive_details:
         account_id = "<redacted>"
-        payload_summary = "sensitive private payload redacted"
         payload_json = None
     if "upstream_summary" in trace_channels:
         logger.info(
-            "upstream_request_start request_id=%s kind=%s method=%s target=%s account_id=%s headers=%s payload=%s",
-            request_id,
-            kind,
-            method,
-            target,
-            account_id,
-            header_keys,
-            payload_summary,
+            "upstream_request_start request_id=%s kind=%s method=%s target=%s account_id=%s headers=%s payload=omitted",
+            safe_log_field(request_id),
+            safe_log_field(kind),
+            safe_log_field(method),
+            safe_log_field(target),
+            safe_log_field(account_id),
+            safe_log_field(",".join(header_keys)),
         )
     if "upstream_payload" in trace_channels and payload_json is not None:
         logger.info(
-            "upstream_request_payload request_id=%s kind=%s target=%s payload=%s",
-            request_id,
-            kind,
-            target,
-            payload_json,
+            "upstream_request_payload request_id=%s kind=%s target=%s payload_bytes=%s",
+            safe_log_field(request_id),
+            safe_log_field(kind),
+            safe_log_field(target),
+            len(payload_json.encode("utf-8")),
         )
 
 

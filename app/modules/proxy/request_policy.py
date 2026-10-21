@@ -23,6 +23,7 @@ from app.core.openai.strict_schema import (
     validate_strict_json_schema,
 )
 from app.core.openai.v1_requests import V1ResponsesRequest
+from app.core.runtime_logging import safe_log_field
 from app.core.types import JsonValue
 from app.core.utils.json_guards import is_json_list, is_json_mapping
 from app.core.utils.request_id import get_request_id
@@ -143,8 +144,8 @@ def validate_reasoning_effort_access(api_key: ApiKeyData | None, effort: str | N
     logger.info(
         "api_key_reasoning_effort_not_allowed request_id=%s key_id=%s reasoning_effort=%s",
         get_request_id(),
-        api_key.id,
-        normalized_effort,
+        "<redacted>",
+        safe_log_field(normalized_effort),
     )
     raise ProxyReasoningEffortNotAllowed(
         f"This API key does not have access to reasoning effort '{normalized_effort}'",
@@ -296,9 +297,9 @@ def apply_api_key_enforcement(
             logger.info(
                 "api_key_model_enforced request_id=%s key_id=%s requested_model=%s enforced_model=%s",
                 get_request_id(),
-                api_key.id,
-                requested_model,
-                api_key.enforced_model,
+                "<redacted>",
+                safe_log_field(requested_model),
+                safe_log_field(api_key.enforced_model),
             )
         payload.model = api_key.enforced_model
         if enforced_model_reasoning_effort is not None:
@@ -328,9 +329,9 @@ def apply_api_key_enforcement(
             logger.info(
                 "api_key_reasoning_enforced request_id=%s key_id=%s requested_effort=%s enforced_effort=%s",
                 get_request_id(),
-                api_key.id,
-                requested_effort,
-                api_key.enforced_reasoning_effort,
+                "<redacted>",
+                safe_log_field(requested_effort),
+                safe_log_field(api_key.enforced_reasoning_effort),
             )
 
     _materialize_provider_reasoning_effort(payload, provider_reasoning_effort)
@@ -367,10 +368,10 @@ def apply_api_key_enforcement(
                 "requested_service_tier=%s enforced_service_tier=%s "
                 "outbound_service_tier=%s",
                 get_request_id(),
-                api_key.id,
-                requested_service_tier,
-                api_key.enforced_service_tier,
-                effective_service_tier,
+                "<redacted>",
+                safe_log_field(requested_service_tier),
+                safe_log_field(api_key.enforced_service_tier),
+                safe_log_field(effective_service_tier),
             )
     apply_prohibit_fast_mode(payload, prohibit_fast_mode=prohibit_fast_mode)
     return ApiKeyEnforcementResult(service_tier_was_enforced, pre_normalization_effort)
@@ -391,7 +392,7 @@ def apply_prohibit_fast_mode(
     logger.info(
         "fast_mode_service_tier_prohibited request_id=%s stripped_service_tier=%s",
         request_id or get_request_id(),
-        service_tier,
+        safe_log_field(service_tier),
     )
     if isinstance(payload, dict):
         payload.pop("service_tier", None)
@@ -425,8 +426,8 @@ def apply_enforced_service_tier_model_fallback(
     logger.info(
         "api_key_enforced_service_tier_model_fallback request_id=%s model=%s enforced_service_tier=%s",
         get_request_id(),
-        payload.model,
-        service_tier,
+        safe_log_field(payload.model),
+        safe_log_field(service_tier),
     )
     payload.service_tier = None
     return True
@@ -588,8 +589,8 @@ def normalize_upstream_model_alias(payload: ResponsesRequest | ResponsesCompactR
         logger.info(
             "model_alias_normalized request_id=%s requested_model=%s normalized_model=%s",
             get_request_id(),
-            payload.model,
-            canonical_model,
+            safe_log_field(payload.model),
+            safe_log_field(canonical_model),
         )
         payload.model = canonical_model
 
@@ -604,10 +605,10 @@ def normalize_upstream_model_alias(payload: ResponsesRequest | ResponsesCompactR
                 "model_alias_reasoning_normalized request_id=%s requested_model=%s "
                 "normalized_model=%s requested_effort=%s normalized_effort=%s",
                 get_request_id(),
-                requested_model,
-                canonical_model,
-                requested_effort,
-                alias_effort,
+                safe_log_field(requested_model),
+                safe_log_field(canonical_model),
+                safe_log_field(requested_effort),
+                safe_log_field(alias_effort),
             )
 
     if alias_service_tier is not None and getattr(payload, "service_tier", None) is None:
@@ -616,9 +617,9 @@ def normalize_upstream_model_alias(payload: ResponsesRequest | ResponsesCompactR
             "model_alias_service_tier_normalized request_id=%s requested_model=%s "
             "normalized_model=%s normalized_service_tier=%s",
             get_request_id(),
-            requested_model,
-            canonical_model,
-            alias_service_tier,
+            safe_log_field(requested_model),
+            safe_log_field(canonical_model),
+            safe_log_field(alias_service_tier),
         )
 
 
@@ -715,9 +716,9 @@ def normalize_unsupported_reasoning_effort(
         logger.info(
             "reasoning_effort_wire_aliased request_id=%s model=%s requested_effort=%s aliased_effort=%s",
             get_request_id(),
-            payload.model,
-            requested_effort,
-            wire_alias,
+            safe_log_field(payload.model),
+            safe_log_field(requested_effort),
+            safe_log_field(wire_alias),
         )
         # Deliberately not reported as restorable: the ultra -> max alias must
         # hold on every surface, source-routed payloads included.
@@ -734,9 +735,9 @@ def normalize_unsupported_reasoning_effort(
     logger.info(
         "reasoning_effort_normalized request_id=%s model=%s requested_effort=%s normalized_effort=%s",
         get_request_id(),
-        payload.model,
-        requested_effort,
-        fallback,
+        safe_log_field(payload.model),
+        safe_log_field(requested_effort),
+        safe_log_field(fallback),
     )
     return normalized_effort
 
@@ -777,10 +778,10 @@ def restore_source_reasoning_effort(
         "reasoning_effort_restored_for_source request_id=%s model=%s source_id=%s "
         "normalized_effort=%s restored_effort=%s",
         get_request_id(),
-        payload.model,
-        source.id,
-        current_effort,
-        restored_effort,
+        safe_log_field(payload.model),
+        safe_log_field(source.id),
+        safe_log_field(current_effort),
+        safe_log_field(restored_effort),
     )
 
 

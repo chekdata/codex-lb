@@ -194,7 +194,7 @@ def thread_anchor_domain(*, owner_row_id: str, model_class: str, instructions: s
     # is a process-local domain separator that keeps one tenant's thread anchors
     # from colliding with another's. A deliberately slow password hash would run
     # on every turn for no security benefit.
-    return sha256(framed).digest()  # codeql[py/weak-sensitive-data-hashing]
+    return sha256(framed, usedforsecurity=False).digest()
 
 
 class _ItemVerdict(Enum):
@@ -252,7 +252,7 @@ def _bounded_item_digest(domain: bytes, item: JsonValue) -> tuple[bytes, int] | 
 
     if _exceeds_item_ceiling(item):
         return _ItemVerdict.OVERSIZED
-    hasher = sha256(domain + b"\x1e")
+    hasher = sha256(domain + b"\x1e", usedforsecurity=False)
     size = 0
     try:
         for chunk in _ITEM_ENCODER.iterencode(item):

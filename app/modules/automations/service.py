@@ -2289,7 +2289,7 @@ def _scheduled_slot_key(
     if account_id is None:
         return f"scheduled:{job_id}:{slot_anchor.isoformat()}Z"
     seed = f"{job_id}:{slot_anchor.isoformat()}:{account_id}"
-    digest = sha1(seed.encode("utf-8")).hexdigest()[:20]
+    digest = sha1(seed.encode("utf-8"), usedforsecurity=False).hexdigest()[:20]
     return f"scheduled:{job_id}:{digest}"
 
 
@@ -2327,7 +2327,7 @@ def _normalize_legacy_manual_cycle_key(value: str | None) -> str | None:
 
 def _manual_slot_key(job_id: str, cycle_id: str, account_id: str) -> str:
     seed = f"{job_id}:{cycle_id}:{account_id}"
-    digest = sha1(seed.encode("utf-8")).hexdigest()[:20]
+    digest = sha1(seed.encode("utf-8"), usedforsecurity=False).hexdigest()[:20]
     return f"{_manual_cycle_key(job_id, cycle_id)}:{digest}"
 
 

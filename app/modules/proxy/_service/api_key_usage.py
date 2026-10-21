@@ -138,7 +138,7 @@ class _ApiKeyUsageMixin:
                 service = _service_api_keys_service()(repos.api_keys)
                 try:
                     return await service.enforce_limits_for_request(
-                        "<redacted>",
+                        api_key.id,
                         request_model=request_model,
                         request_service_tier=request_service_tier,
                         request_usage_budget=request_usage_budget,
@@ -720,7 +720,7 @@ class _ApiKeyUsageMixin:
                 if not retry_persistence_failures:
                     logger.warning(
                         "Failed to release stream API key reservation key_id=%s request_id=%s",
-                        api_key.id,
+                        "<redacted>",
                         request_id,
                         exc_info=True,
                     )
@@ -728,7 +728,7 @@ class _ApiKeyUsageMixin:
                 logger.warning(
                     "Failed to release stream API key reservation key_id=%s request_id=%s "
                     "retry_attempt=%d retry_delay_seconds=%.2f",
-                    api_key.id,
+                    "<redacted>",
                     request_id,
                     retry_attempt,
                     retry_delay_seconds,

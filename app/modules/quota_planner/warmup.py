@@ -18,6 +18,7 @@ from app.core.crypto import TokenEncryptor
 from app.core.openai.parsing import parse_sse_event
 from app.core.openai.requests import ResponsesRequest
 from app.core.resilience.toggles import bind_resilience_toggles
+from app.core.runtime_logging import safe_log_field
 from app.core.utils.shared_future import _await_cleanup_deferring_cancellation
 from app.core.utils.time import naive_utc_to_epoch, utcnow
 from app.db.models import Account, AccountStatus, DashboardSettings, QuotaPlannerDecision
@@ -390,7 +391,10 @@ class QuotaWarmupService:
         try:
             await self._record_warmup_effect(account, model, source=source, confidence=confidence)
         except Exception:
-            logger.exception("Failed to record quota warmup effect", extra={"account_id": account.id, "model": model})
+            logger.exception(
+                "Failed to record quota warmup effect",
+                extra={"account_id": "<redacted>", "model": safe_log_field(model)},
+            )
 
     async def _resolve_refused_claim(
         self,
