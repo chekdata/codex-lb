@@ -133,7 +133,7 @@ def _scheduled_cycle_key(job_id: str, due_slot: datetime) -> str:
 
 def _scheduled_slot_digest(job_id: str, *, account_id: str, due_slot: datetime) -> str:
     seed = f"{job_id}:{due_slot.isoformat()}:{account_id}"
-    return sha1(seed.encode("utf-8")).hexdigest()[:20]
+    return sha1(seed.encode("utf-8"), usedforsecurity=False).hexdigest()[:20]  # lgtm [py/weak-sensitive-data-hashing]
 
 
 def _recover_legacy_scheduled_due_slot_from_account(

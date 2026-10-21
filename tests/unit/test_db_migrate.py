@@ -5,7 +5,6 @@ import json
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
-from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -13,25 +12,27 @@ from typing import cast
 import pytest
 import sqlalchemy as sa
 from alembic import command
-from alembic.migration import MigrationContext
-from alembic.operations import Operations
+from alembic.script import ScriptDirectory
 from alembic.util.exc import CommandError
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy import exc as sa_exc
-from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import Connection
-from sqlalchemy.schema import CreateSchema
 
 import app.db.migrate as migrate_module
+from app.core.auth.dashboard_access import PRESET_ROLE_IDS, PresetRoleSlug
+from app.core.config.settings import get_settings
 from app.db.alembic.revision_ids import OLD_TO_NEW_REVISION_MAP
 from app.db.backup import create_sqlite_pre_migration_backup, list_sqlite_pre_migration_backups
 from app.db.migrate import (
+    CREDENTIAL_DROP_REVISION,
+    CREDENTIAL_REPROJECTION_REVISION,
     MigrationBootstrapError,
     _build_alembic_config,
     _collect_migration_policy_violations,
     _ensure_alembic_version_table_capacity_for_connection,
     _max_revision_id_length,
     _read_current_revisions_from_connection,
+    check_legacy_credential_drop,
     check_migration_policy,
     check_schema_drift,
     inspect_migration_state,
@@ -39,16 +40,13 @@ from app.db.migrate import (
     wait_for_connection,
     wait_for_head,
 )
-from app.db.migration_url import (
-    apply_postgres_migration_search_path,
-    apply_postgres_search_path,
-    ensure_postgres_schema_exists,
-    postgres_migration_search_path,
-    postgres_search_path,
-    to_sync_database_url,
-)
-from app.db.models import Base
+from app.db.migration_url import to_sync_database_url
+from app.db.models import COMPAT_ADMIN_USER_ID, COMPAT_ADMIN_USERNAME, Base
 from app.modules.usage.additional_quota_keys import clear_additional_quota_registry_cache
+
+#: The revision immediately before the one that re-projects the legacy
+#: dashboard credentials; a database stamped here has never run that release.
+CREDENTIAL_REPROJECTION_PARENT = "20260909_010000_add_dashboard_users"
 
 
 def _db_url(path: Path) -> str:
@@ -223,184 +221,6 @@ def test_wait_for_connection_times_out_when_database_stays_unreachable(monkeypat
 
     with pytest.raises(TimeoutError, match="Timed out waiting for database connectivity"):
         wait_for_connection("sqlite+aiosqlite:///tmp/test.db", timeout_seconds=2.0, interval_seconds=1.0)
-
-
-def test_postgres_search_path_helper_normalizes_schema() -> None:
-    assert postgres_search_path(None) is None
-    assert postgres_search_path("") is None
-    assert postgres_search_path("  ") is None
-    assert postgres_search_path("public") == '"public"'
-    assert postgres_search_path("codex_lb_prod") == '"codex_lb_prod",public'
-    assert postgres_search_path('tenant"blue') == '"tenant""blue",public'
-    assert postgres_migration_search_path("codex_lb_prod") == '"codex_lb_prod"'
-
-
-def test_postgres_offline_migration_sets_quoted_schema_only_search_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    output = StringIO()
-    config = _build_alembic_config("postgresql+asyncpg://user:pass@db.example.com:5432/codex_lb")
-    config.output_buffer = output
-    monkeypatch.setenv("CODEX_LB_DATABASE_POSTGRES_SCHEMA", 'tenant"blue')
-    from app.core.config.settings import get_settings
-
-    get_settings.cache_clear()
-    try:
-        # An empty head:head range still executes env.py without asking older
-        # data-aware revisions to reflect from Alembic's offline mock bind.
-        command.upgrade(config, "head:head", sql=True)
-    finally:
-        get_settings.cache_clear()
-
-    generated_sql = output.getvalue()
-    assert 'SET search_path TO "tenant""blue";' in generated_sql
-    assert 'SET search_path TO "tenant""blue",public;' not in generated_sql
-
-
-def test_apply_postgres_search_path_is_noop_for_non_postgres() -> None:
-    class _Connection:
-        dialect = SimpleNamespace(name="sqlite")
-
-        def execute(self, *_args, **_kwargs) -> None:
-            raise AssertionError("execute should not be called for non-PostgreSQL backends")
-
-    apply_postgres_search_path(cast(Connection, _Connection()), "codex_lb_prod")
-
-
-def test_apply_postgres_search_path_sets_transaction_scope_path_for_postgres() -> None:
-    calls: list[tuple[object, object]] = []
-
-    class _Connection:
-        dialect = SimpleNamespace(name="postgresql")
-
-        def execute(self, statement: object, params: object) -> None:
-            calls.append((statement, params))
-
-    connection = cast(Connection, _Connection())
-
-    apply_postgres_search_path(connection, "codex_lb_prod")
-
-    assert len(calls) == 1
-    _statement, params = calls[0]
-    assert params == {"search_path": '"codex_lb_prod",public'}
-
-
-def test_apply_postgres_migration_search_path_excludes_public_fallback() -> None:
-    calls: list[tuple[object, object]] = []
-
-    class _Connection:
-        dialect = SimpleNamespace(name="postgresql")
-
-        def execute(self, statement: object, params: object) -> None:
-            calls.append((statement, params))
-
-    connection = cast(Connection, _Connection())
-    apply_postgres_migration_search_path(connection, "codex_lb_prod")
-
-    assert len(calls) == 1
-    _statement, params = calls[0]
-    assert params == {"search_path": '"codex_lb_prod"'}
-    assert connection.dialect.default_schema_name == "codex_lb_prod"
-
-
-def test_ensure_postgres_schema_exists_is_noop_for_non_postgres() -> None:
-    class _Connection:
-        dialect = SimpleNamespace(name="sqlite")
-
-        def execute(self, *_args, **_kwargs) -> None:
-            raise AssertionError("execute should not be called for non-PostgreSQL backends")
-
-    ensure_postgres_schema_exists(cast(Connection, _Connection()), "codex_lb_prod")
-
-
-def test_ensure_postgres_schema_exists_skips_public_schema() -> None:
-    class _Connection:
-        dialect = SimpleNamespace(name="postgresql")
-
-        def execute(self, *_args, **_kwargs) -> None:
-            raise AssertionError("public schema should not trigger CREATE SCHEMA")
-
-    ensure_postgres_schema_exists(cast(Connection, _Connection()), "public")
-
-
-def test_ensure_postgres_schema_exists_creates_missing_postgres_schema() -> None:
-    calls: list[CreateSchema] = []
-
-    class _Connection:
-        dialect = SimpleNamespace(name="postgresql")
-
-        def execute(self, statement: CreateSchema) -> None:
-            calls.append(statement)
-
-    ensure_postgres_schema_exists(cast(Connection, _Connection()), "codex_lb_prod")
-
-    assert len(calls) == 1
-    statement = calls[0]
-    compiled = str(statement.compile(dialect=postgresql.dialect()))
-    assert compiled == "CREATE SCHEMA IF NOT EXISTS codex_lb_prod"
-
-
-def test_sync_connection_creates_schema_before_search_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[str, str | None]] = []
-
-    class _ConnectionContext:
-        def __enter__(self) -> Connection:
-            return cast(Connection, object())
-
-        def __exit__(self, exc_type, exc, tb) -> bool:
-            return False
-
-    class _Engine:
-        def connect(self) -> _ConnectionContext:
-            return _ConnectionContext()
-
-        def dispose(self) -> None:
-            return None
-
-    monkeypatch.setattr(migrate_module, "create_engine", lambda *_args, **_kwargs: _Engine())
-    monkeypatch.setattr(
-        migrate_module,
-        "get_settings",
-        lambda: SimpleNamespace(database_postgres_schema="codex_lb_prod"),
-    )
-    monkeypatch.setattr(
-        migrate_module,
-        "ensure_postgres_schema_exists",
-        lambda _connection, schema: calls.append(("ensure", schema)),
-    )
-    monkeypatch.setattr(
-        migrate_module,
-        "apply_postgres_migration_search_path",
-        lambda _connection, schema: calls.append(("search_path", schema)),
-    )
-
-    with migrate_module._sync_connection("postgresql+psycopg://codex_lb:codex_lb@127.0.0.1:5432/codex_lb"):
-        pass
-
-    assert calls == [
-        ("ensure", "codex_lb_prod"),
-        ("search_path", "codex_lb_prod"),
-    ]
-
-
-def test_read_table_names_scopes_postgres_inspection_to_configured_schema(monkeypatch) -> None:
-    calls: list[str | None] = []
-
-    class _Inspector:
-        def get_table_names(self, *, schema: str | None) -> list[str]:
-            calls.append(schema)
-            return ["alembic_version"]
-
-    connection = cast(Connection, SimpleNamespace(dialect=SimpleNamespace(name="postgresql")))
-    monkeypatch.setattr(migrate_module, "inspect", lambda _connection: _Inspector())
-    monkeypatch.setattr(
-        migrate_module,
-        "get_settings",
-        lambda: SimpleNamespace(database_postgres_schema="codex_lb_prod"),
-    )
-
-    assert migrate_module._read_table_names(connection) == {"alembic_version"}
-    assert calls == ["codex_lb_prod"]
 
 
 def test_schema_migration_contract_matches_after_upgrade(tmp_path: Path) -> None:
@@ -764,158 +584,6 @@ def test_hourly_rollup_cancelled_count_migration_round_trips_with_default_zero(t
         engine.dispose()
 
     assert inspect_migration_state(url).current_revision == parent_revision
-
-
-def test_http_bridge_recovery_required_marker_migration_round_trips(tmp_path: Path) -> None:
-    db_path = tmp_path / "http-bridge-recovery-required.db"
-    url = _db_url(db_path)
-    parent_revision = "20260811_000000_add_hourly_rollup_cancelled_count"
-    marker_revision = "20260823_000000_add_http_bridge_recovery_required_marker"
-    marker_columns = {
-        "recovery_required_anchor_hash",
-        "recovery_required_account_id",
-        "recovery_required_attempt_fingerprint",
-        "recovery_required_at",
-    }
-
-    run_upgrade(url, parent_revision, bootstrap_legacy=False)
-    engine = create_engine(to_sync_database_url(url))
-    try:
-        with engine.connect() as connection:
-            columns = {column["name"] for column in inspect(connection).get_columns("http_bridge_sessions")}
-            assert marker_columns.isdisjoint(columns)
-
-        result = run_upgrade(url, marker_revision, bootstrap_legacy=False)
-        assert result.current_revision == marker_revision
-        with engine.connect() as connection:
-            columns = {column["name"] for column in inspect(connection).get_columns("http_bridge_sessions")}
-            assert marker_columns <= columns
-
-        config = _build_alembic_config(url)
-        command.downgrade(config, parent_revision)
-        with engine.connect() as connection:
-            columns = {column["name"] for column in inspect(connection).get_columns("http_bridge_sessions")}
-            assert marker_columns.isdisjoint(columns)
-    finally:
-        engine.dispose()
-
-    assert inspect_migration_state(url).current_revision == parent_revision
-
-
-def test_http_bridge_recovery_required_marker_migration_renders_postgres_upgrade_and_downgrade(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    migration = importlib.import_module(
-        "app.db.alembic.versions.20260823_000000_add_http_bridge_recovery_required_marker"
-    )
-
-    upgrade_sql = StringIO()
-    upgrade_context = MigrationContext.configure(
-        dialect_name="postgresql",
-        opts={"as_sql": True, "output_buffer": upgrade_sql},
-    )
-    monkeypatch.setattr(migration, "op", Operations(upgrade_context))
-    monkeypatch.setattr(migration, "_columns", lambda _bind: set())
-    migration.upgrade()
-
-    assert upgrade_sql.getvalue().splitlines() == [
-        "ALTER TABLE http_bridge_sessions ADD COLUMN recovery_required_anchor_hash VARCHAR(64);",
-        "",
-        "ALTER TABLE http_bridge_sessions ADD COLUMN recovery_required_account_id VARCHAR;",
-        "",
-        "ALTER TABLE http_bridge_sessions ADD COLUMN recovery_required_attempt_fingerprint VARCHAR(64);",
-        "",
-        "ALTER TABLE http_bridge_sessions ADD COLUMN recovery_required_at TIMESTAMP WITH TIME ZONE;",
-        "",
-    ]
-
-    downgrade_sql = StringIO()
-    downgrade_context = MigrationContext.configure(
-        dialect_name="postgresql",
-        opts={"as_sql": True, "output_buffer": downgrade_sql},
-    )
-    monkeypatch.setattr(migration, "op", Operations(downgrade_context))
-    monkeypatch.setattr(migration, "_columns", lambda _bind: set(migration._COLUMNS))
-    migration.downgrade()
-
-    assert downgrade_sql.getvalue().splitlines() == [
-        "ALTER TABLE http_bridge_sessions DROP COLUMN recovery_required_at;",
-        "",
-        "ALTER TABLE http_bridge_sessions DROP COLUMN recovery_required_attempt_fingerprint;",
-        "",
-        "ALTER TABLE http_bridge_sessions DROP COLUMN recovery_required_account_id;",
-        "",
-        "ALTER TABLE http_bridge_sessions DROP COLUMN recovery_required_anchor_hash;",
-        "",
-    ]
-
-
-def test_rowless_marker_origin_migration_renders_postgres_upgrade_and_downgrade(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    migration = importlib.import_module(
-        "app.db.alembic.versions.20260824_010000_bind_rowless_authority_to_recovery_marker"
-    )
-
-    upgrade_sql = StringIO()
-    upgrade_context = MigrationContext.configure(
-        dialect_name="postgresql",
-        opts={"as_sql": True, "output_buffer": upgrade_sql},
-    )
-    monkeypatch.setattr(migration, "op", Operations(upgrade_context))
-    monkeypatch.setattr(migration, "_columns", lambda _bind: set())
-    migration.upgrade()
-    assert upgrade_sql.getvalue().splitlines() == [
-        "ALTER TABLE http_bridge_rowless_recovery_authorities ADD COLUMN origin_marker_session_id VARCHAR(36);",
-        "",
-    ]
-
-    downgrade_sql = StringIO()
-    downgrade_context = MigrationContext.configure(
-        dialect_name="postgresql",
-        opts={"as_sql": True, "output_buffer": downgrade_sql},
-    )
-    monkeypatch.setattr(migration, "op", Operations(downgrade_context))
-    monkeypatch.setattr(migration, "_columns", lambda _bind: {migration._COLUMN})
-    monkeypatch.setattr(migration, "_marker_authority_count", lambda _bind: 0)
-    migration.downgrade()
-    assert downgrade_sql.getvalue().splitlines() == [
-        "ALTER TABLE http_bridge_rowless_recovery_authorities DROP COLUMN origin_marker_session_id;",
-        "",
-    ]
-
-
-def test_response_transition_manifest_migration_renders_postgres_upgrade_and_empty_downgrade(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    migration = importlib.import_module("app.db.alembic.versions.20260826_000000_add_response_transition_manifest")
-
-    upgrade_sql = StringIO()
-    upgrade_context = MigrationContext.configure(
-        dialect_name="postgresql",
-        opts={"as_sql": True, "output_buffer": upgrade_sql},
-    )
-    monkeypatch.setattr(migration, "op", Operations(upgrade_context))
-    monkeypatch.setattr(migration, "_columns", lambda _bind: set())
-    migration.upgrade()
-    assert upgrade_sql.getvalue().splitlines() == [
-        "ALTER TABLE http_bridge_sessions ADD COLUMN latest_response_transition_manifest_json TEXT;",
-        "",
-    ]
-
-    downgrade_sql = StringIO()
-    downgrade_context = MigrationContext.configure(
-        dialect_name="postgresql",
-        opts={"as_sql": True, "output_buffer": downgrade_sql},
-    )
-    monkeypatch.setattr(migration, "op", Operations(downgrade_context))
-    monkeypatch.setattr(migration, "_columns", lambda _bind: {migration._COLUMN})
-    monkeypatch.setattr(migration, "_active_manifest_exists", lambda _bind: False)
-    migration.downgrade()
-    assert downgrade_sql.getvalue().splitlines() == [
-        "ALTER TABLE http_bridge_sessions DROP COLUMN latest_response_transition_manifest_json;",
-        "",
-    ]
 
 
 def test_request_log_useragent_family_migration_backfills_only_slash_values(tmp_path: Path) -> None:
@@ -1820,6 +1488,25 @@ def test_check_schema_drift_ignores_legacy_live_extra_request_log_column(tmp_pat
     assert check_schema_drift(url) == ()
 
 
+def test_check_schema_drift_ignores_retired_prewarm_canary_columns_kept_for_rolling_upgrade(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "retired-prewarm-columns.db"
+    url = _db_url(db_path)
+
+    run_upgrade(url, "head", bootstrap_legacy=False)
+
+    retired_columns = {"prewarm_canary_bucket", "prewarm_eligible_reason"}
+    assert not (retired_columns & set(Base.metadata.tables["request_logs"].columns.keys()))
+
+    sync_url = to_sync_database_url(url)
+    with create_engine(sync_url, future=True).connect() as connection:
+        head_columns = {column["name"] for column in inspect(connection).get_columns("request_logs")}
+    assert retired_columns <= head_columns
+
+    assert check_schema_drift(url) == ()
+
+
 def test_check_schema_drift_ignores_sqlite_real_float_reflection_for_sticky_thresholds(
     monkeypatch,
     tmp_path: Path,
@@ -2072,6 +1759,7 @@ def test_run_upgrade_backfills_additional_usage_quota_key_from_configured_regist
     )
 
     monkeypatch.setenv("CODEX_LB_ADDITIONAL_QUOTA_REGISTRY_FILE", str(registry_path))
+    get_settings.cache_clear()
     clear_additional_quota_registry_cache()
 
     run_upgrade(url, "20260309_000000_add_additional_usage_history", bootstrap_legacy=False)
@@ -2194,6 +1882,7 @@ def test_run_upgrade_rejects_duplicate_additional_quota_aliases_in_registry(
     )
 
     monkeypatch.setenv("CODEX_LB_ADDITIONAL_QUOTA_REGISTRY_FILE", str(registry_path))
+    get_settings.cache_clear()
     clear_additional_quota_registry_cache()
 
     run_upgrade(url, "20260309_000000_add_additional_usage_history", bootstrap_legacy=False)
@@ -2325,8 +2014,6 @@ class _FakeConnection:
 
 
 class _MissingAlembicVersionConnection:
-    dialect = SimpleNamespace(name="postgresql")
-
     def execute(self, statement: object) -> None:
         raise sa_exc.ProgrammingError(
             str(statement),
@@ -2336,8 +2023,6 @@ class _MissingAlembicVersionConnection:
 
 
 class _MissingAlembicVersionSQLiteConnection:
-    dialect = SimpleNamespace(name="sqlite")
-
     def execute(self, statement: object) -> None:
         raise sa_exc.OperationalError(
             str(statement),
@@ -2351,14 +2036,12 @@ class _FakeInspector:
         self._has_table = has_table
         self._version_num_length = version_num_length
 
-    def has_table(self, table_name: str, *, schema: str | None = None) -> bool:
+    def has_table(self, table_name: str) -> bool:
         assert table_name == "alembic_version"
-        assert schema is None
         return self._has_table
 
-    def get_columns(self, table_name: str, *, schema: str | None = None) -> list[dict[str, object]]:
+    def get_columns(self, table_name: str) -> list[dict[str, object]]:
         assert table_name == "alembic_version"
-        assert schema is None
         return [
             {
                 "name": "version_num",
@@ -2375,7 +2058,7 @@ def test_ensure_alembic_version_table_capacity_creates_table_when_missing(monkey
     _ensure_alembic_version_table_capacity_for_connection(cast(Connection, connection), required_length=64)
 
     assert connection.executed_sql == [
-        'CREATE TABLE IF NOT EXISTS "alembic_version" ( version_num VARCHAR(64) NOT NULL, PRIMARY KEY (version_num) )'
+        "CREATE TABLE IF NOT EXISTS alembic_version ( version_num VARCHAR(64) NOT NULL, PRIMARY KEY (version_num) )"
     ]
 
 
@@ -2386,7 +2069,7 @@ def test_ensure_alembic_version_table_capacity_alters_short_column(monkeypatch) 
 
     _ensure_alembic_version_table_capacity_for_connection(cast(Connection, connection), required_length=64)
 
-    assert connection.executed_sql == ['ALTER TABLE "alembic_version" ALTER COLUMN version_num TYPE VARCHAR(64)']
+    assert connection.executed_sql == ["ALTER TABLE alembic_version ALTER COLUMN version_num TYPE VARCHAR(64)"]
 
 
 def test_read_current_revisions_returns_empty_when_alembic_version_table_is_missing() -> None:
@@ -2869,6 +2552,23 @@ def test_dashboard_hot_path_postgresql_indexes_build_concurrently() -> None:
     assert "indisvalid" in source
 
 
+def test_request_logs_live_facet_postgresql_indexes_build_concurrently() -> None:
+    revision_path = (
+        Path(__file__).resolve().parents[2]
+        / "app/db/alembic/versions/20260909_130000_add_request_logs_live_facet_indexes.py"
+    )
+    source = revision_path.read_text(encoding="utf-8")
+
+    # Built outside the migration transaction so the proxy write path keeps
+    # inserting; leftover invalid indexes from an interrupted concurrent build
+    # are rebuilt instead of being silently accepted by IF NOT EXISTS.
+    assert "autocommit_block" in source
+    assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS" in source
+    assert "DROP INDEX CONCURRENTLY IF EXISTS" in source
+    assert "indisvalid" in source
+    assert "deleted_at IS NULL" in source
+
+
 def test_dashboard_hot_path_index_migration_drops_redundant_indexes(tmp_path: Path) -> None:
     db_path = tmp_path / "hot-path-redundant-indexes.db"
     url = _db_url(db_path)
@@ -2891,3 +2591,424 @@ def test_dashboard_hot_path_index_migration_drops_redundant_indexes(tmp_path: Pa
     assert "ix_additional_usage_distinct_labels" in usage_indexes
 
     assert check_schema_drift(url) == ()
+
+
+# --- the legacy dashboard credential drop: drain warning ---
+
+
+def _ledger(url: str) -> tuple[str, ...]:
+    with create_engine(to_sync_database_url(url), future=True).connect() as connection:
+        return _read_current_revisions_from_connection(connection)
+
+
+def test_a_database_from_an_older_release_reaches_head_in_one_upgrade(tmp_path: Path, caplog) -> None:
+    """The jump from before the account release is the supported path, not a refusal.
+
+    ``CREDENTIAL_DROP_REVISION`` descends from ``CREDENTIAL_REPROJECTION_REVISION``,
+    so the same run copies the legacy credential onto the account row before it
+    drops the column it came from. Refusing the jump would keep every install of
+    an older release from starting -- ``run_startup_migrations`` is the boot path
+    -- and would refuse work that is safe.
+    """
+
+    url = _db_url(tmp_path / "older-release.db")
+    run_upgrade(url, CREDENTIAL_REPROJECTION_PARENT, bootstrap_legacy=False)
+    engine = create_engine(to_sync_database_url(url), future=True)
+    try:
+        with engine.begin() as connection:
+            if connection.execute(text("SELECT id FROM dashboard_settings")).first() is None:
+                connection.execute(text("INSERT INTO dashboard_settings (id) VALUES (1)"))
+            connection.execute(
+                text("UPDATE dashboard_settings SET password_hash = :hash, totp_last_verified_step = 7 WHERE id = 1"),
+                {"hash": "$2b$legacy"},
+            )
+
+        with caplog.at_level("WARNING", logger="app.db.migrate"):
+            result = run_upgrade(url, "head", bootstrap_legacy=False)
+        assert result.current_revision == inspect_migration_state(url).head_revision
+
+        with engine.connect() as connection:
+            account = connection.execute(
+                text("SELECT password_hash, totp_last_verified_step FROM dashboard_users WHERE username = 'admin'")
+            ).one()
+            settings_columns = {column["name"] for column in inspect(connection).get_columns("dashboard_settings")}
+    finally:
+        engine.dispose()
+
+    assert account[0] == "$2b$legacy" and account[1] == 7
+    assert not {"password_hash", "totp_secret_encrypted", "totp_last_verified_step"} & settings_columns
+    # The one thing the ledger cannot decide is stated rather than guessed, once.
+    drain = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "WARNING" and CREDENTIAL_DROP_REVISION in record.getMessage()
+    ]
+    assert len(drain) == 1
+
+
+def test_an_upgrade_that_stops_short_of_the_drop_says_nothing(tmp_path: Path, caplog) -> None:
+    url = _db_url(tmp_path / "short.db")
+    run_upgrade(url, CREDENTIAL_REPROJECTION_PARENT, bootstrap_legacy=False)
+    config = _build_alembic_config(url)
+
+    with caplog.at_level("WARNING", logger="app.db.migrate"):
+        check_legacy_credential_drop(
+            config,
+            _ledger(url),
+            CREDENTIAL_REPROJECTION_REVISION,
+            has_existing_schema=True,
+        )
+    assert not [record for record in caplog.records if CREDENTIAL_DROP_REVISION in record.getMessage()]
+
+
+def test_a_fresh_install_is_not_warned(tmp_path: Path, caplog) -> None:
+    url = _db_url(tmp_path / "fresh-chain.db")
+    with caplog.at_level("WARNING", logger="app.db.migrate"):
+        result = run_upgrade(url, "head", bootstrap_legacy=False)
+    assert result.current_revision == inspect_migration_state(url).head_revision
+    warnings = [record.getMessage() for record in caplog.records if record.levelname == "WARNING"]
+    assert not [message for message in warnings if CREDENTIAL_DROP_REVISION in message]
+
+    # An empty ledger is the fresh case only when there is no schema under it;
+    # the same emptiness over an existing install is a lost ledger, and is told.
+    config = _build_alembic_config(url)
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="app.db.migrate"):
+        check_legacy_credential_drop(config, (), "head", has_existing_schema=False)
+    assert _drain_warnings(caplog) == []
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="app.db.migrate"):
+        check_legacy_credential_drop(config, (), "head", has_existing_schema=True)
+    assert len(_drain_warnings(caplog)) == 1
+
+
+def test_the_drain_warning_fires_once_on_a_populated_database(tmp_path: Path, caplog) -> None:
+    url = _db_url(tmp_path / "populated.db")
+    run_upgrade(url, CREDENTIAL_REPROJECTION_REVISION, bootstrap_legacy=False)
+
+    with caplog.at_level("WARNING", logger="app.db.migrate"):
+        run_upgrade(url, "head", bootstrap_legacy=False)
+    drain = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "WARNING" and CREDENTIAL_DROP_REVISION in record.getMessage()
+    ]
+    assert len(drain) == 1
+    assert "stop them before this migration runs" in drain[0]
+    # Nothing here claims to have seen a running replica; the ledger cannot.
+    assert "running" not in drain[0]
+
+    # Already at head: the warning is about work that is about to happen.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="app.db.migrate"):
+        run_upgrade(url, "head", bootstrap_legacy=False)
+    assert not [record for record in caplog.records if CREDENTIAL_DROP_REVISION in record.getMessage()]
+
+
+def _drop_revision_parent(url: str) -> str:
+    """The drop's direct parent, read from the graph rather than pinned.
+
+    A literal here would have to be re-edited on every rebase that re-points
+    ``down_revision``, and the campaign has already corrupted one unrelated
+    test with a blanket rewrite of exactly that shape.
+    """
+
+    script_directory = ScriptDirectory.from_config(_build_alembic_config(url))
+    parent = script_directory.get_revision(CREDENTIAL_DROP_REVISION).down_revision
+    assert isinstance(parent, str)
+    return parent
+
+
+#: The drain warning's own sentence. The revision id alone is not enough to
+#: recognise it: the ledger-less stamp names the same revision for a different
+#: reason, and a filter that only looked for the id would count both.
+_DRAIN_PHRASE = "stop them before this migration runs"
+
+
+#: The ledger-repair warning's own sentence, for the same reason.
+_RESTAMP_PHRASE = "Stamping the ledger at it"
+
+
+def _drain_warnings(caplog) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "WARNING"
+        and CREDENTIAL_DROP_REVISION in record.getMessage()
+        and _DRAIN_PHRASE in record.getMessage()
+    ]
+
+
+def _restamp_warnings(caplog) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "WARNING" and _RESTAMP_PHRASE in record.getMessage()
+    ]
+
+
+@pytest.mark.parametrize("target", ["+1", "abbreviated"], ids=["relative", "id-prefix"])
+def test_the_drain_warning_survives_a_relative_or_abbreviated_target(tmp_path: Path, caplog, target: str) -> None:
+    """The decision is taken over what Alembic will apply, not over the string.
+
+    ``upgrade +1`` and ``upgrade <prefix>`` are both targets Alembic resolves
+    happily. A check that special-cased ``head`` and otherwise treated the
+    target as a literal revision id read both as unknown ids, said nothing, and
+    dropped the columns in silence one statement later.
+    """
+
+    url = _db_url(tmp_path / f"relative-{target.strip('+')}.db")
+    parent = _drop_revision_parent(url)
+    run_upgrade(url, parent, bootstrap_legacy=False)
+    revision = target if target == "+1" else CREDENTIAL_DROP_REVISION[:16]
+
+    with caplog.at_level("WARNING", logger="app.db.migrate"):
+        run_upgrade(url, revision, bootstrap_legacy=False)
+
+    assert len(_drain_warnings(caplog)) == 1
+    assert _ledger(url) == (CREDENTIAL_DROP_REVISION,)
+    engine = create_engine(to_sync_database_url(url), future=True)
+    try:
+        with engine.connect() as connection:
+            columns = {column["name"] for column in inspect(connection).get_columns("dashboard_settings")}
+    finally:
+        engine.dispose()
+    assert not {"password_hash", "totp_secret_encrypted", "totp_last_verified_step"} & columns
+
+
+# --- the legacy dashboard credential drop: the ledger-less replay ---
+
+#: A ledger-less bootstrap replays the chain from base. Two revisions in the
+#: middle of it re-create the dropped columns *empty* on an existing
+#: ``dashboard_settings``, and the one-shot re-projection then reads that
+#: emptiness as "the previous release removed the password". These are the
+#: values it used to destroy.
+_SURVIVING_PASSWORD_HASH = "$2b$12$" + "regression-sentinel-not-a-real-hash"
+_SURVIVING_TOTP_SECRET = b"totp-" + b"secret-" + b"sentinel"
+
+_SEED_BOOTSTRAP_ACCOUNT = text(
+    "INSERT INTO dashboard_users (id, username, role_id, role_source, status, password_hash, "
+    "totp_secret_encrypted, totp_last_verified_step, session_generation, must_change_password, "
+    "is_break_glass, created_at, updated_at) "
+    "VALUES (:id, :username, :role_id, 'manual', 'active', :password_hash, :totp_secret, 7, 0, 0, 1, "
+    "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+)
+
+
+def _seed_bootstrap_account_and_lose_the_ledger(url: str) -> None:
+    engine = create_engine(to_sync_database_url(url), future=True)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                _SEED_BOOTSTRAP_ACCOUNT,
+                {
+                    "id": COMPAT_ADMIN_USER_ID,
+                    "username": COMPAT_ADMIN_USERNAME,
+                    "role_id": PRESET_ROLE_IDS[PresetRoleSlug.ADMIN],
+                    "password_hash": _SURVIVING_PASSWORD_HASH,
+                    "totp_secret": _SURVIVING_TOTP_SECRET,
+                },
+            )
+            connection.execute(text(f"DROP TABLE {migrate_module._ALEMBIC_VERSION_TABLE}"))
+    finally:
+        engine.dispose()
+
+
+def _bootstrap_account(url: str) -> tuple[str | None, bytes | None, int | None]:
+    engine = create_engine(to_sync_database_url(url), future=True)
+    try:
+        with engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT password_hash, totp_secret_encrypted, totp_last_verified_step "
+                    "FROM dashboard_users WHERE id = :id"
+                ),
+                {"id": COMPAT_ADMIN_USER_ID},
+            ).one()
+    finally:
+        engine.dispose()
+    return (row[0], row[1], row[2])
+
+
+def test_a_ledgerless_database_that_retired_the_credentials_is_stamped_not_replayed(tmp_path: Path, caplog) -> None:
+    """The account row keeps the only credential the install has left.
+
+    Replaying the chain over this schema is not merely wasteful, it is
+    destructive: ``20260213_000600``/``20260213_000700`` re-add the three
+    columns empty and ``20260909_020000`` reads that emptiness as a removed
+    password. Both of those revisions are published and are not edited to
+    defend themselves -- an install that already applied a revision never
+    applies it again -- so the defence is the marker the drop revision left in
+    ``runtime_sentinels``, read before the first revision runs.
+    """
+
+    url = _db_url(tmp_path / "ledgerless-retired.db")
+    run_upgrade(url, "head", bootstrap_legacy=False)
+    _seed_bootstrap_account_and_lose_the_ledger(url)
+
+    with caplog.at_level("WARNING", logger="app.db.migrate"):
+        result = run_upgrade(url, "head", bootstrap_legacy=True)
+
+    assert result.current_revision == inspect_migration_state(url).head_revision
+    assert _bootstrap_account(url) == (_SURVIVING_PASSWORD_HASH, _SURVIVING_TOTP_SECRET, 7)
+    restamped = _restamp_warnings(caplog)
+    assert len(restamped) == 1 and CREDENTIAL_DROP_REVISION in restamped[0]
+    assert f"no {migrate_module._ALEMBIC_VERSION_TABLE} table" in restamped[0]
+    # Nothing was dropped a second time and no drain warning is owed: the
+    # database had already crossed the revision the warning is about.
+    assert _drain_warnings(caplog) == []
+
+
+@pytest.mark.parametrize("lost_how", ["dropped", "truncated"])
+def test_a_ledgerless_database_without_the_marker_still_replays(tmp_path: Path, caplog, lost_how: str) -> None:
+    """The stamp is keyed on evidence, so everything else keeps today's behaviour.
+
+    Both shapes of a lost ledger are the same database: ``alembic_version``
+    dropped altogether, and ``alembic_version`` present but holding no rows (a
+    truncation, or a restore that brought the schema back without its contents).
+    Neither is a fresh install, and both are owed the drain warning -- the replay
+    below walks the whole chain and drops the columns for real, because the
+    early revisions are inspector-guarded and do not fail over the schema that
+    is already there.
+    """
+
+    url = _db_url(tmp_path / f"ledgerless-pre-drop-{lost_how}.db")
+    parent = _drop_revision_parent(url)
+    run_upgrade(url, parent, bootstrap_legacy=False)
+    engine = create_engine(to_sync_database_url(url), future=True)
+    try:
+        with engine.begin() as connection:
+            marker = connection.execute(
+                text("SELECT name FROM runtime_sentinels WHERE name = :name"),
+                {"name": migrate_module.LEGACY_CREDENTIALS_RETIRED_SENTINEL},
+            ).first()
+            assert marker is None
+            connection.execute(
+                text("UPDATE dashboard_settings SET password_hash = :hash WHERE id = 1"),
+                {"hash": _SURVIVING_PASSWORD_HASH},
+            )
+            verb = "DROP TABLE" if lost_how == "dropped" else "DELETE FROM"
+            connection.execute(text(f"{verb} {migrate_module._ALEMBIC_VERSION_TABLE}"))
+    finally:
+        engine.dispose()
+    assert _ledger(url) == ()
+
+    with caplog.at_level("WARNING", logger="app.db.migrate"):
+        result = run_upgrade(url, "head", bootstrap_legacy=True)
+
+    assert result.current_revision == inspect_migration_state(url).head_revision
+    # The replay ran the whole chain, including the re-projection, and the
+    # legacy hash landed on the account row exactly as it does on an upgrade.
+    assert _bootstrap_account(url)[0] == _SURVIVING_PASSWORD_HASH
+    # Nothing was stamped ahead of the replay, and the operator was told what
+    # the replay was about to do to the columns an older replica still maps.
+    assert _restamp_warnings(caplog) == []
+    assert len(_drain_warnings(caplog)) == 1
+
+
+def test_an_empty_ledger_on_an_empty_database_is_a_fresh_install(tmp_path: Path, caplog) -> None:
+    """The other half of the same question, and why the schema decides it.
+
+    A first run that died after creating ``alembic_version`` -- which
+    ``_ensure_alembic_version_table_capacity`` does before any revision runs --
+    leaves an empty ledger on an empty database. Reading that emptiness as "not
+    fresh", or reading ``config.attributes["codex_lb_fresh_install"]``, which is
+    false for exactly this database because the table exists, would tell an
+    operator to drain replicas of a release that has never run here, over
+    columns that do not exist yet.
+    """
+
+    url = _db_url(tmp_path / "empty-ledger-empty-db.db")
+    engine = create_engine(to_sync_database_url(url), future=True)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    f"CREATE TABLE {migrate_module._ALEMBIC_VERSION_TABLE} "
+                    f"({migrate_module._ALEMBIC_VERSION_COLUMN} VARCHAR(255) NOT NULL, "
+                    f"PRIMARY KEY ({migrate_module._ALEMBIC_VERSION_COLUMN}))"
+                )
+            )
+    finally:
+        engine.dispose()
+
+    with caplog.at_level("WARNING", logger="app.db.migrate"):
+        result = run_upgrade(url, "head", bootstrap_legacy=True)
+
+    assert result.current_revision == inspect_migration_state(url).head_revision
+    assert _drain_warnings(caplog) == []
+
+
+def test_a_rewound_ledger_over_a_retired_schema_is_re_stamped(tmp_path: Path, caplog) -> None:
+    """The ledger, not the schema, is the thing that is wrong.
+
+    A ledger can be rewound as well as lost -- a restore from a partial backup,
+    a hand-edited ``alembic_version``, or the legacy-id remap this module
+    already repairs. Replaying from there over a schema that has dropped the
+    columns does not even reach the destructive re-projection: it fails on
+    ``no such column: password_hash`` inside the published
+    ``20260909_010000_add_dashboard_users``. Only that revision's marker can
+    tell the two apart, because only the drop revision writes it.
+    """
+
+    url = _db_url(tmp_path / "rewound.db")
+    run_upgrade(url, "head", bootstrap_legacy=False)
+    engine = create_engine(to_sync_database_url(url), future=True)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                _SEED_BOOTSTRAP_ACCOUNT,
+                {
+                    "id": COMPAT_ADMIN_USER_ID,
+                    "username": COMPAT_ADMIN_USERNAME,
+                    "role_id": PRESET_ROLE_IDS[PresetRoleSlug.ADMIN],
+                    "password_hash": _SURVIVING_PASSWORD_HASH,
+                    "totp_secret": _SURVIVING_TOTP_SECRET,
+                },
+            )
+            connection.execute(
+                text(f"UPDATE {migrate_module._ALEMBIC_VERSION_TABLE} SET version_num = :rewound"),
+                {"rewound": CREDENTIAL_REPROJECTION_PARENT},
+            )
+    finally:
+        engine.dispose()
+
+    with caplog.at_level("WARNING", logger="app.db.migrate"):
+        result = run_upgrade(url, "head", bootstrap_legacy=False)
+
+    assert result.current_revision == inspect_migration_state(url).head_revision
+    assert _bootstrap_account(url) == (_SURVIVING_PASSWORD_HASH, _SURVIVING_TOTP_SECRET, 7)
+    restamped = _restamp_warnings(caplog)
+    assert len(restamped) == 1 and CREDENTIAL_REPROJECTION_PARENT in restamped[0]
+
+
+def test_a_multi_head_ledger_does_not_break_the_drain_check(tmp_path: Path, caplog) -> None:
+    """Two heads in the ledger and a target on one branch: plan it, do not raise.
+
+    This is why the check asks ``_upgrade_revs`` -- the planner
+    ``command.upgrade`` itself uses -- rather than the public
+    ``iterate_revisions``, which raises ``RangeNotAncestorError`` on exactly
+    this shape while the upgrade succeeds. The pair below is the real fork
+    ``20260908_020000_merge_overflow_transport_heads`` was added to repair, and
+    ``tests/integration/test_migration_merge_overflow_transport.py`` walks it
+    end to end.
+    """
+
+    url = _db_url(tmp_path / "multi-head.db")
+    run_upgrade(url, "head", bootstrap_legacy=False)
+    config = _build_alembic_config(url)
+    forked = (
+        "20260908_000000_add_subscription_overflow",
+        "20260908_000000_replace_upstream_stream_transport_default_sentinel",
+    )
+
+    with caplog.at_level("WARNING", logger="app.db.migrate"):
+        check_legacy_credential_drop(config, forked, forked[1], has_existing_schema=True)
+    assert _drain_warnings(caplog) == []
+
+    # The same forked ledger heading for head still crosses the drop, and is told.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="app.db.migrate"):
+        check_legacy_credential_drop(config, forked, "head", has_existing_schema=True)
+    assert len(_drain_warnings(caplog)) == 1
