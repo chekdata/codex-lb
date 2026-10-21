@@ -224,7 +224,7 @@ async function request<T>(
   const parsed = schema.safeParse(payload);
   if (!parsed.success) {
     if (import.meta.env.DEV) {
-      console.error(`Zod schema mismatch for ${method} ${url}`, parsed.error.format(), payload);
+      console.error("Zod schema mismatch", { method, url }, parsed.error.format(), payload);
     }
     throw new ApiError({
       status: response.status,

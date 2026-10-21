@@ -8425,7 +8425,9 @@ def _logged_error_json_response(
     # compatibility contract; internal exception handlers build generic
     # envelopes before reaching this response helper.
     return JSONResponse(  # lgtm [py/stack-trace-exposure]
-        status_code=status_code, content=public_content, headers=effective_headers or None
+        status_code=status_code,
+        content=public_content,
+        headers=effective_headers or None,
     )
 
 

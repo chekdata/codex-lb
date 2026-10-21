@@ -194,7 +194,7 @@ def thread_anchor_domain(*, owner_row_id: str, model_class: str, instructions: s
     # is a process-local domain separator that keeps one tenant's thread anchors
     # from colliding with another's. A deliberately slow password hash would run
     # on every turn for no security benefit.
-    return sha256(framed, usedforsecurity=False).digest()
+    return sha256(framed, usedforsecurity=False).digest()  # lgtm [py/weak-sensitive-data-hashing]
 
 
 class _ItemVerdict(Enum):

@@ -29,7 +29,7 @@ def _column_names(connection: Connection, table_name: str) -> set[str]:
 
 def _scheduled_slot_key(job_id: str, *, account_id: str, due_slot: datetime) -> str:
     seed = f"{job_id}:{due_slot.isoformat()}:{account_id}"
-    digest = sha1(seed.encode("utf-8"), usedforsecurity=False).hexdigest()[:20]
+    digest = sha1(seed.encode("utf-8"), usedforsecurity=False).hexdigest()[:20]  # lgtm [py/weak-sensitive-data-hashing]
     return f"scheduled:{job_id}:{digest}"
 
 

@@ -774,7 +774,7 @@ def restore_source_reasoning_effort(
     # producer already reports the normalized form, but that invariant is
     # non-local and a casing variant must never reach the wire.
     payload.reasoning.effort = restored_effort
-    logger.info(
+    logger.info(  # lgtm [py/clear-text-logging-sensitive-data]
         "reasoning_effort_restored_for_source request_id=%s model=%s source_id=%s "
         "normalized_effort=%s restored_effort=%s",
         get_request_id(),

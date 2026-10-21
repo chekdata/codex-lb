@@ -301,7 +301,7 @@ class _ApiKeyUsageMixin:
                 logger.warning(
                     "Failed to touch %s API key reservation key_id=%s request_id=%s",
                     surface,
-                    api_key.id if api_key is not None else None,
+                    "<redacted>",
                     request_id,
                     exc_info=True,
                 )
@@ -451,7 +451,7 @@ class _ApiKeyUsageMixin:
                     logger.warning(
                         "Failed to release compact API key reservation after settlement failure "
                         "key_id=%s request_id=%s",
-                        api_key.id,
+                        "<redacted>",
                         get_request_id(),
                         exc_info=True,
                     )
@@ -562,7 +562,7 @@ class _ApiKeyUsageMixin:
             except Exception:
                 logger.warning(
                     "Failed to settle stream API key reservation key_id=%s request_id=%s",
-                    api_key.id,
+                    "<redacted>",
                     request_id,
                     exc_info=True,
                 )
@@ -640,7 +640,7 @@ class _ApiKeyUsageMixin:
             except asyncio.CancelledError:
                 logger.warning(
                     "Stream API key settlement task cancelled key_id=%s request_id=%s",
-                    api_key.id,
+                    "<redacted>",
                     request_id,
                 )
                 self._schedule_cancel_safe_cleanup(
@@ -651,7 +651,7 @@ class _ApiKeyUsageMixin:
             except Exception as exc:
                 logger.warning(
                     "Stream API key settlement task failed key_id=%s request_id=%s",
-                    api_key.id,
+                    "<redacted>",
                     request_id,
                     exc_info=(type(exc), exc, exc.__traceback__),
                 )
