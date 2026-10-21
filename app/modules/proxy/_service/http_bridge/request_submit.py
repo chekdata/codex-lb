@@ -2836,22 +2836,49 @@ class _HTTPBridgeRequestSubmitMixin:
                 ),
             )
 
-    async def _retire_http_bridge_after_drain_if_ready(self: Any, session: "_HTTPBridgeSession") -> bool:
+    async def _retire_http_bridge_after_drain_if_ready(
+        self: Any,
+        session: "_HTTPBridgeSession",
+        *,
+        lock_wait_timeout_seconds: float | None = None,
+    ) -> bool:
+        """Bound hot-path lock waits while preserving lifecycle-owner cleanup."""
         if not (session.upstream_control.reconnect_requested and session.upstream_control.retire_after_drain):
             return False
-        async with session.pending_lock:
+
+        def decide_locked() -> bool:
             has_visible_pending = any(
                 _http_bridge_request_counts_against_queue(request_state) for request_state in session.pending_requests
             )
-            should_reconnect = (
+            unowned = (
                 not has_visible_pending
                 and session.queued_request_count == 0
                 and session.unanchored_reservation_id is None
                 and not session.upstream_close_attempted
             )
-            if should_reconnect:
+            if unowned:
                 session.pending_requests.clear()
                 session.upstream_close_attempted = True
+            return unowned
+
+        if lock_wait_timeout_seconds is None:
+            async with session.pending_lock:
+                should_reconnect = decide_locked()
+        else:
+            try:
+                async with asyncio.timeout(lock_wait_timeout_seconds):
+                    await session.pending_lock.acquire()
+            except TimeoutError:
+                logger.warning(
+                    "Skipping detached HTTP bridge retire check: pending_lock busy for %.1fs session_key=%s",
+                    lock_wait_timeout_seconds,
+                    _hash_identifier(session.key.affinity_key),
+                )
+                return False
+            try:
+                should_reconnect = decide_locked()
+            finally:
+                session.pending_lock.release()
         if not should_reconnect:
             return False
 

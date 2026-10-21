@@ -257,3 +257,23 @@ OpenSpec change first.
 - Post-deploy: correlate retry-circuit `opened`, `half_open`, and `reset` events with bridge `pending` and `response_events_seen` diagnostics. An idle `pending=0` retirement must not precede an immediate two-failure cooldown.
 - Post-deploy: monitor `previous_response_not_found` on `/backend-api/codex/responses`; recurring spikes show repeated continuity failures, which may come from malformed client identifiers, server-side invalidation, or connection lifecycle. Clients should perform the documented full-context retry without `previous_response_id`. Investigate socket-lifecycle remediation only when a separate close-reason, reconnect, or transport diagnostic correlates with the failures.
 - Websocket/Codex CLI tier verification runbook: `openspec/specs/responses-api-compat/ops.md`
+
+## Detached retirement sweep deadline
+
+Issue #2149 bounds aggregate detached-session lock waiting during request finalization. A sweep shares five seconds: if its first attempt consumes three seconds, the next receives two, and later attempts stop at expiry. Deferred generations remain tracked for later requests and their lifecycle owners. The deadline does not cancel resource-close owners or replace their existing close timeout.
+
+## CHEK reliability backport (2026-10-21)
+
+Backports upstream c085177110b4b80d5aba7cdef50093efd5565b4f,
+58c6a28f24b8672830ca4bdda911fe6f191de47e, and
+09b8e8916b0cbee17109e43e447712481bce9959 onto CHEK 1.24.1-beta.1.
+The internal service uses time.monotonic and asyncio.timeout instead of the
+newer upstream clock/scheduler interfaces. Timed lock acquisition remains in
+the calling task because AnyIO locks require the owner to release them. The
+existing queue, reservation, and socket ownership checks are retained.
+
+Before dependency sync, the cancelled-waiter regression failed for AnyIO Lock
+and Semaphore on 4.13.0; the stdlib reference passed. With locked AnyIO 4.15.1,
+all 713 tests in the three affected test modules passed. Ruff and ty passed.
+The local full CI hook stopped at missing bun; PostgreSQL, Docker, and Helm
+integration results must come from the PR CI before production promotion.

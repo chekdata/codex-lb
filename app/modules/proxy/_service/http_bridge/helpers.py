@@ -209,6 +209,13 @@ T = TypeVar("T")
 
 _HTTP_BRIDGE_INFLIGHT_STARTED_AT_ATTR = "_codex_lb_started_at"
 _HTTP_BRIDGE_STALE_INFLIGHT_MIN_SECONDS = 120.0
+# Upper bound for the per-request fail-safe sweep's wait on a detached
+# session's ``pending_lock``. The sweep runs on every bridge request, so a
+# single detached generation whose lock never frees (2026-09-07: an anyio 4.13
+# Lock lost-wakeup left ~100 live request tasks queued behind one detached
+# session) must not park every request; a skipped pass is revisited by the
+# next request's sweep and by the session's own close/drain paths.
+_HTTP_BRIDGE_DETACHED_RETIRE_LOCK_WAIT_SECONDS = 5.0
 _HTTP_BRIDGE_STALE_INFLIGHT_TIMEOUT_MULTIPLIER = 6.0
 
 
@@ -2179,8 +2186,19 @@ async def _release_http_bridge_unanchored_handoffs_for_request(
         # sweep runs. Reconsider every detached generation so marker ordering
         # cannot leave a fully drained predecessor owning a socket and cap slot.
         detached_sessions = tuple(service._http_bridge_detached_sessions.values())
-    for session in detached_sessions:
-        await service._retire_http_bridge_after_drain_if_ready(session)
+    deadline = time.monotonic() + _HTTP_BRIDGE_DETACHED_RETIRE_LOCK_WAIT_SECONDS
+    for index, session in enumerate(detached_sessions):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logger.warning(
+                "Detached HTTP bridge retire sweep deadline exhausted: skipped_sessions=%d",
+                len(detached_sessions) - index,
+            )
+            break
+        await service._retire_http_bridge_after_drain_if_ready(
+            session,
+            lock_wait_timeout_seconds=remaining,
+        )
 
 
 def _track_alias_registration(session: _HTTPBridgeSession, alias: str, *, turn_state: bool) -> int:
