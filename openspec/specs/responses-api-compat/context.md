@@ -277,3 +277,6 @@ and Semaphore on 4.13.0; the stdlib reference passed. With locked AnyIO 4.15.1,
 all 713 tests in the three affected test modules passed. Ruff and ty passed.
 The local full CI hook stopped at missing bun; PostgreSQL, Docker, and Helm
 integration results must come from the PR CI before production promotion.
+
+OpenSpec spec validation: 57 passed, 0 failed. Strict imported change validation
+required shortening upstream requirement prose; the behavior and scenarios are unchanged.

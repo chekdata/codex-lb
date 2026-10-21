@@ -2,12 +2,7 @@
 
 ### Requirement: AnyIO synchronization primitives survive cancelled-waiter releases
 
-The proxy uses two families of asyncio synchronization primitives: the AnyIO asyncio-backend `anyio.Lock` and `anyio.Semaphore` (every HTTP-bridge session `pending_lock`, the bridge registry lock, websocket mixin locks, and cache locks) and the stdlib `asyncio.Lock` and `asyncio.Semaphore`. When a release happens while a queued waiter has already been cancelled but has not yet removed itself from the waiter queue, each primitive MUST satisfy the following:
-
-- **Lock**: the release MUST either hand ownership to a live (non-cancelled) queued waiter or leave the lock unowned such that the next `acquire()` call succeeds. A release MUST NOT leave the lock with no owner and a queued waiter that is never woken.
-- **Semaphore**: the released permit MUST become available to a live queued waiter or to the next acquirer. A release MUST NOT strand the permit behind a cancelled waiter entry so that waiter progress stops while the permit count is positive.
-
-The stdlib primitives already satisfy this (they skip cancelled waiters on acquire) and serve as the reference behaviour. The repository MUST declare an AnyIO dependency floor whose asyncio-backend implementation satisfies this (anyio 4.14.0 or later) and MUST keep a deterministic regression that drives the release/cancel/acquire interleaving against `anyio.Lock`, `anyio.Semaphore`, and the stdlib reference.
+The project MUST use AnyIO 4.14.0 or later. Releasing an AnyIO lock or semaphore while a cancelled waiter remains queued MUST wake a live waiter or let the next acquirer proceed; it MUST NOT strand an unowned lock or available permit. A deterministic release/cancel/acquire regression MUST cover both AnyIO primitives and the stdlib lock reference.
 
 #### Scenario: AnyIO Lock newcomer acquires after a release coinciding with a cancelled waiter
 

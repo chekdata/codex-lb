@@ -300,6 +300,10 @@ Thanks goes to these wonderful people ([emoji key](https://allcontributors.org/e
     <tr>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/hongzexin"><img src="https://avatars.githubusercontent.com/u/136784169?v=4?s=100" width="100px;" alt="Jason HONG"/><br /><sub><b>Jason HONG</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=hongzexin" title="Code">💻</a> <a href="https://github.com/Soju06/codex-lb/commits?author=hongzexin" title="Tests">⚠️</a> <a href="https://github.com/Soju06/codex-lb/commits?author=hongzexin" title="Maintenance">🚧</a></td>
     </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/felixcake618"><img src="https://avatars.githubusercontent.com/u/91266981?v=4?s=100" width="100px;" alt="Felix Cake"/><br /><sub><b>Felix Cake</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=felixcake618" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/TheFoolThatDoesntBelongToThisEra"><img src="https://avatars.githubusercontent.com/u/252236154?v=4?s=100" width="100px;" alt="TheFoolThatDoesntBelongToThisEra"/><br /><sub><b>TheFoolThatDoesntBelongToThisEra</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=TheFoolThatDoesntBelongToThisEra" title="Code">💻</a></td>
+    </tr>
   </tbody>
 </table>
 

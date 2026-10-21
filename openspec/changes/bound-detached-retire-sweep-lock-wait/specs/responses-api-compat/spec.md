@@ -2,7 +2,7 @@
 
 ### Requirement: Per-request detached-session retire sweep bounds its lock wait
 
-The fail-safe sweep that reconsiders detached HTTP-bridge generations on every bridge request MUST bound how long it waits for any single detached session's `pending_lock`. When the bound elapses the sweep MUST skip that session for the current pass, emit a warning, leave the session tracked and its lock state untouched, and continue. Session lifecycle owners (drain, close, cooldown-suppression retirement) MUST keep waiting for the lock without a bound so retirement decisions stay authoritative.
+The per-request detached-session retire sweep MUST bound each pending-lock wait to five seconds. A timeout MUST leave the session tracked, preserve lock ownership, and emit a warning. Lifecycle owners MUST keep waiting without this bound so their retirement decisions remain authoritative.
 
 #### Scenario: Busy detached lock does not park the request path
 
